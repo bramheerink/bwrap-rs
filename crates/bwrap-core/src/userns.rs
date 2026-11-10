@@ -1,0 +1,553 @@
+//! User-namespace setup: overflow ids, the uid/gid maps, `setgroups=deny`,
+//! and disabling further user namespaces.
+//!
+//! Mirrors bwrap's `read_overflowids`, `write_uid_gid_map`, the
+//! `--unshare-user-try` probe and the `--disable-userns` sysctl write. All of
+//! this is Linux kernel API, not distro-specific; the probes exist precisely
+//! so the same binary behaves correctly on Debian, RHEL, etc.
+
+use std::fs;
+use std::os::fd::{AsFd, BorrowedFd};
+
+use nix::errno::Errno;
+use nix::fcntl::{OFlag, openat};
+use nix::sys::stat::Mode;
+use nix::unistd::{Pid, write};
+
+use crate::error::{Context, Error, Result};
+use crate::types::UsernsProbe;
+
+/// The kernel overflow uid/gid, used as the unmapped identity in a map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OverflowIds {
+    /// `/proc/sys/kernel/overflowuid`.
+    pub uid: u32,
+    /// `/proc/sys/kernel/overflowgid`.
+    pub gid: u32,
+}
+
+impl OverflowIds {
+    /// Read and parse the overflow ids (bwrap's `read_overflowids`).
+    ///
+    /// A value of 0 is rejected, matching bwrap: 0 means the file could not be
+    /// parsed, and mapping to uid 0 would be wrong.
+    pub fn read() -> Result<Self> {
+        Ok(Self {
+            uid: read_overflow("/proc/sys/kernel/overflowuid")?,
+            gid: read_overflow("/proc/sys/kernel/overflowgid")?,
+        })
+    }
+}
+
+fn read_overflow(path: &'static str) -> Result<u32> {
+    let data = fs::read_to_string(path).with_context(|| format!("Can't read {path}"))?;
+    // bwrap uses strtol, which stops at the trailing newline.
+    match data.trim().parse::<u32>() {
+        Ok(v) if v != 0 => Ok(v),
+        _ => Err(Error::invalid(format!("Can't parse {path}"))),
+    }
+}
+
+/// Which process's `/proc/<x>/` map files to write.
+#[derive(Debug, Clone, Copy)]
+pub enum MapTarget {
+    /// `/proc/self/` — the calling process writes its own maps (bwrap's
+    /// `pid == -1`).
+    SelfProc,
+    /// `/proc/<pid>/` — write another process's maps.
+    Pid(Pid),
+}
+
+impl MapTarget {
+    fn proc_dir(self) -> String {
+        match self {
+            MapTarget::SelfProc => "self".to_string(),
+            MapTarget::Pid(p) => p.as_raw().to_string(),
+        }
+    }
+}
+
+/// The identity mapping to install into a user namespace.
+#[derive(Debug, Clone, Copy)]
+pub struct IdMap {
+    /// uid inside the sandbox.
+    pub sandbox_uid: u32,
+    /// uid outside (the real uid).
+    pub parent_uid: u32,
+    /// gid inside the sandbox.
+    pub sandbox_gid: u32,
+    /// gid outside (the real gid).
+    pub parent_gid: u32,
+    /// Overflow ids, used for the extra `0`-mapping when `map_root`.
+    pub overflow: OverflowIds,
+    /// Also map uid/gid 0 to the overflow id (bwrap's `map_root`), so that
+    /// root inside the first userns is the overflow id, not the real user.
+    pub map_root: bool,
+    /// Write `setgroups=deny` before the gid map.
+    pub deny_groups: bool,
+}
+
+impl IdMap {
+    /// The `uid_map` file contents (pure; bwrap's `uid_map` branch).
+    pub fn uid_map_string(&self) -> String {
+        single_or_root_map(
+            self.sandbox_uid,
+            self.parent_uid,
+            self.overflow.uid,
+            self.map_root,
+        )
+    }
+
+    /// The `gid_map` file contents (pure; bwrap's `gid_map` branch).
+    pub fn gid_map_string(&self) -> String {
+        single_or_root_map(
+            self.sandbox_gid,
+            self.parent_gid,
+            self.overflow.gid,
+            self.map_root,
+        )
+    }
+
+    /// Write the maps under `proc_fd`/`target`, in the security-critical order
+    /// **uid_map → setgroups=deny → gid_map** (bwrap's `write_uid_gid_map`).
+    ///
+    /// `setgroups` must be denied before the gid map is written, or an
+    /// unprivileged user could use the gid map to gain group privileges. A
+    /// missing `setgroups` file (kernel < 3.19, CVE-2014-8989) is tolerated.
+    ///
+    /// `proc_fd` is an `O_PATH` fd to `/proc` (bwrap keeps one open across the
+    /// pivot so these writes still resolve afterwards).
+    pub fn write(&self, proc_fd: BorrowedFd<'_>, target: MapTarget) -> Result<()> {
+        let dir = target.proc_dir();
+        let dir_fd = openat(proc_fd, dir.as_str(), OFlag::O_PATH, Mode::empty())
+            .with_context(|| format!("open /proc/{dir} failed"))?;
+
+        write_proc_file(dir_fd.as_fd(), "uid_map", self.uid_map_string().as_bytes())
+            .context("setting up uid map")?;
+
+        if self.deny_groups {
+            match write_proc_file(dir_fd.as_fd(), "setgroups", b"deny\n") {
+                Ok(()) => {}
+                // No setgroups file: kernel < 3.19. Tolerated, as bwrap does.
+                Err(Errno::ENOENT) => {}
+                Err(e) => {
+                    return Err(Error::Sys {
+                        message: "error writing to setgroups".into(),
+                        errno: e,
+                    });
+                }
+            }
+        }
+
+        write_proc_file(dir_fd.as_fd(), "gid_map", self.gid_map_string().as_bytes())
+            .context("setting up gid map")?;
+        Ok(())
+    }
+}
+
+fn single_or_root_map(sandbox: u32, parent: u32, overflow: u32, map_root: bool) -> String {
+    if map_root && parent != 0 && sandbox != 0 {
+        format!("0 {overflow} 1\n{sandbox} {parent} 1\n")
+    } else {
+        format!("{sandbox} {parent} 1\n")
+    }
+}
+
+fn write_proc_file(dir_fd: BorrowedFd<'_>, name: &str, data: &[u8]) -> nix::Result<()> {
+    // bwrap's write_file_at opens O_RDWR | O_CLOEXEC.
+    let fd = openat(
+        dir_fd,
+        name,
+        OFlag::O_RDWR | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )?;
+    let mut off = 0;
+    while off < data.len() {
+        match write(&fd, &data[off..]) {
+            Ok(0) => return Err(Errno::EIO),
+            Ok(n) => off += n,
+            Err(Errno::EINTR) => {}
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// Disable the creation of further user namespaces by writing `1` to
+/// `/proc/sys/user/max_user_namespaces` (bwrap's `--disable-userns`).
+///
+/// Written relative to `proc_fd` so it resolves after the pivot. Must be done
+/// before the nested userns is entered.
+pub fn disable_user_namespaces(proc_fd: BorrowedFd<'_>) -> Result<()> {
+    let fd = openat(
+        proc_fd,
+        "sys/user/max_user_namespaces",
+        OFlag::O_WRONLY,
+        Mode::empty(),
+    )
+    .context("cannot open /proc/sys/user/max_user_namespaces")?;
+    let mut off = 0;
+    let data = b"1";
+    while off < data.len() {
+        match write(&fd, &data[off..]) {
+            Ok(0) => {
+                return Err(Error::Sys {
+                    message: "sysctl user.max_user_namespaces = 1".into(),
+                    errno: Errno::EIO,
+                });
+            }
+            Ok(n) => off += n,
+            Err(Errno::EINTR) => {}
+            Err(e) => {
+                return Err(Error::Sys {
+                    message: "sysctl user.max_user_namespaces = 1".into(),
+                    errno: e,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reads `/proc` and `/sys` to answer the `--unshare-user-try` probe
+/// (bwrap's checks in `main()`). The logic is kernel/distro-neutral.
+#[derive(Debug, Default)]
+pub struct SystemUsernsProbe;
+
+impl UsernsProbe for SystemUsernsProbe {
+    fn user_ns_supported(&self) -> bool {
+        // bwrap: stat("/proc/self/ns/user") == 0.
+        fs::metadata("/proc/self/ns/user").is_ok()
+    }
+
+    fn unprivileged_userns_disabled(&self) -> bool {
+        // RHEL7 module parameter: 'N' means disabled.
+        if let Ok(s) = fs::read_to_string("/sys/module/user_namespace/parameters/enable") {
+            if s.starts_with('N') {
+                return true;
+            }
+        }
+        // max_user_namespaces == 0 means disabled (Debian and others).
+        if let Ok(s) = fs::read_to_string("/proc/sys/user/max_user_namespaces") {
+            if s.trim() == "0" {
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn overflow() -> OverflowIds {
+        OverflowIds {
+            uid: 65534,
+            gid: 65534,
+        }
+    }
+
+    #[test]
+    fn reads_real_overflow_ids() {
+        let ids = OverflowIds::read().expect("overflow ids readable on Linux");
+        assert!(ids.uid != 0 && ids.gid != 0);
+    }
+
+    #[test]
+    fn single_line_map_without_map_root() {
+        let m = IdMap {
+            sandbox_uid: 1000,
+            parent_uid: 1000,
+            sandbox_gid: 1000,
+            parent_gid: 1000,
+            overflow: overflow(),
+            map_root: false,
+            deny_groups: true,
+        };
+        assert_eq!(m.uid_map_string(), "1000 1000 1\n");
+        assert_eq!(m.gid_map_string(), "1000 1000 1\n");
+    }
+
+    #[test]
+    fn map_root_adds_overflow_line_when_ids_nonzero() {
+        let m = IdMap {
+            sandbox_uid: 1000,
+            parent_uid: 1000,
+            sandbox_gid: 1000,
+            parent_gid: 1000,
+            overflow: overflow(),
+            map_root: true,
+            deny_groups: true,
+        };
+        assert_eq!(m.uid_map_string(), "0 65534 1\n1000 1000 1\n");
+        assert_eq!(m.gid_map_string(), "0 65534 1\n1000 1000 1\n");
+    }
+
+    #[test]
+    fn map_root_is_single_line_when_an_id_is_zero() {
+        // If sandbox or parent is already 0, the extra 0-mapping is skipped.
+        let m = IdMap {
+            sandbox_uid: 0,
+            parent_uid: 1000,
+            sandbox_gid: 1000,
+            parent_gid: 0,
+            overflow: overflow(),
+            map_root: true,
+            deny_groups: false,
+        };
+        assert_eq!(m.uid_map_string(), "0 1000 1\n");
+        assert_eq!(m.gid_map_string(), "1000 0 1\n");
+    }
+
+    #[test]
+    fn probe_reports_userns_supported_on_this_host() {
+        // This host has user namespaces (we run the sandbox on it).
+        assert!(SystemUsernsProbe.user_ns_supported());
+    }
+
+    use std::os::fd::OwnedFd;
+    use std::path::{Path, PathBuf};
+
+    fn fake_proc(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("bwrap-userns-{tag}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn open_dir(p: &Path) -> OwnedFd {
+        nix::fcntl::open(
+            p,
+            OFlag::O_PATH | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    fn id_map(map_root: bool, deny_groups: bool) -> IdMap {
+        IdMap {
+            sandbox_uid: 1000,
+            parent_uid: 1001,
+            sandbox_gid: 2000,
+            parent_gid: 2001,
+            overflow: overflow(),
+            map_root,
+            deny_groups,
+        }
+    }
+
+    #[test]
+    fn write_fills_all_three_files_in_a_fake_proc() {
+        let proc = fake_proc("write");
+        let me = proc.join("self");
+        fs::create_dir_all(&me).unwrap();
+        for f in ["uid_map", "gid_map", "setgroups"] {
+            fs::write(me.join(f), b"").unwrap();
+        }
+        let fd = open_dir(&proc);
+        id_map(true, true)
+            .write(fd.as_fd(), MapTarget::SelfProc)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(me.join("uid_map")).unwrap(),
+            "0 65534 1\n1000 1001 1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(me.join("gid_map")).unwrap(),
+            "0 65534 1\n2000 2001 1\n"
+        );
+        assert_eq!(fs::read_to_string(me.join("setgroups")).unwrap(), "deny\n");
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn write_targets_a_pid_directory_and_skips_setgroups_when_allowed() {
+        let proc = fake_proc("pid");
+        let dir = proc.join("4242");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("uid_map"), b"").unwrap();
+        fs::write(dir.join("gid_map"), b"").unwrap();
+        fs::write(dir.join("setgroups"), b"allow\n").unwrap();
+        let fd = open_dir(&proc);
+        id_map(false, false)
+            .write(fd.as_fd(), MapTarget::Pid(Pid::from_raw(4242)))
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(dir.join("uid_map")).unwrap(),
+            "1000 1001 1\n"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("gid_map")).unwrap(),
+            "2000 2001 1\n"
+        );
+        // deny_groups == false: setgroups is left alone.
+        assert_eq!(
+            fs::read_to_string(dir.join("setgroups")).unwrap(),
+            "allow\n"
+        );
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn missing_setgroups_file_is_tolerated() {
+        let proc = fake_proc("nosetgroups");
+        let me = proc.join("self");
+        fs::create_dir_all(&me).unwrap();
+        fs::write(me.join("uid_map"), b"").unwrap();
+        fs::write(me.join("gid_map"), b"").unwrap();
+        let fd = open_dir(&proc);
+        id_map(false, true)
+            .write(fd.as_fd(), MapTarget::SelfProc)
+            .unwrap();
+        assert_eq!(
+            fs::read_to_string(me.join("gid_map")).unwrap(),
+            "2000 2001 1\n"
+        );
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn write_errors_carry_bwrap_messages() {
+        let proc = fake_proc("errors");
+        let fd = open_dir(&proc);
+        // No /proc/self at all.
+        let e = id_map(false, true)
+            .write(fd.as_fd(), MapTarget::SelfProc)
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "open /proc/self failed: No such file or directory"
+        );
+        let e = id_map(false, true)
+            .write(fd.as_fd(), MapTarget::Pid(Pid::from_raw(7)))
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "open /proc/7 failed: No such file or directory"
+        );
+
+        // uid_map missing: fails before touching setgroups or gid_map.
+        let me = proc.join("self");
+        fs::create_dir_all(&me).unwrap();
+        fs::write(me.join("setgroups"), b"").unwrap();
+        fs::write(me.join("gid_map"), b"").unwrap();
+        let e = id_map(false, true)
+            .write(fd.as_fd(), MapTarget::SelfProc)
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "setting up uid map: No such file or directory"
+        );
+        assert_eq!(e.errno(), Some(Errno::ENOENT));
+        assert_eq!(fs::read(me.join("setgroups")).unwrap(), b"");
+        assert_eq!(fs::read(me.join("gid_map")).unwrap(), b"");
+
+        // gid_map missing: uid map and setgroups were written first.
+        fs::write(me.join("uid_map"), b"").unwrap();
+        fs::remove_file(me.join("gid_map")).unwrap();
+        let e = id_map(false, true)
+            .write(fd.as_fd(), MapTarget::SelfProc)
+            .unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "setting up gid map: No such file or directory"
+        );
+        assert_eq!(
+            fs::read_to_string(me.join("uid_map")).unwrap(),
+            "1000 1001 1\n"
+        );
+        assert_eq!(fs::read_to_string(me.join("setgroups")).unwrap(), "deny\n");
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn setgroups_error_other_than_enoent_is_fatal() {
+        let proc = fake_proc("sgerr");
+        let me = proc.join("self");
+        fs::create_dir_all(me.join("setgroups")).unwrap(); // a directory: EISDIR
+        fs::write(me.join("uid_map"), b"").unwrap();
+        fs::write(me.join("gid_map"), b"").unwrap();
+        let fd = open_dir(&proc);
+        let e = id_map(false, true)
+            .write(fd.as_fd(), MapTarget::SelfProc)
+            .unwrap_err();
+        assert_eq!(e.to_string(), "error writing to setgroups: Is a directory");
+        // gid_map must not have been written.
+        assert_eq!(fs::read(me.join("gid_map")).unwrap(), b"");
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn disable_userns_writes_one_to_the_sysctl() {
+        let proc = fake_proc("sysctl");
+        let dir = proc.join("sys/user");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("max_user_namespaces"), b"9\n").unwrap();
+        let fd = open_dir(&proc);
+        disable_user_namespaces(fd.as_fd()).unwrap();
+        // O_WRONLY without O_TRUNC: "1" overwrites the first byte.
+        assert_eq!(fs::read(dir.join("max_user_namespaces")).unwrap(), b"1\n");
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn disable_userns_reports_open_failure() {
+        let proc = fake_proc("sysctl-missing");
+        let fd = open_dir(&proc);
+        let e = disable_user_namespaces(fd.as_fd()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "cannot open /proc/sys/user/max_user_namespaces: No such file or directory"
+        );
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn disable_userns_reports_write_failure() {
+        // /dev/full accepts the open and fails every write with ENOSPC.
+        let proc = fake_proc("sysctl-full");
+        let dir = proc.join("sys/user");
+        fs::create_dir_all(&dir).unwrap();
+        std::os::unix::fs::symlink("/dev/full", dir.join("max_user_namespaces")).unwrap();
+        let fd = open_dir(&proc);
+        let e = disable_user_namespaces(fd.as_fd()).unwrap_err();
+        assert_eq!(
+            e.to_string(),
+            "sysctl user.max_user_namespaces = 1: No space left on device"
+        );
+        assert_eq!(e.errno(), Some(Errno::ENOSPC));
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn write_proc_file_write_failure_is_returned() {
+        let proc = fake_proc("full");
+        std::os::unix::fs::symlink("/dev/full", proc.join("uid_map")).unwrap();
+        let fd = open_dir(&proc);
+        assert_eq!(
+            write_proc_file(fd.as_fd(), "uid_map", b"x"),
+            Err(Errno::ENOSPC)
+        );
+        let _ = fs::remove_dir_all(&proc);
+    }
+
+    #[test]
+    fn map_target_proc_dir_names() {
+        assert_eq!(MapTarget::SelfProc.proc_dir(), "self");
+        assert_eq!(MapTarget::Pid(Pid::from_raw(31337)).proc_dir(), "31337");
+    }
+
+    #[test]
+    fn probe_unprivileged_disabled_matches_files() {
+        // Recompute the answer from the same two files, independently.
+        let rhel = fs::read_to_string("/sys/module/user_namespace/parameters/enable")
+            .is_ok_and(|s| s.starts_with('N'));
+        let zero =
+            fs::read_to_string("/proc/sys/user/max_user_namespaces").is_ok_and(|s| s.trim() == "0");
+        assert_eq!(
+            SystemUsernsProbe.unprivileged_userns_disabled(),
+            rhel || zero
+        );
+    }
+}

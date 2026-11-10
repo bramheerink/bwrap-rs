@@ -1,0 +1,38 @@
+[workspace]
+resolver = "3"
+members = ["crates/bwrap-sys", "crates/bwrap-core", "crates/bwrap-cli"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.87"
+# Port of bubblewrap, which is LGPL-2.0-or-later.
+license = "LGPL-2.0-or-later"
+description = "A byte-exact, 100% native Rust drop-in replacement for bubblewrap 0.13.1"
+repository = "https://github.com/bramheerink/bwrap-rs"
+publish = false
+
+[workspace.dependencies]
+# Only allowed external dependency. Raw syscalls go through the `nix::libc` re-export.
+nix = { version = "0.31.3", default-features = false }
+bwrap-sys = { path = "crates/bwrap-sys" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+multiple_unsafe_ops_per_block = "deny"
+cast_possible_truncation = "warn"
+cast_sign_loss = "warn"
+unwrap_used = "warn"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1

@@ -1,0 +1,8 @@
+/target
+**/*.rs.bk
+*.core
+
+# internal planning docs, not part of the public port
+DESIGN.md
+UPSTREAM-FINDINGS.md
+QE-REVIEW.md

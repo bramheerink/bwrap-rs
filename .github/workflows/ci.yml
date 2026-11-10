@@ -1,0 +1,50 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt / clippy / test / conformance
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install the Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Formatting
+        run: cargo fmt --all --check
+
+      - name: Clippy (warnings are errors)
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Build
+        run: cargo build --workspace --release
+
+      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor, which
+      # the host/differential tests and the conformance matrix need. Relax it
+      # (best-effort) BEFORE running them; where it cannot be relaxed, those
+      # tests skip themselves cleanly rather than fail.
+      - name: Allow unprivileged user namespaces
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+      - name: Unit and host tests
+        run: cargo test --workspace
+
+      # The conformance matrix runs the built binary through real user namespaces
+      # — the sandboxing syscall paths the unit tests skip when namespaces are
+      # unavailable. Byte-for-byte A/B against the real binary needs bubblewrap
+      # *0.13.1* specifically (the drop-in target); distro packages differ, so
+      # here the matrix runs our-binary-only (exercising the paths and the
+      # ours-only invariants). The byte-identical oracle run is done on a Fedora
+      # host that ships 0.13.1.
+      - name: Behavioural conformance (real sandbox)
+        run: OURS=target/release/bwrap tests/conformance.sh

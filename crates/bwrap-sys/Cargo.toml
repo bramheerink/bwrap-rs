@@ -1,0 +1,23 @@
+[package]
+name = "bwrap-sys"
+description = "The only crate in bwrap-rs that contains `unsafe`: thin, safe wrappers for syscalls nix does not cover."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+nix = { workspace = true, features = ["sched", "process"] }
+
+[dev-dependencies]
+nix = { workspace = true, features = ["sched", "process", "mount", "fs", "signal", "user"] }
+
+# Clone/fork/seccomp tests need a single-threaded process, which libtest's
+# harness is not. This test binary brings its own `main`.
+[[test]]
+name = "single_threaded"
+harness = false
+
+[lints]
+workspace = true

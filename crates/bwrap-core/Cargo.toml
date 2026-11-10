@@ -1,0 +1,56 @@
+[package]
+name = "bwrap-core"
+description = "Safe sandbox logic for bwrap-rs (forbid(unsafe_code))."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+bwrap-sys.workspace = true
+# fs: openat + Mode. process: Pid + prctl. mount: mount()/MsFlags.
+# net: if_nametoindex. socket: the NETLINK_ROUTE socket for loopback setup.
+# poll: monitor_child's poll loop. signal: SIGCHLD mask + signalfd.
+# user: getuid/setuid/setgid + Uid/Gid for the privilege handling.
+# term: ttyname(3) for the /dev/console host-tty detection.
+# hostname: sethostname(2) for --hostname.
+nix = { workspace = true, features = ["fs", "process", "mount", "net", "socket", "poll", "signal", "user", "term", "hostname"] }
+
+[dev-dependencies]
+nix = { workspace = true, features = ["fs", "process", "mount", "sched", "user"] }
+
+# userns / newroot / capability tests need a single-threaded process and a real
+# `clone(CLONE_NEWUSER)`, which libtest's harness cannot give; see the file.
+[[test]]
+name = "namespaces"
+harness = false
+
+# Real bind/tmpfs/mqueue mounts need a user+mount namespace and a single-
+# threaded process; see the file.
+[[test]]
+name = "mount_host"
+harness = false
+
+# Loopback setup needs a user+net namespace; single-threaded for the clone.
+[[test]]
+name = "net_host"
+harness = false
+
+# Seccomp apply needs a single-threaded fork + PR_SET_NO_NEW_PRIVS.
+[[test]]
+name = "seccomp_host"
+harness = false
+
+# monitor_child + do_init need real forks, a pipe and a signalfd (no namespace).
+[[test]]
+name = "process_host"
+harness = false
+
+# pivot_into_newroot + setup_newroot need a real user+mount namespace.
+[[test]]
+name = "newroot_host"
+harness = false
+
+[lints]
+workspace = true
