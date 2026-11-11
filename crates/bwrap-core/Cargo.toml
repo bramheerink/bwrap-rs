@@ -15,7 +15,7 @@ bwrap-sys.workspace = true
 # user: getuid/setuid/setgid + Uid/Gid for the privilege handling.
 # term: ttyname(3) for the /dev/console host-tty detection.
 # hostname: sethostname(2) for --hostname.
-nix = { workspace = true, features = ["fs", "process", "mount", "net", "socket", "poll", "signal", "user", "term", "hostname"] }
+nix = { workspace = true, features = ["fs", "process", "sched", "mount", "net", "socket", "poll", "signal", "user", "term", "hostname"] }
 
 [dev-dependencies]
 nix = { workspace = true, features = ["fs", "process", "mount", "sched", "user"] }
