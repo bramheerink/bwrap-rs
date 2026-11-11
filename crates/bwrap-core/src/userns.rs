@@ -220,6 +220,11 @@ impl UsernsProbe for SystemUsernsProbe {
         fs::metadata("/proc/self/ns/user").is_ok()
     }
 
+    fn cgroup_ns_supported(&self) -> bool {
+        // bwrap: stat("/proc/self/ns/cgroup") == 0.
+        fs::metadata("/proc/self/ns/cgroup").is_ok()
+    }
+
     fn unprivileged_userns_disabled(&self) -> bool {
         // RHEL7 module parameter: 'N' means disabled.
         if let Ok(s) = fs::read_to_string("/sys/module/user_namespace/parameters/enable") {

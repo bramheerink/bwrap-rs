@@ -177,6 +177,15 @@ pub fn write_all(fd: std::os::fd::BorrowedFd<'_>, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Write an info/status document, mapping a write failure to bwrap's `dump_info`
+/// message (`Write to info_fd`) regardless of which fd it is, as C does.
+pub fn dump_info(fd: std::os::fd::BorrowedFd<'_>, data: &[u8]) -> Result<()> {
+    write_all(fd, data).map_err(|e| Error::Sys {
+        message: "Write to info_fd".into(),
+        errno: e.errno().unwrap_or(Errno::EIO),
+    })
+}
+
 /// Block `SIGCHLD` and reap any inherited zombies (`block_sigchild`). Must be
 /// called before the clone so the later `signalfd` in [`monitor_child`]
 /// receives the child's death instead of the default handler.
@@ -249,7 +258,11 @@ fn report_child_exit_status(
     if n != 1 {
         return Ok(());
     }
-    write_all(json_fd, exit_code_json(exitc).as_bytes())
+    // bwrap writes the final exit-code document with exit_on_error=false
+    // (bubblewrap.c:471): if the `--json-status-fd` reader closed early, the
+    // sandbox's real exit code must still be propagated, not turned into 1.
+    let _ = write_all(json_fd, exit_code_json(exitc).as_bytes());
+    Ok(())
 }
 
 /// Wait for the sandbox's main process and return its exit code (`monitor_child`).

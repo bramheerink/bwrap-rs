@@ -613,6 +613,35 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
     Ok(())
 }
 
+/// bwrap captures `old_cwd` with glibc's `get_current_dir_name()`, which returns
+/// `$PWD` when it is an absolute path that names the current directory (same
+/// dev/ino, no `.`/`..` components) and falls back to `getcwd()` otherwise. That
+/// keeps a *logical* cwd reached through a symlink (bash's `$PWD`) for the
+/// sandbox cwd and `PWD`, where a plain `getcwd()` would substitute the physical
+/// path — an observable difference for `pwd`/`$PWD` inside the sandbox.
+fn get_current_dir_name() -> nix::Result<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    if let Some(pwd) = std::env::var_os("PWD") {
+        let b = pwd.as_bytes();
+        let has_dot_component = b.windows(3).any(|w| w == b"/./")
+            || b.windows(4).any(|w| w == b"/../")
+            || b.ends_with(b"/.")
+            || b.ends_with(b"/..");
+        if b.first() == Some(&b'/') && !has_dot_component {
+            let pwd_path = std::path::Path::new(&pwd);
+            if let (Ok(at_pwd), Ok(at_dot)) = (
+                nix::sys::stat::stat(pwd_path),
+                nix::sys::stat::stat(std::path::Path::new(".")),
+            ) && at_pwd.st_dev == at_dot.st_dev
+                && at_pwd.st_ino == at_dot.st_ino
+            {
+                return Ok(std::path::PathBuf::from(&pwd));
+            }
+        }
+    }
+    nix::unistd::getcwd()
+}
+
 /// Build the sandbox root and run the setup (the `pivot_root` dance in bwrap's
 /// `main`): mount a tmpfs at `/tmp`, carve `newroot`/`oldroot` and any
 /// `--tmp-overlay` dirs, `pivot_root` into it, bind `/proc` so `/proc/self/fd`
@@ -623,7 +652,7 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
 /// default sandbox cwd. Must run in the sandbox's own mount namespace.
 pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<std::path::PathBuf> {
     use nix::mount::{MntFlags, umount2};
-    use nix::unistd::{chdir, fchdir, getcwd, mkdir, pivot_root};
+    use nix::unistd::{chdir, fchdir, mkdir, pivot_root};
 
     const BASE: &str = "/tmp";
     let dir_mode = NixMode::from_bits_truncate(0o755);
@@ -650,7 +679,7 @@ pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<std::path
     .with_mount_context(|| "Failed to mount tmpfs".to_string())?;
 
     // CWD during the whole setup; old/new root reached via "oldroot"/"newroot".
-    let old_cwd = getcwd().context("get_current_dir_name")?;
+    let old_cwd = get_current_dir_name().context("get_current_dir_name")?;
     chdir(BASE).context("chdir base_path")?;
 
     mkdir("newroot", dir_mode).context("Creating newroot failed")?;

@@ -51,6 +51,11 @@ pub fn run(
     crate::fs::set_force_openat_fallback(config.force_openat_fallback);
     crate::mount::set_force_mount_setattr_fallback(config.force_mount_setattr_fallback);
 
+    // The Rust runtime ignores SIGPIPE; bwrap (C) does not. Restore the default
+    // before the clone so the sandbox and the exec'd command inherit SIG_DFL,
+    // exactly as C leaves it.
+    bwrap_sys::process::reset_sigpipe_to_default();
+
     // The process that invoked bwrap, captured before the clone, for the
     // launcher's die-with-parent reparent check (#700).
     let invoker = nix::unistd::getppid();
@@ -145,18 +150,20 @@ pub fn run(
                             message: "Setting pidns failed".into(),
                             errno: e,
                         })
-                        .unwrap_or_else(|e| {
-                            eprintln!("{}", crate::log::error_line(&e.to_string()));
-                            bwrap_sys::process::exit_immediately(1)
-                        });
-                    let _ = fork_intermediate();
+                        .unwrap_or_else(die_in_child);
+                    fork_intermediate().unwrap_or_else(die_in_child);
                     if resolved.namespaces.pid == NsPolicy::Unshare {
-                        let _ = nix::sched::unshare(CloneFlags::CLONE_NEWPID);
-                        let _ = fork_intermediate();
+                        nix::sched::unshare(CloneFlags::CLONE_NEWPID)
+                            .map_err(|e| Error::Sys {
+                                message: "unshare pid ns".into(),
+                                errno: e,
+                            })
+                            .unwrap_or_else(die_in_child);
+                        fork_intermediate().unwrap_or_else(die_in_child);
                     }
                 }
                 drop(s0);
-                let _ = send_pid(s1.as_fd());
+                send_pid(s1.as_fd()).unwrap_or_else(die_in_child);
                 drop(s1);
             }
             let code = child(
@@ -236,7 +243,11 @@ fn parent(
             child.as_raw(),
             &ns_ids,
         );
-        write_all(borrow(fd), doc.as_bytes())?;
+        crate::process::dump_info(borrow(fd), doc.as_bytes())?;
+        // bwrap closes --info-fd here, right after writing and before the
+        // --userns-block-fd wait, so a helper that reads the info pipe to EOF
+        // before releasing the block fd does not deadlock.
+        bwrap_sys::fd::close_raw(fd);
     }
     if let Some(fd) = config.json_status_fd {
         let doc = crate::process::sandbox_info_json(
@@ -244,7 +255,7 @@ fn parent(
             child.as_raw(),
             &ns_ids,
         );
-        write_all(borrow(fd), doc.as_bytes())?;
+        crate::process::dump_info(borrow(fd), doc.as_bytes())?;
     }
 
     // With `--userns-block-fd`, an external process writes the child's maps and
@@ -480,11 +491,13 @@ fn child(
                     keep.push(efd.as_fd().as_raw_fd());
                 }
                 keep.extend(config.sync_fds.iter().copied());
-                // Keep the /proc handle the walk itself reads through; it is
-                // O_CLOEXEC and drops with `child`, so it must not be closed by
-                // the walk (a later double close would abort).
+                // Keep the /proc handle out of the walk (it is reading through
+                // it, and a later double close would abort), then close it right
+                // after: bwrap closes proc_fd in pid 1 too, so the sandbox keeps
+                // no descriptor pointing at the host /proc.
                 keep.push(proc_fd.as_raw_fd());
                 bwrap_sys::process::close_extra_fds(proc_fd.as_fd(), &keep).context("fdwalk")?;
+                drop(proc_fd);
                 return do_init(
                     ev_w.as_ref().map(AsFd::as_fd),
                     app,
@@ -752,6 +765,14 @@ fn create_pid_socketpair() -> Result<(OwnedFd, OwnedFd)> {
 /// Fork to actually enter a pid namespace joined/created via setns/unshare (which
 /// only affect children). The parent half is not needed and exits (bwrap's
 /// `fork_intermediate_child`); only the child returns.
+/// Print an error the way bwrap's `die` does and exit the sandbox child with 1.
+/// Used on the clone-child setup path, where we cannot return a `Result`.
+/// Generic in the (never produced) return type so it fits `unwrap_or_else`.
+fn die_in_child<T>(e: Error) -> T {
+    eprintln!("{}", crate::log::error_line(&e.to_string()));
+    bwrap_sys::process::exit_immediately(1)
+}
+
 fn fork_intermediate() -> Result<()> {
     match bwrap_sys::process::fork_single_threaded() {
         Ok(nix::unistd::ForkResult::Parent { .. }) => bwrap_sys::process::exit_immediately(0),
@@ -810,19 +831,23 @@ fn read_all_fd(fd: std::os::fd::RawFd) -> Result<Vec<u8>> {
     let bf = bwrap_sys::fd::borrow_raw(fd);
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
-    loop {
+    let result = loop {
         match read(bf, &mut buf) {
-            Ok(0) => return Ok(out),
+            Ok(0) => break Ok(out),
             Ok(n) => out.extend_from_slice(&buf[..n]),
             Err(Errno::EINTR) => {}
             Err(e) => {
-                return Err(Error::Sys {
+                break Err(Error::Sys {
                     message: "Can't read seccomp data".into(),
                     errno: e,
                 });
             }
         }
-    }
+    };
+    // bwrap's `seccomp_program_new` reads the fd and closes it (before the pid-1
+    // fork), so `--seccomp FD` cannot leak into the sandboxed process.
+    bwrap_sys::fd::close_raw(fd);
+    result
 }
 
 /// The post-env environment as an ordered list of `NAME=VALUE` entries.

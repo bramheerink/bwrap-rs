@@ -107,6 +107,8 @@ printf -- '--setenv\0AFD\0yes\0/bin/sh\0-c\0echo $AFD\0' > "$WORK/args.nul"
 # (its dir is bound at /cbin, which is not on the host PATH). Resolving it tests
 # that the command search uses the sandbox PATH, like execvp — the flatpak bug.
 mkdir -p "$WORK/cbin"; printf '#!/bin/sh\necho CUSTOM-PATH-OK\n' > "$WORK/cbin/zzconform"; chmod +x "$WORK/cbin/zzconform"
+printf '%s\0' --setenv X Y > "$WORK/argsx.nul"       # a passed-fd whose fd must not leak
+mkdir -p "$WORK/real"; ln -sfn real "$WORK/link"      # logical-cwd ($PWD) via a symlink
 
 echo "Running conformance matrix (HAVE_REAL=$HAVE_REAL)..."
 
@@ -125,6 +127,21 @@ ab  clearenv         -- "${BASE[@]}" --clearenv --setenv ONLY me /usr/bin/env
 # zzconform lives only in /cbin (set as PATH here), so finding it proves the
 # search uses the sandbox PATH. This broke every flatpak launch ("execvp smile").
 ab  path-search      -- "${BASE[@]}" --ro-bind "$WORK/cbin" /cbin --setenv PATH /cbin zzconform
+
+# === regressions from the C<->Rust parity audit =============================
+# Passed fds (--args / --seccomp) must be closed after reading, not leaked into
+# the sandbox (bubblewrap.c:1815 / seccomp_program_new); the sandbox fd list
+# must then be byte-identical to C.
+abx args-fd-noleak    '%B --bind / / --dev /dev --proc /proc --args 9 /bin/sh -c "ls /proc/self/fd" 9<"'"$WORK"'/argsx.nul"'
+abx seccomp-fd-noleak '%B --bind / / --dev /dev --proc /proc --seccomp 9 /bin/sh -c "ls /proc/self/fd" 9<"'"$WORK"'/allow.bpf"'
+# The Rust runtime ignores SIGPIPE; reset to default before exec so a broken
+# pipe in the sandbox behaves like C (no spurious "Broken pipe").
+ab  sigpipe          -- --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok'
+# Logical cwd: $PWD reached through a symlink is kept (get_current_dir_name),
+# not canonicalised to the physical path.
+abx cwd-logical       'cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd'
+# An empty SELinux label is rejected exactly as C (libselinux writes the NUL).
+ab  empty-exec-label -- "${BASE[@]}" --exec-label '' /bin/true
 ab  chdir            -- "${BASE[@]}" --chdir /usr /bin/sh -c 'pwd'
 ab  chdir-missing    -- "${BASE[@]}" --chdir /no/such /bin/true
 ab  level-prefix     -- --level-prefix "${BASE[@]}" --bind /no/such /x /bin/true

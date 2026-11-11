@@ -174,6 +174,23 @@ pub fn replace_environ(env: &[(std::ffi::CString, std::ffi::CString)]) {
     }
 }
 
+/// Restore SIGPIPE to its default disposition (`SIG_DFL`).
+///
+/// The Rust runtime sets SIGPIPE to `SIG_IGN` at startup, and the disposition
+/// survives `exec`. bwrap (C) never touches SIGPIPE, so without this the
+/// sandboxed command would inherit `SIG_IGN` where C leaves `SIG_DFL` —
+/// e.g. `bwrap … sh -c 'yes | head -1'` prints a spurious "Broken pipe" only
+/// under the port. Call it before the clone so the whole sandbox, and the
+/// exec'd command, match C.
+pub fn reset_sigpipe_to_default() {
+    use nix::sys::signal::{SigHandler, Signal, signal};
+    // SAFETY: installs `SIG_DFL` for SIGPIPE from the single-threaded startup
+    // path. `SIG_DFL` is always a valid disposition and runs no Rust code.
+    unsafe {
+        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+    }
+}
+
 /// Close every open file descriptor greater than 2 (stdio) that is not in
 /// `keep`, by walking the fd directory of `proc` (bwrap's `fdwalk` +
 /// `close_extra_fds`).
@@ -201,7 +218,9 @@ pub fn close_extra_fds(proc: BorrowedFd<'_>, keep: &[RawFd]) -> io::Result<()> {
         )
     };
     if dir_fd < 0 {
-        return Err(io::Error::last_os_error());
+        // bwrap's fdwalk silently ignores a /proc/self/fd it cannot open
+        // rather than treating it as fatal; match that.
+        return Ok(());
     }
     // SAFETY: `fdopendir` takes ownership of the freshly opened `dir_fd`; the
     // matching `closedir` below frees the stream and the fd. On failure we close

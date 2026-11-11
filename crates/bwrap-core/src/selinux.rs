@@ -130,7 +130,14 @@ fn write_attr(path: &str, value: &[u8]) -> std::result::Result<(), nix::errno::E
         .write(true)
         .open(path)
         .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(0)))?;
-    f.write_all(value)
+    // libselinux writes the context with its trailing NUL (`strlen + 1`). We
+    // must do the same: an empty label then becomes a lone `\0`, which the
+    // kernel rejects with EINVAL ("invalid label : Invalid argument"), matching
+    // C — whereas writing zero bytes would be silently accepted.
+    let mut buf = Vec::with_capacity(value.len() + 1);
+    buf.extend_from_slice(value);
+    buf.push(0);
+    f.write_all(&buf)
         .map_err(|e| Errno::from_raw(e.raw_os_error().unwrap_or(0)))?;
     Ok(())
 }

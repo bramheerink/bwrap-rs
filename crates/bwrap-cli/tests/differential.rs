@@ -438,5 +438,37 @@ fn build_checks() -> Vec<Check> {
         }),
     ));
 
+    // Regression (audit F1): `--unshare-cgroup-try` must actually unshare the
+    // cgroup namespace when the kernel supports it (it was parsed but dropped).
+    // Ours-only: the cgroup ns inside the sandbox must differ from the host's.
+    v.push((
+        "cgroup-try-unshares",
+        Box::new(|_| {
+            let host = std::fs::read_link("/proc/self/ns/cgroup")
+                .map(|p| p.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if host.is_empty() {
+                return Ok(()); // no cgroup-ns support on this kernel; skip
+            }
+            let args = base_with(&[
+                "--unshare-cgroup-try",
+                "/bin/sh",
+                "-c",
+                "readlink /proc/self/ns/cgroup",
+            ]);
+            let a: Vec<&str> = args.iter().map(String::as_str).collect();
+            let o = run(OURS, &a);
+            exit_is(&o, 0)?;
+            let inside = String::from_utf8_lossy(&o.stdout).trim().to_string();
+            if inside.is_empty() || inside == host {
+                Err(format!(
+                    "--unshare-cgroup-try did not unshare (inside={inside:?} host={host:?})"
+                ))
+            } else {
+                Ok(())
+            }
+        }),
+    ));
+
     v
 }

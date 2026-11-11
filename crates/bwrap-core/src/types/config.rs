@@ -100,6 +100,10 @@ pub trait UsernsProbe {
     /// For `--unshare-user-try`: whether *unprivileged* user namespaces are
     /// disabled (RHEL7 module param `N`, or `max_user_namespaces` == 0).
     fn unprivileged_userns_disabled(&self) -> bool;
+    /// `stat("/proc/self/ns/cgroup") == 0`: the kernel supports cgroup
+    /// namespaces. Gates `--unshare-cgroup` (bwrap dies without it) and
+    /// `--unshare-cgroup-try` (used only when available).
+    fn cgroup_ns_supported(&self) -> bool;
 }
 
 /// The parsed options, mirroring bwrap's `opt_*` globals before resolution.
@@ -280,6 +284,20 @@ impl Config {
             ));
         }
 
+        // cgroup namespace (bubblewrap.c:3068-3084): `--unshare-cgroup` requires
+        // kernel support — bwrap dies otherwise — while `--unshare-cgroup-try`
+        // enables it only when available. Both probe `/proc/self/ns/cgroup`.
+        let cgroup_unshare = if self.unshare_cgroup {
+            if !probe.cgroup_ns_supported() {
+                return Err(Error::invalid(
+                    "Cannot create new cgroup namespace because the kernel does not support it",
+                ));
+            }
+            true
+        } else {
+            self.unshare_cgroup_try && probe.cgroup_ns_supported()
+        };
+
         let ns = |unshare: bool| {
             if unshare {
                 NsPolicy::Unshare
@@ -296,9 +314,7 @@ impl Config {
                 net: ns(self.unshare_net),
                 ipc: ns(self.unshare_ipc),
                 uts: ns(self.unshare_uts),
-                // cgroup_try is resolved against the system later (module 11);
-                // the explicit flag is all we can decide purely here.
-                cgroup: ns(self.unshare_cgroup),
+                cgroup: ns(cgroup_unshare),
             },
             sandbox_uid,
             sandbox_gid,
@@ -318,6 +334,9 @@ mod tests {
         }
         fn unprivileged_userns_disabled(&self) -> bool {
             false
+        }
+        fn cgroup_ns_supported(&self) -> bool {
+            true
         }
     }
 
@@ -482,6 +501,9 @@ mod tests {
                 true
             }
             fn unprivileged_userns_disabled(&self) -> bool {
+                true
+            }
+            fn cgroup_ns_supported(&self) -> bool {
                 true
             }
         }

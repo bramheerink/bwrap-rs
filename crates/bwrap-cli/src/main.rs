@@ -37,7 +37,12 @@ struct Host;
 
 impl ParseHost for Host {
     fn read_args(&mut self, fd: RawFd) -> Result<Vec<u8>, Error> {
-        read_fd_fully(fd).map_err(|e| Error::Sys {
+        // bwrap closes the --args fd right after reading (bubblewrap.c:1815), so
+        // it never leaks into the sandbox and a repeated `--args N N` re-read
+        // fails with EBADF as in C. Close it regardless of the read result.
+        let r = read_fd_fully(fd);
+        bwrap_sys::fd::close_raw(fd);
+        r.map_err(|e| Error::Sys {
             message: "Can't read --args data".into(),
             errno: e,
         })
