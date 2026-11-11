@@ -18,7 +18,7 @@ use nix::sched::CloneFlags;
 use nix::sys::stat::{Mode as NixMode, fstat};
 use std::os::fd::AsRawFd;
 
-use nix::unistd::{Pid, chdir, execvpe, read, setsid};
+use nix::unistd::{Pid, chdir, execvp, read, setsid};
 
 use crate::caps::{drop_bounding_set, set_ambient};
 use crate::error::{Context, Error, Result};
@@ -327,6 +327,19 @@ fn child(
             .with_context(|| format!("Can't set hostname to {hostname}"))?;
     }
 
+    // Open a single O_PATH handle to the host /proc and read the kernel
+    // overflow ids up front, before any pivot — exactly as bwrap does. Both are
+    // needed again after the pivot (to write the second-level uid/gid map and,
+    // with --disable-userns, to lock userns), but the sandbox root may not mount
+    // /proc at all: `--dev` without `--proc` (as GNOME's glycin image loaders
+    // do) leaves no /proc behind. Reading or reopening /proc late would then
+    // fail and abort the sandbox. The O_PATH fd keeps the host procfs reachable
+    // via openat() across the pivot; every tests had `--proc /proc`, which is
+    // why this path went unseen.
+    let proc_fd = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, NixMode::empty())
+        .context("Can't open /proc")?;
+    let overflow = OverflowIds::read()?;
+
     // `--dev` mounts devpts, which needs the mounter to be root in the user
     // namespace. In that case we first map the real id to 0, then (after the
     // pivot) create a second user namespace mapping 0 back to the sandbox id.
@@ -340,9 +353,6 @@ fn child(
     // Unprivileged: write our own uid/gid map inside the new user namespace.
     // With `--userns-block-fd` an external process writes the maps instead.
     if unshare_user && config.userns_block_fd.is_none() {
-        let overflow = OverflowIds::read()?;
-        let proc_fd = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, NixMode::empty())
-            .context("Can't open /proc")?;
         let idmap = IdMap {
             sandbox_uid: ns_uid,
             parent_uid: real_uid,
@@ -401,17 +411,12 @@ fn child(
             || config.disable_userns)
     {
         if config.disable_userns {
-            let proc_fd = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, NixMode::empty())
-                .context("Can't open /proc")?;
             crate::userns::disable_user_namespaces(proc_fd.as_fd())?;
         }
         nix::sched::unshare(CloneFlags::CLONE_NEWUSER).context("unshare user ns")?;
         // The new userns restored the bounding set; clear it again (keeping the
         // requested caps), as bwrap's drop_cap_bounding_set(false) does.
         drop_bounding_set(requested)?;
-        let overflow = OverflowIds::read()?;
-        let proc_fd = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, NixMode::empty())
-            .context("Can't open /proc")?;
         IdMap {
             sandbox_uid: resolved.sandbox_uid,
             parent_uid: ns_uid,
@@ -475,7 +480,11 @@ fn child(
                     keep.push(efd.as_fd().as_raw_fd());
                 }
                 keep.extend(config.sync_fds.iter().copied());
-                bwrap_sys::process::close_extra_fds(&keep).context("fdwalk")?;
+                // Keep the /proc handle the walk itself reads through; it is
+                // O_CLOEXEC and drops with `child`, so it must not be closed by
+                // the walk (a later double close would abort).
+                keep.push(proc_fd.as_raw_fd());
+                bwrap_sys::process::close_extra_fds(proc_fd.as_fd(), &keep).context("fdwalk")?;
                 return do_init(
                     ev_w.as_ref().map(AsFd::as_fd),
                     app,
@@ -871,7 +880,17 @@ fn compute_cwd(
     Ok(b"/".to_vec())
 }
 
-/// `execvpe` the command with `argv0` applied and the computed environment.
+/// `execvp` the command with `argv0` applied and the computed environment,
+/// exactly as bwrap does.
+///
+/// The environment is applied to the real `environ` first ([`replace_environ`],
+/// the one place that mutation lives), then `execvp` resolves the command and
+/// runs it. This matters: `execvp`'s `PATH` search reads the global `environ`,
+/// so the sandbox `PATH` must be installed there — not merely passed as an
+/// `envp` vector. Using `execvpe` with an `envp` instead looks the command up in
+/// bwrap's *own* `PATH`, which is the bug that broke every flatpak launch
+/// (`execvp smile: No such file`). Deferring to real `execvp` also gives the
+/// `_CS_PATH` default and the ENOEXEC shell fallback for free.
 fn exec_command(config: &Config, env: &[(Vec<u8>, Vec<u8>)]) -> Result<i32> {
     let exec_path = CString::new(config.command[0].as_bytes())
         .map_err(|_| Error::invalid("command contains a NUL byte"))?;
@@ -884,17 +903,13 @@ fn exec_command(config: &Config, env: &[(Vec<u8>, Vec<u8>)]) -> Result<i32> {
     for a in &config.command[1..] {
         argv.push(CString::new(a.as_bytes()).map_err(|_| Error::invalid("arg NUL"))?);
     }
-    let envp: Vec<CString> = env
+    let envp: Vec<(CString, CString)> = env
         .iter()
-        .filter_map(|(k, v)| {
-            let mut e = k.clone();
-            e.push(b'=');
-            e.extend_from_slice(v);
-            CString::new(e).ok()
-        })
+        .filter_map(|(k, v)| Some((CString::new(k.clone()).ok()?, CString::new(v.clone()).ok()?)))
         .collect();
-    match execvpe(&exec_path, &argv, &envp) {
-        Ok(_) => unreachable!("execvpe returns only on error"),
+    bwrap_sys::process::replace_environ(&envp);
+    match execvp(&exec_path, &argv) {
+        Ok(_) => unreachable!("execvp returns only on error"),
         Err(e) => Err(Error::Sys {
             message: format!("execvp {}", config.command[0]).into(),
             errno: e,

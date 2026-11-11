@@ -283,7 +283,12 @@ pub fn monitor_child(
     {
         keep.push(fd.as_raw_fd());
     }
-    bwrap_sys::process::close_extra_fds(&keep).context("fdwalk")?;
+    // The monitor runs in the launcher, which never pivots, so the host /proc is
+    // always reachable; open a handle for the fd walk (bwrap's `proc_fd`).
+    let proc_fd = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty())
+        .context("Can't open /proc")?;
+    keep.push(proc_fd.as_raw_fd());
+    bwrap_sys::process::close_extra_fds(proc_fd.as_fd(), &keep).context("fdwalk")?;
 
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGCHLD);

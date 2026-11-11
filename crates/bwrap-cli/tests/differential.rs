@@ -13,7 +13,12 @@ use std::process::{Command, ExitCode, Output};
 
 /// Our freshly-built binary (Cargo exposes its path to this bin crate's tests).
 const OURS: &str = env!("CARGO_BIN_EXE_bwrap");
-const REAL: &str = "/usr/bin/bwrap";
+/// The reference bwrap to compare against. `BWRAP_REAL` overrides the default,
+/// which matters when ours is installed as `/usr/bin/bwrap` (a soak-test setup):
+/// point it at the stock build, e.g. `BWRAP_REAL=/usr/bin/bwrap.backup`.
+fn real_bin() -> String {
+    std::env::var("BWRAP_REAL").unwrap_or_else(|_| "/usr/bin/bwrap".to_string())
+}
 
 /// A minimal read-only sandbox that is the SAME on any usr-merged distribution:
 /// bind `/usr` and recreate the usr-merge symlinks, so the command, its loader
@@ -64,7 +69,7 @@ fn base_with(extra: &[&str]) -> Vec<String> {
 
 /// Is the system bwrap exactly the drop-in target (0.13.1)?
 fn real_is_target() -> bool {
-    match Command::new(REAL).arg("--version").output() {
+    match Command::new(real_bin()).arg("--version").output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == "bubblewrap 0.13.1",
         Err(_) => false,
     }
@@ -134,7 +139,7 @@ fn differential(
     let o = run(OURS, args);
     want(&o)?;
     if have_real {
-        let r = run(REAL, args);
+        let r = run(&real_bin(), args);
         if o.status.code() != r.status.code() {
             return Err(format!(
                 "exit differs: ours={:?} real={:?}",
@@ -239,6 +244,98 @@ fn build_checks() -> Vec<Check> {
         }),
     ));
 
+    // Regression (glycin): a sandbox with `--dev` but NO `--proc`. `--dev`
+    // triggers bwrap's devpts "second user namespace" dance, which writes a
+    // uid/gid map and walks fds *after* the pivot — but the sandbox root here
+    // has no `/proc`. bwrap reads the kernel overflow ids and reaches `/proc`
+    // through a single O_PATH handle opened before the pivot; reading `/proc`
+    // by path late (as we once did) aborts with "Can't read
+    // /proc/sys/kernel/overflowuid" / "fdwalk". This is exactly the shape GNOME's
+    // glycin image loaders use (`--dev` without `--proc`); every other case here
+    // mounts `--proc`, which is why the whole suite missed it.
+    v.push((
+        "dev-without-proc",
+        Box::new(|real| {
+            let args = [
+                "--unshare-user",
+                "--dev",
+                "/dev",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "/usr/bin/true",
+            ];
+            differential(&args, |o| exit_is(o, 0), real)
+        }),
+    ));
+
+    // Regression (flatpak): resolve a BARE command name through a PATH set in the
+    // sandbox env. bwrap uses execvp, whose PATH search reads the environment it
+    // installs — not bwrap's own environ. `zzdiff` lives only in a dir bound at
+    // /cbin (absent from the host PATH), so finding it proves the search uses the
+    // sandbox PATH. Getting this wrong broke every flatpak launch ("execvp smile:
+    // No such file"); every other case here runs an absolute path, hiding it.
+    v.push((
+        "path-search-exec",
+        Box::new(|real| {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = std::env::temp_dir().join(format!("bwrap-ps-{}", std::process::id()));
+            let cbin = dir.join("cbin");
+            std::fs::create_dir_all(&cbin).unwrap();
+            let app = cbin.join("zzdiff");
+            std::fs::write(&app, "#!/bin/sh\necho CUSTOM-PATH-OK\n").unwrap();
+            std::fs::set_permissions(&app, std::fs::Permissions::from_mode(0o755)).unwrap();
+            let cbin_s = cbin.to_str().unwrap();
+            let args = [
+                "--unshare-user",
+                "--ro-bind",
+                "/usr",
+                "/usr",
+                "--symlink",
+                "usr/bin",
+                "/bin",
+                "--symlink",
+                "usr/lib",
+                "/lib",
+                "--symlink",
+                "usr/lib64",
+                "/lib64",
+                "--proc",
+                "/proc",
+                "--ro-bind",
+                cbin_s,
+                "/cbin",
+                "--setenv",
+                "PATH",
+                "/cbin",
+                "zzdiff",
+            ];
+            let res = differential(
+                &args,
+                |o| {
+                    exit_is(o, 0)?;
+                    if o.stdout == b"CUSTOM-PATH-OK\n" {
+                        Ok(())
+                    } else {
+                        Err(format!("stdout={:?}", String::from_utf8_lossy(&o.stdout)))
+                    }
+                },
+                real,
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+            res
+        }),
+    ));
+
     // Error grammar: a missing bind source must match C byte-for-byte on stderr
     // (regression for the resolve_symlinks_in_ops "Can't find source path" fix).
     v.push((
@@ -313,7 +410,11 @@ fn build_checks() -> Vec<Check> {
             let o = sh(&line);
             let res = exit_is(&o, 0);
             if res.is_ok() && real {
-                let rline = format!("{REAL} --seccomp 9 {base} /bin/true 9<{}", bpf.display());
+                let rline = format!(
+                    "{} --seccomp 9 {base} /bin/true 9<{}",
+                    real_bin(),
+                    bpf.display()
+                );
                 let r = sh(&rline);
                 if r.status.code() != Some(0) {
                     let _ = std::fs::remove_dir_all(&dir);

@@ -103,6 +103,10 @@ open(sys.argv[1],'wb').write(b''.join(struct.pack('<HBBI',*p) for p in prog))
 PY
 printf 'hello-from-fd\n' > "$WORK/data.txt"
 printf -- '--setenv\0AFD\0yes\0/bin/sh\0-c\0echo $AFD\0' > "$WORK/args.nul"
+# A uniquely-named command, reachable only through a PATH set in the sandbox env
+# (its dir is bound at /cbin, which is not on the host PATH). Resolving it tests
+# that the command search uses the sandbox PATH, like execvp — the flatpak bug.
+mkdir -p "$WORK/cbin"; printf '#!/bin/sh\necho CUSTOM-PATH-OK\n' > "$WORK/cbin/zzconform"; chmod +x "$WORK/cbin/zzconform"
 
 echo "Running conformance matrix (HAVE_REAL=$HAVE_REAL)..."
 
@@ -116,6 +120,11 @@ invx args-bad-fd 1 "" '%B --args 8 '"$B"' /bin/true'
 ab  setenv           -- "${BASE[@]}" --setenv FOO bar /bin/sh -c 'echo $FOO'
 ab  unsetenv         -- "${BASE[@]}" --unsetenv PATH /bin/sh -c 'echo p=${PATH-unset}'
 ab  clearenv         -- "${BASE[@]}" --clearenv --setenv ONLY me /usr/bin/env
+# Regression (flatpak): resolve a bare command via the sandbox PATH. bwrap uses
+# execvp, whose PATH search reads the environment it installs — not bwrap's own.
+# zzconform lives only in /cbin (set as PATH here), so finding it proves the
+# search uses the sandbox PATH. This broke every flatpak launch ("execvp smile").
+ab  path-search      -- "${BASE[@]}" --ro-bind "$WORK/cbin" /cbin --setenv PATH /cbin zzconform
 ab  chdir            -- "${BASE[@]}" --chdir /usr /bin/sh -c 'pwd'
 ab  chdir-missing    -- "${BASE[@]}" --chdir /no/such /bin/true
 ab  level-prefix     -- --level-prefix "${BASE[@]}" --bind /no/such /x /bin/true
@@ -132,6 +141,13 @@ ab  robind-try       -- "${BASE[@]}" --ro-bind-try /no/such /x /bin/true
 ab  robind-is-ro     -- "${BASE[@]}" --ro-bind /usr /u /bin/sh -c 'touch /u/x 2>&1; echo e=$?'
 ab  dev-bind         -- "${BASE[@]}" --dev-bind /dev /d /bin/sh -c 'test -c /d/null && echo yes'
 ab  dev-bind-try     -- "${BASE[@]}" --dev-bind-try /no/such /x /bin/true
+# Regression (glycin): --dev WITHOUT --proc. --dev triggers bwrap's devpts
+# "second user namespace" path, which writes a uid/gid map and walks fds after
+# the pivot — but this sandbox has no /proc. bwrap reads the kernel overflow ids
+# and reaches /proc through a single O_PATH handle opened before the pivot;
+# reading /proc by path late aborts here. Every BASE case mounts --proc, so this
+# shape (what GNOME's glycin image loaders use) went uncovered.
+ab  dev-without-proc -- --unshare-user --dev /dev --ro-bind /usr /usr --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/bin /bin /usr/bin/true
 ab  remount-ro       -- "${BASE[@]}" --tmpfs /t --remount-ro /t /bin/sh -c 'touch /t/f 2>&1; echo e=$?'
 
 # === fs construction ======================================================

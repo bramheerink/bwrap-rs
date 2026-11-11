@@ -17,7 +17,7 @@
 
 use std::fmt;
 use std::io;
-use std::os::fd::RawFd;
+use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
 
 use nix::errno::Errno;
 use nix::libc::{self, c_ulong, pid_t};
@@ -154,32 +154,90 @@ pub fn exit_immediately(status: i32) -> ! {
     unsafe { libc::_exit(status) }
 }
 
+/// Replace the process environment with `env` (`clearenv` + `setenv` per entry).
+///
+/// bwrap builds the sandbox environment on the real `environ` and then calls
+/// `execvp`, so the command's `PATH` search and the child's environment both
+/// come from it. The caller does the same: set the environment here, then
+/// `execvp`. (`std::env::set_var` is `unsafe` under edition 2024 and forbidden
+/// in the pure-safe crates, so this one wrapper owns the mutation.)
+///
+/// Sound because the sandbox child is single-threaded at exec time (see the
+/// module caveat): no other thread can race on `environ`.
+pub fn replace_environ(env: &[(std::ffi::CString, std::ffi::CString)]) {
+    // SAFETY: clears `environ`; single-threaded here, so nothing races.
+    unsafe { libc::clearenv() };
+    for (name, value) in env {
+        // SAFETY: both are valid NUL-terminated C strings owned by the caller
+        // for this call; setenv copies them. Single-threaded as above.
+        unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) };
+    }
+}
+
 /// Close every open file descriptor greater than 2 (stdio) that is not in
-/// `keep`, by walking `/proc/self/fd` (bwrap's `fdwalk` + `close_extra_fds`).
+/// `keep`, by walking the fd directory of `proc` (bwrap's `fdwalk` +
+/// `close_extra_fds`).
+///
+/// `proc` is an `O_PATH` handle to the host `/proc`, opened before any pivot;
+/// the directory is listed with `openat(proc, "self/fd")`, never via the
+/// `/proc/self/fd` path. This matches bwrap, which threads a single `proc_fd`
+/// through, and is required because the sandbox root need not mount `/proc` at
+/// all (`--dev` without `--proc`, as glycin does) — a path lookup would then
+/// fail right before `exec`.
 ///
 /// Called in the sandboxed child just before `exec` so that no stray host fd
 /// leaks in. The fd numbers are collected while the directory is open, then
-/// closed after the directory handle is dropped; closing an already-closed or
+/// closed after the directory handle is closed; closing an already-closed or
 /// invalid number yields `EBADF`, which is ignored, exactly as bwrap does.
-pub fn close_extra_fds(keep: &[RawFd]) -> io::Result<()> {
+pub fn close_extra_fds(proc: BorrowedFd<'_>, keep: &[RawFd]) -> io::Result<()> {
     let mut candidates: Vec<RawFd> = Vec::new();
-    {
-        for entry in std::fs::read_dir("/proc/self/fd")? {
-            let entry = entry?;
-            let name = entry.file_name();
-            if let Some(n) = name.to_str().and_then(|s| s.parse::<RawFd>().ok())
-                && n > 2
-                && !keep.contains(&n)
-            {
-                candidates.push(n);
-            }
+    // SAFETY: `openat` with a valid directory fd and a static NUL-terminated
+    // path. On failure it returns -1 and sets errno, which we surface.
+    let dir_fd = unsafe {
+        libc::openat(
+            proc.as_raw_fd(),
+            c"self/fd".as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if dir_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: `fdopendir` takes ownership of the freshly opened `dir_fd`; the
+    // matching `closedir` below frees the stream and the fd. On failure we close
+    // `dir_fd` ourselves and surface errno.
+    let dirp = unsafe { libc::fdopendir(dir_fd) };
+    if dirp.is_null() {
+        let err = io::Error::last_os_error();
+        // SAFETY: `dir_fd` is still a valid, unclaimed fd here.
+        unsafe { libc::close(dir_fd) };
+        return Err(err);
+    }
+    loop {
+        // SAFETY: `dirp` is a valid `DIR*`; `readdir` returns a pointer valid
+        // until the next `readdir`/`closedir`, or NULL at end of stream.
+        let ent = unsafe { libc::readdir(dirp) };
+        if ent.is_null() {
+            break;
         }
-    } // The ReadDir (and its own directory fd) is dropped here.
+        // SAFETY: `ent` is a valid `dirent` pointer (checked non-null above);
+        // `d_name` is an inline array within it.
+        let d_name = unsafe { (*ent).d_name.as_ptr() };
+        // SAFETY: `d_name` points at a NUL-terminated C string in that `dirent`.
+        let name = unsafe { std::ffi::CStr::from_ptr(d_name) };
+        if let Ok(n) = name.to_str().unwrap_or("").parse::<RawFd>()
+            && n > 2
+            && n != dir_fd
+            && !keep.contains(&n)
+        {
+            candidates.push(n);
+        }
+    }
+    // SAFETY: closes the `DIR*` stream and its underlying `dir_fd`.
+    unsafe { libc::closedir(dirp) };
     for fd in candidates {
         // SAFETY: `close` takes an fd number and touches none of our memory. A
-        // stale number (e.g. the just-dropped directory fd) returns EBADF; we
-        // ignore it, as bwrap's fdwalk does. Nothing opens a new fd between the
-        // drop above and this loop, so no live fd can have been recycled.
+        // stale number returns EBADF; we ignore it, as bwrap's fdwalk does.
         unsafe {
             libc::close(fd);
         }
