@@ -11,6 +11,7 @@ pub mod mount;
 pub mod net;
 pub mod privs;
 pub mod process;
+pub mod profile;
 pub mod run;
 pub mod seccomp;
 pub mod selinux;

@@ -56,6 +56,10 @@ pub fn run(
     // exactly as C leaves it.
     bwrap_sys::process::reset_sigpipe_to_default();
 
+    // Open the optional profile log (BWRAP_RS_PROFILE) before the clone so the
+    // sandbox child inherits the fd. A no-op when the variable is unset.
+    crate::profile::init();
+
     // The process that invoked bwrap, captured before the clone, for the
     // launcher's die-with-parent reparent check (#700).
     let invoker = nix::unistd::getppid();
@@ -316,6 +320,7 @@ fn child(
     drop(cw_r);
     let mut exec_parent = nix::unistd::getppid();
 
+    let sp = crate::profile::span("child.switch_user");
     switch_to_user_with_privs(
         unshare_user,
         config.userns_fd.is_some(),
@@ -325,6 +330,7 @@ fn child(
         real_gid,
         resolved.sandbox_gid,
     )?;
+    drop(sp);
 
     if ns.net == NsPolicy::Unshare {
         crate::net::loopback_setup()?;
@@ -388,7 +394,9 @@ fn child(
     // Resolve symlinks in the op sources against the real root before pivoting
     // (and fail early on a missing source with the right message).
     let resolved_ops = resolve_symlinks_in_ops(&config.ops)?;
+    let sp = crate::profile::span("child.setup_newroot");
     let old_cwd = pivot_into_newroot(&resolved_ops, &ctx)?;
+    drop(sp);
 
     // Close the op source fds now that setup has consumed them, so the exec'd
     // sandbox never inherits them (bwrap's `close_ops_fd`, called right after
@@ -460,7 +468,9 @@ fn child(
     }
 
     // Load seccomp now (reads the fds), apply just before exec.
+    let sp = crate::profile::span("child.seccomp_load");
     let seccomp = SeccompPrograms::load(&config.seccomp, read_all_fd)?;
+    drop(sp);
 
     nix::sys::stat::umask(old_umask);
 

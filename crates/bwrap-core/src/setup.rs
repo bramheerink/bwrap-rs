@@ -297,10 +297,31 @@ fn make_dest(
 /// Execute the resolved setup ops against the prepared `/newroot` (bwrap's
 /// `setup_newroot`). Sources are read from `/oldroot`. Must run after the root
 /// tmpfs and `pivot_root` are in place.
+/// A stable `'static` profiler label per setup-op kind.
+fn op_label(op: &SetupOp) -> &'static str {
+    match op {
+        SetupOp::Bind { .. } => "op.bind",
+        SetupOp::BindFd { .. } => "op.bind_fd",
+        SetupOp::Overlay { .. } => "op.overlay",
+        SetupOp::Proc { .. } => "op.proc",
+        SetupOp::Dev { .. } => "op.dev",
+        SetupOp::Tmpfs { .. } => "op.tmpfs",
+        SetupOp::Mqueue { .. } => "op.mqueue",
+        SetupOp::Dir { .. } => "op.dir",
+        SetupOp::File { .. } => "op.file",
+        SetupOp::BindData { .. } => "op.bind_data",
+        SetupOp::Symlink { .. } => "op.symlink",
+        SetupOp::RemountRo { .. } => "op.remount_ro",
+        SetupOp::Chmod { .. } => "op.chmod",
+    }
+}
+
 pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
     let mut tmp_overlay_idx = 0usize;
 
     for op in ops {
+        // Per-op timing for the profiler (BWRAP_RS_PROFILE); no-op when off.
+        let _sp = crate::profile::span(op_label(op));
         match op {
             SetupOp::Bind {
                 src,
