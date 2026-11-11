@@ -183,11 +183,10 @@ pub fn replace_environ(env: &[(std::ffi::CString, std::ffi::CString)]) {
 /// under the port. Call it before the clone so the whole sandbox, and the
 /// exec'd command, match C.
 pub fn reset_sigpipe_to_default() {
-    use nix::sys::signal::{SigHandler, Signal, signal};
     // SAFETY: installs `SIG_DFL` for SIGPIPE from the single-threaded startup
     // path. `SIG_DFL` is always a valid disposition and runs no Rust code.
     unsafe {
-        let _ = signal(Signal::SIGPIPE, SigHandler::SigDfl);
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
 }
 

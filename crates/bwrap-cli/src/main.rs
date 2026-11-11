@@ -4,6 +4,8 @@
 
 #![forbid(unsafe_code)]
 
+mod trace;
+
 use std::os::fd::RawFd;
 use std::process::ExitCode;
 
@@ -78,7 +80,7 @@ fn main() -> ExitCode {
     // variable is unset or empty, so the drop-in behaviour and output stay
     // byte-identical to bwrap. Logged first, from the raw argv, so even
     // invocations we then reject (e.g. non-UTF-8 argv) are still captured.
-    trace_invocation(&argv_os);
+    trace::invocation(&argv_os);
     let argv0 = argv_os
         .first()
         .map(|s| s.to_string_lossy().into_owned())
@@ -92,7 +94,7 @@ fn main() -> ExitCode {
     {
         Ok(v) => v,
         Err(_) => {
-            trace_outcome("err=non-utf8-argv");
+            trace::outcome("err=non-utf8-argv");
             eprintln!("bwrap: non-UTF-8 arguments are not yet supported by this build");
             return ExitCode::FAILURE;
         }
@@ -114,7 +116,7 @@ fn main() -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            trace_outcome(&format!("err={e}"));
+            trace::outcome(&format!("err={e}"));
             eprintln!("{}", bwrap_core::log::error_line(&e.to_string()));
             return ExitCode::FAILURE;
         }
@@ -122,106 +124,20 @@ fn main() -> ExitCode {
 
     match launch(config) {
         Ok(code) => {
-            trace_outcome(&format!("exit={code}"));
+            trace::outcome(&format!("exit={code}"));
             ExitCode::from(u8::try_from(code).unwrap_or(255))
         }
         // bwrap prints the full usage to stderr for the "no command" error.
         Err(Error::Usage) => {
-            trace_outcome("err=usage");
+            trace::outcome("err=usage");
             eprint!("{}", usage(&argv0));
             ExitCode::FAILURE
         }
         Err(e) => {
-            trace_outcome(&format!("err={e}"));
+            trace::outcome(&format!("err={e}"));
             eprintln!("{}", bwrap_core::log::error_line(&e.to_string()));
             ExitCode::FAILURE
         }
-    }
-}
-
-/// Resolve where to write the invocation log, or `None` to disable it.
-///
-/// `BWRAP_RS_LOG` (non-empty) wins; otherwise the first line of the root-owned
-/// file `/etc/bwrap-rs-log`, if present, is used. The file fallback makes
-/// logging independent of session-environment propagation — every caller logs,
-/// however it was launched (flatpak, glycin, Claude Code's own sandbox) — which
-/// an env var alone cannot guarantee. When the variable is unset and the file
-/// is absent, the binary stays a byte-exact drop-in: at most one failed `open`,
-/// which changes no observable output.
-///
-/// Note: those callers' argv can contain secrets such as proxy credentials.
-/// Point the log at a private, mode-0600 file and do not share it.
-fn log_path() -> Option<std::ffi::OsString> {
-    if let Some(p) = std::env::var_os("BWRAP_RS_LOG")
-        && !p.is_empty()
-    {
-        return Some(p);
-    }
-    let contents = std::fs::read_to_string("/etc/bwrap-rs-log").ok()?;
-    let line = contents.lines().next().unwrap_or("").trim();
-    (!line.is_empty()).then(|| std::ffi::OsString::from(line))
-}
-
-/// Append one line to `path`. Best-effort: any error (unwritable path, full
-/// disk) is ignored, and nothing is ever written to stdout/stderr, so logging
-/// can never change the sandbox's observable output.
-fn trace(path: &std::ffi::OsStr, record: &str) {
-    use std::io::Write as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-    {
-        let _ = f.write_all(record.as_bytes());
-    }
-}
-
-/// Seconds since the Unix epoch, for a cheap, dependency-free timestamp.
-fn trace_now() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
-/// Log the full invocation (argv), shell-quoted so a captured line can be
-/// replayed. Uses the raw `OsString` argv so non-UTF-8 arguments are still
-/// recorded (lossily), unlike the parse path which rejects them.
-fn trace_invocation(argv: &[std::ffi::OsString]) {
-    let Some(path) = log_path() else {
-        return;
-    };
-    let mut line = format!("t={} pid={} argv:", trace_now(), std::process::id());
-    for a in argv {
-        line.push(' ');
-        line.push_str(&sh_quote(&a.to_string_lossy()));
-    }
-    line.push('\n');
-    trace(&path, &line);
-}
-
-/// Log how an invocation ended (`exit=N`, or `err=…`), keyed by pid so it pairs
-/// with the matching `argv:` line.
-fn trace_outcome(outcome: &str) {
-    let Some(path) = log_path() else {
-        return;
-    };
-    trace(
-        &path,
-        &format!("t={} pid={} {outcome}\n", trace_now(), std::process::id()),
-    );
-}
-
-/// Minimal POSIX shell quoting: pass through a token of safe characters as-is,
-/// otherwise single-quote it (with `'` escaped as `'\''`).
-fn sh_quote(s: &str) -> String {
-    let safe = !s.is_empty()
-        && s.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_./:=@%+,-".contains(&b));
-    if safe {
-        s.to_string()
-    } else {
-        format!("'{}'", s.replace('\'', "'\\''"))
     }
 }
 
