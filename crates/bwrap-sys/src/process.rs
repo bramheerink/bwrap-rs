@@ -174,19 +174,59 @@ pub fn replace_environ(env: &[(std::ffi::CString, std::ffi::CString)]) {
     }
 }
 
-/// Restore SIGPIPE to its default disposition (`SIG_DFL`).
+/// The SIGPIPE disposition the process was started with, captured before the
+/// Rust runtime replaces it (see [`CAPTURE_INHERITED_SIGPIPE`]). Stored as the
+/// raw `sighandler_t` (`SIG_DFL` is 0, `SIG_IGN` is 1, else a handler address).
+/// Initialised to `SIG_DFL` so a missed capture degrades to C's usual case, not
+/// to the runtime's `SIG_IGN`.
+static INHERITED_SIGPIPE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
+
+/// Record the inherited SIGPIPE disposition during ELF startup, before `main`
+/// and before the Rust runtime overrides SIGPIPE with `SIG_IGN`.
 ///
-/// The Rust runtime sets SIGPIPE to `SIG_IGN` at startup, and the disposition
-/// survives `exec`. bwrap (C) never touches SIGPIPE, so without this the
-/// sandboxed command would inherit `SIG_IGN` where C leaves `SIG_DFL` —
-/// e.g. `bwrap … sh -c 'yes | head -1'` prints a spurious "Broken pipe" only
-/// under the port. Call it before the clone so the whole sandbox, and the
-/// exec'd command, match C.
-pub fn reset_sigpipe_to_default() {
-    // SAFETY: installs `SIG_DFL` for SIGPIPE from the single-threaded startup
-    // path. `SIG_DFL` is always a valid disposition and runs no Rust code.
+/// bwrap (C) never touches SIGPIPE: the sandboxed command inherits whatever
+/// disposition bwrap itself was launched with — normally `SIG_DFL`, but a
+/// parent that ignores SIGPIPE (a CI runner, some daemons) passes `SIG_IGN`
+/// through. The Rust runtime unconditionally installs `SIG_IGN` at startup and
+/// that survives `exec`, so to stay a faithful drop-in we must restore the
+/// *inherited* disposition before the clone (see [`restore_inherited_sigpipe`]),
+/// not force `SIG_DFL`. The inherited value is only observable before the
+/// runtime runs, so this `.init_array` constructor records it then.
+#[used]
+#[cfg_attr(
+    any(target_os = "linux", target_os = "android"),
+    unsafe(link_section = ".init_array")
+)]
+static CAPTURE_INHERITED_SIGPIPE: extern "C" fn() = {
+    extern "C" fn capture() {
+        // SAFETY: an all-zero `sigaction` is a valid value (SIG_DFL, no flags,
+        // empty mask); it is overwritten by the query below before being read.
+        let mut cur: libc::sigaction = unsafe { std::mem::zeroed() };
+        // SAFETY: runs single-threaded during ELF startup, before main and
+        // before the Rust runtime touches signals. A null `act` pointer only
+        // queries the current disposition into `cur`; nothing is installed.
+        let rc = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut cur) };
+        if rc == 0 {
+            INHERITED_SIGPIPE.store(cur.sa_sigaction, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    capture
+};
+
+/// Restore SIGPIPE to the disposition the process inherited at startup, undoing
+/// the Rust runtime's `SIG_IGN` so the sandbox and the exec'd command see
+/// exactly what C's child would. Call it before the clone.
+///
+/// (`SIG_DFL`/`SIG_IGN` are reinstalled faithfully; an inherited *custom*
+/// handler — essentially nonexistent for SIGPIPE — is reinstalled with default
+/// flags, still closer to C than forcing `SIG_DFL`.)
+pub fn restore_inherited_sigpipe() {
+    let disp = INHERITED_SIGPIPE.load(std::sync::atomic::Ordering::Relaxed);
+    // SAFETY: single-threaded startup path (before the clone). `disp` is a
+    // sighandler_t captured from a real SIGPIPE disposition, valid to reinstall.
     unsafe {
-        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+        libc::signal(libc::SIGPIPE, disp);
     }
 }
 

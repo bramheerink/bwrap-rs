@@ -156,9 +156,13 @@ ab  path-search      -- "${BASE[@]}" --ro-bind "$WORK/cbin" /cbin --setenv PATH 
 # must then be byte-identical to C.
 abx args-fd-noleak    '%B --bind / / --dev /dev --proc /proc --args 9 /bin/sh -c "ls /proc/self/fd" 9<"'"$WORK"'/argsx.nul"'
 abx seccomp-fd-noleak '%B --bind / / --dev /dev --proc /proc --seccomp 9 /bin/sh -c "ls /proc/self/fd" 9<"'"$WORK"'/allow.bpf"'
-# The Rust runtime ignores SIGPIPE; reset to default before exec so a broken
-# pipe in the sandbox behaves like C (no spurious "Broken pipe").
+# The Rust runtime forces SIGPIPE to SIG_IGN; bwrap must present the sandboxed
+# command the disposition it inherited, as C does. With the usual SIG_DFL a
+# broken pipe is silent; a parent that passed SIG_IGN through (`trap '' PIPE`,
+# as a CI runner does) must stay ignored, so `yes` prints "Broken pipe" under
+# both the port and C. Both ambients are pinned so neither regresses.
 ab  sigpipe          -- --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok'
+abx sigpipe-ign       "( trap '' PIPE; %B --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok' )"
 # Logical cwd: $PWD reached through a symlink is kept (get_current_dir_name),
 # not canonicalised to the physical path.
 abx cwd-logical       'cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd'

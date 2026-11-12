@@ -51,10 +51,12 @@ pub fn run(
     crate::fs::set_force_openat_fallback(config.force_openat_fallback);
     crate::mount::set_force_mount_setattr_fallback(config.force_mount_setattr_fallback);
 
-    // The Rust runtime ignores SIGPIPE; bwrap (C) does not. Restore the default
-    // before the clone so the sandbox and the exec'd command inherit SIG_DFL,
-    // exactly as C leaves it.
-    bwrap_sys::process::reset_sigpipe_to_default();
+    // The Rust runtime forces SIGPIPE to SIG_IGN at startup; bwrap (C) never
+    // touches SIGPIPE, so its child inherits whatever disposition bwrap was
+    // launched with. Restore that inherited disposition before the clone so the
+    // sandbox and the exec'd command match C — including when a parent passed
+    // SIG_IGN through (e.g. a CI runner), not just the usual SIG_DFL case.
+    bwrap_sys::process::restore_inherited_sigpipe();
 
     // Open the optional profile log (BWRAP_RS_PROFILE) before the clone so the
     // sandbox child inherits the fd. A no-op when the variable is unset.
