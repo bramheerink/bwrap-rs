@@ -43,11 +43,30 @@ well-formed invocation.
    rejected rather than read past. This never arises for the mountinfo a kernel
    actually produces; it is defensive hardening.
 
-6. **Non-UTF-8 arguments are not yet supported.** Arguments and paths that are
-   not valid UTF-8 are rejected with
+6. **Non-UTF-8 arguments are rejected (known, parked limitation).** Arguments and
+   paths that are not valid UTF-8 are rejected with
    `non-UTF-8 arguments are not yet supported by this build`, whereas bubblewrap
-   processes arbitrary byte strings. This is a current limitation, not a design
-   choice, and is planned to be lifted.
+   passes arbitrary byte strings straight through to `openat`/`mount`/`execvp`.
+   Byte-transparent paths are the correct Unix behaviour and the eventual target.
+   Reaching byte-exactness here means carrying raw bytes through the whole parser
+   — and through the error messages that embed a path — a change to the hot parse
+   path that is deliberately deferred to the pre-adoption polish rather than
+   rushed. The rejection is fail-closed, carries no security risk (the bytes only
+   ever reach syscalls, never an interpreter), and no well-formed UTF-8
+   invocation is affected; in practice no desktop caller (flatpak, glycin,
+   portals) ever hits it.
+
+7. **`--size` does not accept a `0b` binary literal.** bubblewrap parses
+   `--size` with the C library's `strtoull(.., 0)`. glibc 2.38+ extended that
+   base-0 autodetection to accept a `0b`/`0B` binary prefix, so on a recent
+   glibc system `--size 0b100…` is read as a binary number; on musl and older
+   glibc the same bubblewrap binary rejects it. `bwrap-rs` implements the
+   portable, standard base-0 rule (`0x`→hex, leading `0`→octal, else decimal)
+   and so rejects `0b…`, matching bubblewrap on musl and pre-2.38 glibc and
+   differing only from bubblewrap on glibc ≥ 2.38. This is a libc artefact
+   rather than a bubblewrap behaviour, affects only the obscure `0b` form (no
+   real caller uses it), and leaves every well-formed decimal/hex/octal size
+   identical.
 
 ## Everything else
 
