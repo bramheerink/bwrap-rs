@@ -8,6 +8,7 @@
 use std::os::fd::RawFd;
 
 use super::path::{HostPath, SandboxPath};
+use crate::cnum::c_strtou64;
 use crate::error::Error;
 
 /// A file mode (permission bits), `--perms` / `--chmod`.
@@ -29,57 +30,28 @@ impl Mode {
             // --perms and --chmod share the "octal argument <= 07777" wording.
             Error::invalid(format!("{option} takes an octal argument <= 07777"))
         };
-        let b = value.as_bytes();
-        if b.is_empty() {
-            return Err(bad()); // bwrap's argv[1][0] == '\0' check
-        }
-        let mut i = 0;
-        while i < b.len() && is_c_whitespace(b[i]) {
-            i += 1;
-        }
-        let neg = match b.get(i) {
-            Some(b'+') => {
-                i += 1;
-                false
-            }
-            Some(b'-') => {
-                i += 1;
-                true
-            }
-            _ => false,
-        };
-        let start = i;
-        let mut val: u64 = 0;
-        let mut overflow = false;
-        while i < b.len() && (b'0'..=b'7').contains(&b[i]) {
-            match val
-                .checked_mul(8)
-                .and_then(|v| v.checked_add(u64::from(b[i] - b'0')))
-            {
-                Some(v) => val = v,
-                None => overflow = true,
-            }
-            i += 1;
-        }
-        // No digits, or trailing junk (bwrap's `*endptr != '\0'`).
-        if i == start || i != b.len() {
+        let c = c_strtou64(value, 8);
+        // No digits (covers the empty string, i.e. bwrap's `argv[1][0] == '\0'`
+        // check), or trailing junk (bwrap's `*endptr != '\0'`).
+        if c.digits == 0 || c.end != value.len() {
             return Err(bad());
         }
         // strtoul returns ULONG_MAX on overflow regardless of sign (ERANGE), so
         // an overflowing value is rejected. Otherwise the sign negates the
-        // unsigned result (so "-0" is 0, "-5" wraps huge and is rejected).
-        let value = if overflow {
+        // unsigned result by wrapping (so "-0" is 0, "-5" wraps huge and is
+        // rejected).
+        let v = if c.overflow {
             u64::MAX
-        } else if neg {
-            0u64.wrapping_sub(val)
+        } else if c.neg {
+            0u64.wrapping_sub(c.val)
         } else {
-            val
+            c.val
         };
-        if value > 0o7777 {
+        if v > 0o7777 {
             return Err(bad());
         }
-        // value <= 0o7777 (4095), so it fits a u16.
-        Ok(Self(u16::try_from(value).unwrap_or(0)))
+        // v <= 0o7777 (4095), so it fits a u16.
+        Ok(Self(u16::try_from(v).unwrap_or(0)))
     }
 
     /// From raw bits (already known to be `<= 07777`).
@@ -97,12 +69,6 @@ impl std::fmt::Debug for Mode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "Mode(0o{:04o})", self.0)
     }
-}
-
-/// C `isspace`: space, tab, newline, vertical tab, form feed, carriage return.
-/// Rust's `is_ascii_whitespace` omits vertical tab (`\x0b`), so we match C here.
-pub(crate) fn is_c_whitespace(c: u8) -> bool {
-    matches!(c, b' ' | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d)
 }
 
 /// How a bind mount exposes its source.
@@ -295,14 +261,5 @@ mod tests {
         );
         assert_eq!(format!("{:?}", Mode::from_bits(0o640)), "Mode(0o0640)");
         assert_eq!(Mode::default().bits(), 0);
-    }
-
-    #[test]
-    fn c_whitespace_includes_vertical_tab() {
-        for c in [b' ', b'\t', b'\n', 0x0b, 0x0c, b'\r'] {
-            assert!(is_c_whitespace(c));
-        }
-        assert!(!is_c_whitespace(b'x'));
-        assert!(!is_c_whitespace(0));
     }
 }

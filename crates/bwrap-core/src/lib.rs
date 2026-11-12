@@ -4,6 +4,7 @@
 #![forbid(unsafe_code)]
 
 pub mod caps;
+pub mod cnum;
 pub mod error;
 pub mod fs;
 pub mod log;
