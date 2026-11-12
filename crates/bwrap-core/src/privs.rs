@@ -6,7 +6,7 @@
 //! configurations are refused.
 
 use nix::sys::prctl::set_dumpable;
-use nix::unistd::{Gid, Uid, getegid, geteuid, getgid, getuid, setgid, setuid};
+use nix::unistd::{Gid, Uid, geteuid, getuid, setgid, setuid};
 
 use crate::caps::{drop_all_caps, drop_bounding_set, has_caps, initial_requested};
 use crate::error::{Context, Error, Result};
@@ -81,16 +81,6 @@ pub fn drop_privs(keep: Option<CapSet>, cap_add_or_drop_used: bool, is_root: boo
     // No privs now, so make us dumpable: /proc/self is then owned by the user.
     set_dumpable(true).context("can't set dumpable")?;
     Ok(())
-}
-
-/// The real uid/gid, read once (helper for the orchestration).
-pub fn real_ids() -> (u32, u32) {
-    (getuid().as_raw(), getgid().as_raw())
-}
-
-/// The effective gid (helper for the orchestration).
-pub fn effective_gid() -> u32 {
-    getegid().as_raw()
 }
 
 #[cfg(test)]

@@ -168,8 +168,6 @@ pub struct Config {
     pub exec_label: Option<String>,
     /// `--file-label` (SELinux file context).
     pub file_label: Option<String>,
-    /// `--level-prefix` (prefix diagnostics with e.g. `<3>`).
-    pub level_prefix: bool,
     /// `--not-a-security-boundary`.
     pub not_a_security_boundary: bool,
     /// Seccomp source (`--seccomp` / `--add-seccomp-fd`).

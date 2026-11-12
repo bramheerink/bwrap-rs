@@ -168,9 +168,9 @@ impl Parser<'_> {
                 Ok(1)
             }
             "--level-prefix" => {
-                self.cfg.level_prefix = true;
                 // Take effect immediately, so a later parse warning/error is
-                // prefixed but an earlier one is not (bwrap's global).
+                // prefixed but an earlier one is not (bwrap's global). The flag
+                // lives only in the logger's atomic; there is no Config field.
                 self.host.set_level_prefix(true);
                 Ok(0)
             }

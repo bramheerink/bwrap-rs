@@ -92,10 +92,13 @@ impl Capability {
         }
     }
 
-    /// Parse a capability name as `--cap-add` / `--cap-drop` do.
+    /// Strict capability-name lookup — a construction helper for tests.
     ///
-    /// Case-insensitive, `CAP_` prefix required, matching `cap_from_name`'s
-    /// usual spelling. The error text matches bwrap's `die ("unknown cap: …")`.
+    /// Case-insensitive, `CAP_` prefix required. Production parses `--cap-add` /
+    /// `--cap-drop` through [`Capability::from_arg`], which reproduces libcap's
+    /// laxity; this strict exact-match form exists only to build known
+    /// capabilities in the unit and host tests. Do not use it on an argument —
+    /// it does not match bubblewrap's `--cap-add` grammar.
     pub fn from_name(name: &str) -> Result<Self, Error> {
         CAP_NAMES
             .iter()
@@ -211,7 +214,9 @@ impl CapSet {
         self.0
     }
 
-    /// Low and high 32-bit words, as bwrap's `requested_caps[0]`/`[1]`.
+    /// Low and high 32-bit words, as bwrap's `requested_caps[0]`/`[1]`
+    /// (test-only: nothing in production reads the split representation).
+    #[cfg(test)]
     pub fn words(self) -> (u32, u32) {
         ((self.0 & 0xffff_ffff) as u32, (self.0 >> 32) as u32)
     }
