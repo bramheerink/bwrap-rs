@@ -92,10 +92,13 @@ impl Capability {
         }
     }
 
-    /// Parse a capability name as `--cap-add` / `--cap-drop` do.
+    /// Strict capability-name lookup — a construction helper for tests.
     ///
-    /// Case-insensitive, `CAP_` prefix required, matching `cap_from_name`'s
-    /// usual spelling. The error text matches bwrap's `die ("unknown cap: …")`.
+    /// Case-insensitive, `CAP_` prefix required. Production parses `--cap-add` /
+    /// `--cap-drop` through [`Capability::from_arg`], which reproduces libcap's
+    /// laxity; this strict exact-match form exists only to build known
+    /// capabilities in the unit and host tests. Do not use it on an argument —
+    /// it does not match bubblewrap's `--cap-add` grammar.
     pub fn from_name(name: &str) -> Result<Self, Error> {
         CAP_NAMES
             .iter()
@@ -118,7 +121,10 @@ impl Capability {
     pub fn from_arg(arg: &str) -> Result<Self, Error> {
         let unknown = || Error::invalid(format!("unknown cap: {arg}"));
         if arg.as_bytes().first().is_some_and(u8::is_ascii_digit) {
-            match strtoul_base0_prefix(arg) {
+            // libcap reads the number with `strtoul(.., 0)` and ignores any
+            // trailing junk; the first byte is a digit here, so there is no
+            // sign or whitespace to skip and the magnitude is all we need.
+            match crate::cnum::c_strtou64(arg, 0).val {
                 n if n < 64 => Self::from_number(u8::try_from(n).unwrap_or(u8::MAX)),
                 _ => Err(unknown()),
             }
@@ -162,33 +168,6 @@ impl fmt::Debug for Capability {
     }
 }
 
-/// `strtoul(s, 0)` reading only the leading digits valid for the detected base
-/// (`0x`/`0X` hex, leading `0` octal, else decimal) and ignoring any trailing
-/// junk, exactly as libcap does for a numeric capability. `s` starts with a
-/// digit. Overflow saturates (the caller rejects anything `>= 64`).
-fn strtoul_base0_prefix(s: &str) -> u64 {
-    let b = s.as_bytes();
-    let (start, radix) = if b.len() >= 2 && b[0] == b'0' && (b[1] == b'x' || b[1] == b'X') {
-        (2, 16u32)
-    } else if b[0] == b'0' {
-        (1, 8u32) // the leading '0' is the value if no more octal digits follow
-    } else {
-        (0, 10u32)
-    };
-    let mut val: u64 = 0;
-    for &c in &b[start..] {
-        match (c as char).to_digit(radix) {
-            Some(d) => {
-                val = val
-                    .saturating_mul(u64::from(radix))
-                    .saturating_add(u64::from(d))
-            }
-            None => break,
-        }
-    }
-    val
-}
-
 /// A set of capabilities, one bit per capability number (bwrap's two
 /// `requested_caps` words joined into one `u64`).
 #[derive(Clone, Copy, PartialEq, Eq, Default, Hash)]
@@ -211,7 +190,9 @@ impl CapSet {
         self.0
     }
 
-    /// Low and high 32-bit words, as bwrap's `requested_caps[0]`/`[1]`.
+    /// Low and high 32-bit words, as bwrap's `requested_caps[0]`/`[1]`
+    /// (test-only: nothing in production reads the split representation).
+    #[cfg(test)]
     pub fn words(self) -> (u32, u32) {
         ((self.0 & 0xffff_ffff) as u32, (self.0 >> 32) as u32)
     }

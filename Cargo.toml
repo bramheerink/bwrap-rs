@@ -5,7 +5,7 @@ members = ["crates/bwrap-sys", "crates/bwrap-core", "crates/bwrap-cli"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.87"
+rust-version = "1.88"
 # Port of bubblewrap, which is LGPL-2.0-or-later.
 license = "LGPL-2.0-or-later"
 description = "A byte-exact, 100% native Rust drop-in replacement for bubblewrap 0.13.1"

@@ -12,6 +12,11 @@ bwrap-core = { path = "../bwrap-core" }
 bwrap-sys = { path = "../bwrap-sys" }
 nix = { workspace = true, features = ["fs", "user"] }
 
+[features]
+# Pass-through for the core setup profiler: `cargo build --features profile`
+# builds a `bwrap` that honours BWRAP_RS_PROFILE. Off by default (drop-in).
+profile = ["bwrap-core/profile"]
+
 # The `bwrap` binary: the orchestration entry point (module 11).
 [[bin]]
 name = "bwrap"

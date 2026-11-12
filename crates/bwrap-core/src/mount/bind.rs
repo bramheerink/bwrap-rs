@@ -110,10 +110,10 @@ impl fmt::Display for BindError {
             BindErrorKind::MountSetattr => format!("mount_setattr() failed at \"{path}\""),
         };
         f.write_str(&s)?;
-        if self.wants_errno() {
-            if let Some(e) = self.errno {
-                write!(f, ": {}", self.errno_text(e))?;
-            }
+        if self.wants_errno()
+            && let Some(e) = self.errno
+        {
+            write!(f, ": {}", self.errno_text(e))?;
         }
         Ok(())
     }
@@ -258,14 +258,11 @@ fn mount_setattr_fallback(resolved_dest: &[u8], opts: BindOptions) -> BindResult
                     if opts.fail_open {
                         // --not-a-security-boundary: warn and keep going, exactly
                         // as bwrap's warn() does (bind-mount.c:545).
-                        eprintln!(
-                            "{}",
-                            crate::log::warning_line(&format!(
-                                "Can't remount {} submount ({}), ignoring error",
-                                String::from_utf8_lossy(&sub.mountpoint),
-                                bwrap_sys::strerror(e),
-                            ))
-                        );
+                        crate::log::emit_err(&crate::log::warning_line(&format!(
+                            "Can't remount {} submount ({}), ignoring error",
+                            String::from_utf8_lossy(&sub.mountpoint),
+                            bwrap_sys::strerror(e),
+                        )));
                         continue;
                     }
                     return Err(BindError::new(

@@ -24,6 +24,17 @@ if [ -x "$REAL" ] && [ "$("$REAL" --version 2>/dev/null)" = "bubblewrap 0.13.1" 
     HAVE_REAL=1
 fi
 
+# REQUIRE_REAL=1 / REQUIRE_USERNS=1 turn a missing oracle or unavailable user
+# namespaces into a hard failure instead of a silent pass/skip. CI sets both, so
+# a run that cannot actually compare against bubblewrap 0.13.1 fails loudly
+# rather than reporting green against nothing.
+REQUIRE_REAL="${REQUIRE_REAL:-0}"
+REQUIRE_USERNS="${REQUIRE_USERNS:-0}"
+if [ "$REQUIRE_REAL" = 1 ] && [ "$HAVE_REAL" != 1 ]; then
+    echo "conformance: REQUIRE_REAL=1 but no bubblewrap 0.13.1 oracle at REAL=$REAL"
+    exit 1
+fi
+
 # A minimal read-only sandbox that is identical on any usr-merged distribution:
 # bind /usr and recreate the usr-merge symlinks, so the command, its loader and
 # its libraries resolve through /usr whether libc lives in /usr/lib64 (Fedora)
@@ -31,6 +42,10 @@ fi
 # sbin usr.
 BASE=(--unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc)
 if ! "$OURS" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
+    if [ "$REQUIRE_USERNS" = 1 ]; then
+        echo "conformance: REQUIRE_USERNS=1 but the base sandbox cannot start (user namespaces unavailable)"
+        exit 1
+    fi
     echo "SKIP: user namespaces unavailable in this environment"
     exit 0
 fi
@@ -48,12 +63,17 @@ ab() {
     local name="$1"; shift 2
     local oo oe oc ro re rc
     oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" = 1 ]; then
-        ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-        [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
-        [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-        [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    if [ "$HAVE_REAL" != 1 ]; then
+        # No oracle: we ran ours (a smoke check) but cannot prove byte-identity,
+        # so report SKIP rather than a dishonest pass. REQUIRE_REAL would already
+        # have aborted the run above.
+        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
+        return
     fi
+    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
+    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
+    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
+    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
     ok "$name"
 }
 
@@ -63,12 +83,14 @@ abx() {
     local name="$1" tmpl="$2"
     local oo oe oc ro re rc
     oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" = 1 ]; then
-        ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-        [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
-        [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-        [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    if [ "$HAVE_REAL" != 1 ]; then
+        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
+        return
     fi
+    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
+    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
+    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
+    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
     ok "$name"
 }
 
@@ -134,9 +156,13 @@ ab  path-search      -- "${BASE[@]}" --ro-bind "$WORK/cbin" /cbin --setenv PATH 
 # must then be byte-identical to C.
 abx args-fd-noleak    '%B --bind / / --dev /dev --proc /proc --args 9 /bin/sh -c "ls /proc/self/fd" 9<"'"$WORK"'/argsx.nul"'
 abx seccomp-fd-noleak '%B --bind / / --dev /dev --proc /proc --seccomp 9 /bin/sh -c "ls /proc/self/fd" 9<"'"$WORK"'/allow.bpf"'
-# The Rust runtime ignores SIGPIPE; reset to default before exec so a broken
-# pipe in the sandbox behaves like C (no spurious "Broken pipe").
+# The Rust runtime forces SIGPIPE to SIG_IGN; bwrap must present the sandboxed
+# command the disposition it inherited, as C does. With the usual SIG_DFL a
+# broken pipe is silent; a parent that passed SIG_IGN through (`trap '' PIPE`,
+# as a CI runner does) must stay ignored, so `yes` prints "Broken pipe" under
+# both the port and C. Both ambients are pinned so neither regresses.
 ab  sigpipe          -- --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok'
+abx sigpipe-ign       "( trap '' PIPE; %B --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok' )"
 # Logical cwd: $PWD reached through a symlink is kept (get_current_dir_name),
 # not canonicalised to the physical path.
 abx cwd-logical       'cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd'
@@ -155,6 +181,10 @@ ab  bind-missing     -- "${BASE[@]}" --bind /no/such /x /bin/true
 ab  bind-try         -- "${BASE[@]}" --bind-try /no/such /x /bin/true
 ab  robind-missing   -- "${BASE[@]}" --ro-bind /no/such /x /bin/true
 ab  robind-try       -- "${BASE[@]}" --ro-bind-try /no/such /x /bin/true
+# Regression (#6): a /proc source with a leading double slash must still be
+# treated as /proc (bwrap's component-aware has_path_prefix), so its magic link
+# is opened directly instead of failing in the in-root resolver.
+ab  robind-dslash-proc -- "${BASE[@]}" --tmpfs /t --ro-bind-try //proc/self/ns/user /t/x /bin/sh -c 'test -e /t/x && echo yes || echo no'
 ab  robind-is-ro     -- "${BASE[@]}" --ro-bind /usr /u /bin/sh -c 'touch /u/x 2>&1; echo e=$?'
 ab  dev-bind         -- "${BASE[@]}" --dev-bind /dev /d /bin/sh -c 'test -c /d/null && echo yes'
 ab  dev-bind-try     -- "${BASE[@]}" --dev-bind-try /no/such /x /bin/true
@@ -169,6 +199,12 @@ ab  remount-ro       -- "${BASE[@]}" --tmpfs /t --remount-ro /t /bin/sh -c 'touc
 
 # === fs construction ======================================================
 ab  symlink          -- "${BASE[@]}" --symlink /usr /u /bin/sh -c 'readlink /u'
+# Regression (#8): a mount whose destination inside the new root is a symlink
+# must be refused ("Can't mount on symlink destination"), so a symlink can't
+# redirect a bind/tmpfs/remount elsewhere. Cover the bind, tmpfs and remount ops.
+ab  symlink-dest-bind    -- "${BASE[@]}" --tmpfs /t --symlink /usr /t/x --bind /usr /t/x /bin/true
+ab  symlink-dest-tmpfs   -- "${BASE[@]}" --tmpfs /t --symlink /usr /t/x --tmpfs /t/x /bin/true
+ab  symlink-dest-remount -- "${BASE[@]}" --tmpfs /t --symlink /usr /t/x --remount-ro /t/x /bin/true
 ab  dir              -- "${BASE[@]}" --dir /made /bin/sh -c 'test -d /made && echo yes'
 ab  tmpfs            -- "${BASE[@]}" --tmpfs /t /bin/sh -c 'test -d /t && echo yes'
 ab  perms-dir        -- "${BASE[@]}" --perms 0750 --dir /d /bin/sh -c 'stat -c %a /d'
@@ -275,6 +311,21 @@ invx file-fd-leak      2 "No such file" '%B --file 7 /f '"$B"' /bin/sh -c "ls /p
 invx bind-data-fd-leak 2 "No such file" '%B --bind-data 7 /bd '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7<"'"$WORK"'/data.txt"'
 invx bind-fd-leak      2 "No such file" '%B --bind-fd 7 /bf '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7<"'"$WORK"'"'
 
+# Regression (#2, ours-only): if the launcher fails before releasing the child
+# (here an --info-fd write to a full fd makes the launcher exit 1), the child
+# must NOT run the command — no stray, unmonitored sandbox process. bwrap-rs
+# exits the child on EOF; bubblewrap would instead leave it blocked forever, so
+# this is an ours-only invariant, not an A/B case.
+noexec_marker="$WORK/noexec.marker"; rm -f "$noexec_marker"
+timeout 5 "$OURS" --ro-bind / / --bind "$WORK" "$WORK" --info-fd 9 \
+    /bin/sh -c "echo ran > '$noexec_marker'" 9>/dev/full >/dev/null 2>&1
+nc=$?
+if [ "$nc" = 1 ] && [ ! -e "$noexec_marker" ]; then
+    ok failed-launch-no-exec
+else
+    fail failed-launch-no-exec "rc=$nc marker=$([ -e "$noexec_marker" ] && echo present || echo absent)"
+fi
+
 # The monitor must not busy-loop: a sleeping sandbox should consume ~no CPU (a
 # POLLHUP spin would peg a core). Ours-only resource invariant (B1 regression).
 if command -v /usr/bin/time >/dev/null 2>&1; then
@@ -296,6 +347,6 @@ ab  file-label-bad   -- "${BASE[@]}" --file-label not_a_valid_label_t --dir /d /
 
 # ---- report ---------------------------------------------------------------
 echo
-echo "conformance: $PASS passed, $FAIL failed, $SKIP skipped (of $((PASS+FAIL)))"
+echo "conformance: $PASS passed, $FAIL failed, $SKIP skipped (of $((PASS+FAIL+SKIP)))"
 if [ "$FAIL" -gt 0 ]; then printf '%s\n' "${FAILED[@]}"; exit 1; fi
 echo "ALL PASS — every case byte-identical to /usr/bin/bwrap 0.13.1 (or ours-only invariant held)"

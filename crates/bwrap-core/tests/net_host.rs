@@ -91,6 +91,12 @@ fn main() -> ExitCode {
         Ok(ForkResult::Child) => std::process::exit(child(real_uid, real_gid)),
         Ok(ForkResult::Parent { child: c }) => wait(c),
         Err(ForkError::Sys(Errno::EPERM | Errno::ENOSPC | Errno::EINVAL | Errno::EUSERS)) => {
+            if std::env::var_os("BWRAP_RS_REQUIRE_USERNS").is_some() {
+                println!(
+                    "test net_host ... FAILED (BWRAP_RS_REQUIRE_USERNS set but user/net namespaces unavailable)"
+                );
+                return ExitCode::FAILURE;
+            }
             println!("test net_host ... SKIP (user/net namespaces unavailable)");
             return ExitCode::SUCCESS;
         }

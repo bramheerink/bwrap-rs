@@ -406,7 +406,10 @@ fn exercises_the_full_option_surface() {
     assert_eq!(cfg.hostname.as_deref(), Some("box"));
     assert_eq!(cfg.chdir.as_deref(), Some("/work"));
     assert_eq!(cfg.argv0.as_deref(), Some("sh"));
-    assert!(cfg.new_session && cfg.die_with_parent && cfg.as_pid_1 && cfg.level_prefix);
+    // `--level-prefix` has no Config field (its only effect is on the logger's
+    // global); that the full parse above accepts it is the coverage here, and
+    // its byte-exact output is checked by the conformance `level-prefix` case.
+    assert!(cfg.new_session && cfg.die_with_parent && cfg.as_pid_1);
     assert!(
         cfg.not_a_security_boundary
             && cfg.force_openat_fallback

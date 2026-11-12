@@ -2,6 +2,7 @@
 
 use std::os::fd::RawFd;
 
+use bwrap_core::cnum::c_strtou64;
 use bwrap_core::types::{
     BindKind, CapOp, Capability, Config, EnvOp, HostPath, Mode, OnMissing, OverlayUpper,
     SandboxPath, SeccompSource, SetupOp,
@@ -168,9 +169,9 @@ impl Parser<'_> {
                 Ok(1)
             }
             "--level-prefix" => {
-                self.cfg.level_prefix = true;
                 // Take effect immediately, so a later parse warning/error is
-                // prefixed but an earlier one is not (bwrap's global).
+                // prefixed but an earlier one is not (bwrap's global). The flag
+                // lives only in the logger's atomic; there is no Config field.
                 self.host.set_level_prefix(true);
                 Ok(0)
             }
@@ -662,11 +663,6 @@ fn dest(option: &str, value: &str) -> Result<SandboxPath> {
     SandboxPath::parse(option, value)
 }
 
-/// C `isspace`: Rust's `is_ascii_whitespace` omits vertical tab (`\x0b`).
-fn is_c_whitespace(c: u8) -> bool {
-    matches!(c, b' ' | 0x09 | 0x0a | 0x0b | 0x0c | 0x0d)
-}
-
 /// An environment variable name that `setenv`/`unsetenv` accept: non-empty and
 /// with no `=`.
 fn is_valid_env_name(name: &str) -> bool {
@@ -705,45 +701,26 @@ fn parse_id(value: &str, which: &str) -> Result<u32> {
 /// `strtol` does with `ERANGE`), or `None` on empty input / no digits /
 /// trailing junk. Leading C whitespace and a leading `+`/`-` are accepted.
 fn strtol10(value: &str) -> Option<i64> {
-    let b = value.as_bytes();
-    let mut i = 0;
-    while i < b.len() && is_c_whitespace(b[i]) {
-        i += 1;
-    }
-    let neg = match b.get(i) {
-        Some(b'+') => {
-            i += 1;
-            false
-        }
-        Some(b'-') => {
-            i += 1;
-            true
-        }
-        _ => false,
-    };
-    let start = i;
-    let mut val: i64 = 0;
-    let mut overflow = false;
-    while i < b.len() && b[i].is_ascii_digit() {
-        match val
-            .checked_mul(10)
-            .and_then(|v| v.checked_add(i64::from(b[i] - b'0')))
-        {
-            Some(v) => val = v,
-            None => overflow = true,
-        }
-        i += 1;
-    }
-    if i == start || i != b.len() {
+    let c = c_strtou64(value, 10);
+    // bwrap applies strtol's non-empty and full-consumption checks.
+    if c.digits == 0 || c.end != value.len() {
         return None; // no digits, or trailing junk
     }
-    // On overflow strtol returns LONG_MAX / LONG_MIN (ERANGE); bwrap stores that
-    // into an int without checking errno, so a huge negative narrows to 0 and a
-    // huge positive to -1.
-    if overflow {
-        return Some(if neg { i64::MIN } else { i64::MAX });
+    // strtol returns LONG_MAX / LONG_MIN on ERANGE: that is a u64 overflow, or a
+    // magnitude outside the signed `long` range even when it still fits a u64.
+    // bwrap stores the result into an int without checking errno, so a huge
+    // positive later narrows to -1 and a huge negative to 0.
+    const LONG_MAX_MAG: u64 = i64::MAX as u64; // |LONG_MAX|
+    const LONG_MIN_MAG: u64 = LONG_MAX_MAG + 1; // |LONG_MIN|
+    if c.overflow || (!c.neg && c.val > LONG_MAX_MAG) || (c.neg && c.val > LONG_MIN_MAG) {
+        return Some(if c.neg { i64::MIN } else { i64::MAX });
     }
-    Some(if neg { -val } else { val })
+    if c.neg && c.val == LONG_MIN_MAG {
+        return Some(i64::MIN); // the one magnitude that negates but cannot be held positive
+    }
+    // c.val <= LONG_MAX here, so it fits an i64.
+    let mag = i64::try_from(c.val).unwrap_or(i64::MAX);
+    Some(if c.neg { -mag } else { mag })
 }
 
 /// Parse `--perms`/`--chmod`: octal, `<= 07777`. Error text names `option`.
@@ -756,35 +733,25 @@ fn parse_perms(option: &str, value: &str) -> Result<Mode> {
 /// fully consumed, non-zero, `<= MAX_TMPFS_BYTES`.
 fn parse_size(value: &str) -> Result<u64> {
     let non_zero = "--size takes a non-zero number of bytes";
-    let b = value.as_bytes();
-    if b.first().is_none_or(|c| !c.is_ascii_digit()) {
+    // C guards with `isdigit(argv[1][0])`: the first byte must be a digit, which
+    // simultaneously rejects leading whitespace and any sign. Keep that guard —
+    // the shared scanner would otherwise skip them.
+    if value.as_bytes().first().is_none_or(|c| !c.is_ascii_digit()) {
         return Err(Error::invalid(non_zero));
     }
-    let (digits, radix) = if let Some(hex) = value
-        .strip_prefix("0x")
-        .or_else(|| value.strip_prefix("0X"))
-    {
-        (hex, 16)
-    } else if b[0] == b'0' && b.len() > 1 {
-        (&value[1..], 8)
-    } else {
-        (value, 10)
-    };
-    // `from_str_radix` would accept a leading '+' after the prefix (e.g.
-    // "0x+5"), but strtoull does not treat that as part of the number.
-    if digits.starts_with(['+', '-']) {
+    let c = c_strtou64(value, 0);
+    // `strtoull` sets ERANGE on overflow (bwrap's `errno != 0`), bwrap requires
+    // full consumption (`*endptr == '\0'`), and the result must be non-zero —
+    // all three share the "non-zero number of bytes" message.
+    if c.overflow || c.end != value.len() || c.val == 0 {
         return Err(Error::invalid(non_zero));
     }
-    let parsed = u64::from_str_radix(digits, radix).map_err(|_| Error::invalid(non_zero))?;
-    if parsed == 0 {
-        return Err(Error::invalid(non_zero));
-    }
-    if parsed > MAX_TMPFS_BYTES {
+    if c.val > MAX_TMPFS_BYTES {
         return Err(Error::invalid(format!(
             "--size (for tmpfs) is limited to {MAX_TMPFS_BYTES}"
         )));
     }
-    Ok(parsed)
+    Ok(c.val)
 }
 
 /// Split the bytes of an `--args` file into arguments, as bwrap does: NUL is
@@ -808,4 +775,126 @@ fn split_nul_args(bytes: &[u8]) -> Vec<String> {
         .into_iter()
         .map(|p| String::from_utf8_lossy(p).into_owned())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn strtol10_matches_c_long_semantics() {
+        assert_eq!(strtol10(" \t\x0b5"), Some(5)); // C whitespace, incl. vtab
+        assert_eq!(strtol10("+7"), Some(7));
+        assert_eq!(strtol10("-2147483648"), Some(-2_147_483_648));
+        assert_eq!(strtol10("4294967296"), Some(4_294_967_296));
+        assert_eq!(strtol10("9223372036854775807"), Some(i64::MAX));
+        assert_eq!(strtol10("-9223372036854775808"), Some(i64::MIN));
+        // Out of signed-long range but still within u64: strtol saturates (ERANGE).
+        assert_eq!(strtol10("9223372036854775808"), Some(i64::MAX));
+        assert_eq!(strtol10("-9223372036854775809"), Some(i64::MIN));
+        // Beyond u64 too.
+        assert_eq!(strtol10("99999999999999999999999"), Some(i64::MAX));
+        assert_eq!(strtol10("-99999999999999999999999"), Some(i64::MIN));
+        // Empty, no digits, or trailing junk ('x' is not a base-10 digit).
+        assert_eq!(strtol10(""), None);
+        assert_eq!(strtol10("5x"), None);
+        assert_eq!(strtol10("0x10"), None);
+    }
+
+    #[test]
+    fn parse_size_matches_c_strtoull_base0() {
+        assert_eq!(parse_size("0x10000").unwrap(), 0x10000);
+        assert_eq!(parse_size("010").unwrap(), 0o10);
+        assert_eq!(parse_size("1").unwrap(), 1);
+        // Trailing junk, zero, leading space / sign: all the "non-zero" message.
+        for bad in ["1e3", "00", "0x", " 5", "+5", "-5"] {
+            let e = parse_size(bad).unwrap_err();
+            assert_eq!(
+                e.to_string(),
+                "--size takes a non-zero number of bytes",
+                "{bad:?}"
+            );
+        }
+        // u64::MAX fits strtoull (no ERANGE) but exceeds the tmpfs cap.
+        assert!(
+            parse_size("18446744073709551615")
+                .unwrap_err()
+                .to_string()
+                .contains("limited to")
+        );
+        // One past u64::MAX is ERANGE, which bwrap reports as "non-zero".
+        assert_eq!(
+            parse_size("18446744073709551616").unwrap_err().to_string(),
+            "--size takes a non-zero number of bytes"
+        );
+    }
+
+    /// The three command-line number parsers are built on one scanner
+    /// (`c_strtou64`), but keep their own post-checks. This table feeds the same
+    /// tricky inputs to all three with independently hand-computed glibc
+    /// results, so a drift in the shared scan moves more than one column at once
+    /// and is caught here.
+    #[test]
+    fn the_three_callers_share_one_scanner() {
+        struct Row {
+            input: &'static str,
+            long: Option<i64>,  // strtol10: --uid/--gid/fd (base 10)
+            perms: Option<u16>, // Mode::parse_octal: --perms/--chmod (base 8)
+            size: Option<u64>,  // parse_size: --size (base 0, isdigit-guarded)
+        }
+        let rows = [
+            Row {
+                input: "0",
+                long: Some(0),
+                perms: Some(0),
+                size: None,
+            },
+            Row {
+                input: "10",
+                long: Some(10),
+                perms: Some(0o10),
+                size: Some(10),
+            },
+            Row {
+                input: "0x10",
+                long: None,
+                perms: None,
+                size: Some(0x10),
+            },
+            Row {
+                input: "010",
+                long: Some(10),
+                perms: Some(0o10),
+                size: Some(0o10),
+            },
+            Row {
+                input: " 5",
+                long: Some(5),
+                perms: Some(5),
+                size: None,
+            },
+            Row {
+                input: "5x",
+                long: None,
+                perms: None,
+                size: None,
+            },
+            Row {
+                input: "8",
+                long: Some(8),
+                perms: None,
+                size: Some(8),
+            },
+        ];
+        for r in rows {
+            assert_eq!(strtol10(r.input), r.long, "strtol10 {:?}", r.input);
+            assert_eq!(
+                Mode::parse_octal("--perms", r.input).ok().map(Mode::bits),
+                r.perms,
+                "parse_octal {:?}",
+                r.input
+            );
+            assert_eq!(parse_size(r.input).ok(), r.size, "parse_size {:?}", r.input);
+        }
+    }
 }

@@ -51,10 +51,12 @@ pub fn run(
     crate::fs::set_force_openat_fallback(config.force_openat_fallback);
     crate::mount::set_force_mount_setattr_fallback(config.force_mount_setattr_fallback);
 
-    // The Rust runtime ignores SIGPIPE; bwrap (C) does not. Restore the default
-    // before the clone so the sandbox and the exec'd command inherit SIG_DFL,
-    // exactly as C leaves it.
-    bwrap_sys::process::reset_sigpipe_to_default();
+    // The Rust runtime forces SIGPIPE to SIG_IGN at startup; bwrap (C) never
+    // touches SIGPIPE, so its child inherits whatever disposition bwrap was
+    // launched with. Restore that inherited disposition before the clone so the
+    // sandbox and the exec'd command match C — including when a parent passed
+    // SIG_IGN through (e.g. a CI runner), not just the usual SIG_DFL case.
+    bwrap_sys::process::restore_inherited_sigpipe();
 
     // Open the optional profile log (BWRAP_RS_PROFILE) before the clone so the
     // sandbox child inherits the fd. A no-op when the variable is unset.
@@ -110,8 +112,11 @@ pub fn run(
         None
     };
 
-    // Handshake and lifecycle pipes (8-byte payloads, like bwrap's eventfds).
-    let (cw_r, cw_w) = pipe_pair()?; // launcher -> child: "maps ready, go"
+    // Handshake and lifecycle fds (8-byte payloads, like bwrap's eventfds). The
+    // launcher->child "go" channel is a socketpair, not a pipe, so the launcher
+    // can signal with MSG_NOSIGNAL (see parent()) without risking SIGPIPE, while
+    // a stream socket still gives the child EOF if the launcher dies (see child()).
+    let (cw_r, cw_w) = child_wait_pair()?; // launcher -> child: "maps ready, go"
     // The event pipe (pid-1 -> monitor: exit status + 1) exists ONLY when there
     // is a pid-namespace init to report through it, exactly as bwrap creates its
     // eventfd only for `opt_unshare_pid && !opt_as_pid_1`. In every other case
@@ -177,7 +182,7 @@ pub fn run(
             match code {
                 Ok(c) => bwrap_sys::process::exit_immediately(c),
                 Err(e) => {
-                    eprintln!("{}", crate::log::error_line(&e.to_string()));
+                    crate::log::emit_err(&crate::log::error_line(&e.to_string()));
                     bwrap_sys::process::exit_immediately(1);
                 }
             }
@@ -270,8 +275,18 @@ fn parent(
         bwrap_sys::fd::close_raw(fd);
     }
 
-    // Let the child proceed now that its maps are set up.
-    write_all(cw_w.as_fd(), &1u64.to_ne_bytes())?;
+    // Let the child proceed now that its maps are set up. Ignore the result,
+    // exactly as bwrap does (bubblewrap.c:3181, "Ignore res, if e.g. the child
+    // died"): if the child is already gone the send fails, but we must still fall
+    // through to monitor_child to reap it and report its real exit status —
+    // instead of dying here (e.g. SIGPIPE/exit 141) and losing that status.
+    // MSG_NOSIGNAL keeps this one send from raising SIGPIPE; the launcher's own
+    // --info-fd/--json-status-fd writes keep C's SIG_DFL behaviour.
+    let _ = nix::sys::socket::send(
+        cw_w.as_raw_fd(),
+        &1u64.to_ne_bytes(),
+        nix::sys::socket::MsgFlags::MSG_NOSIGNAL,
+    );
     drop(cw_w);
 
     let json = config.json_status_fd.map(borrow);
@@ -313,11 +328,34 @@ fn child(
         bwrap_sys::fd::close_raw(fd);
     }
 
-    // Wait for the launcher to finish its setup. The launcher is alive here
-    // (it just signalled us), so this is the valid parent for die-with-parent.
+    // Wait for the launcher to finish its setup. A full 8-byte read is "go".
+    // Anything else — EOF (the launcher died before signalling) or an error —
+    // means the launcher is gone: exit without printing and without running the
+    // command, so a failed or aborted launch never leaves an unmonitored sandbox
+    // process behind (e.g. a `?` error in parent(), or the launcher killed while
+    // waiting on --userns-block-fd). This is stricter than bubblewrap, whose
+    // eventfd child would block forever instead; recorded in DIFFERENCES.md.
     let mut buf = [0u8; 8];
-    let _ = read(cw_r.as_fd(), &mut buf);
+    let mut got = 0;
+    let launcher_ready = loop {
+        match read(cw_r.as_fd(), &mut buf[got..]) {
+            Ok(0) => break false, // EOF: the launcher is gone
+            Ok(n) => {
+                got += n;
+                if got == buf.len() {
+                    break true;
+                }
+            }
+            Err(Errno::EINTR) => {}
+            Err(_) => break false,
+        }
+    };
+    if !launcher_ready {
+        bwrap_sys::process::exit_immediately(1);
+    }
     drop(cw_r);
+    // The launcher is alive here (it just signalled us), so this is the valid
+    // parent for die-with-parent.
     let mut exec_parent = nix::unistd::getppid();
 
     let sp = crate::profile::span("child.switch_user");
@@ -677,6 +715,23 @@ fn pipe_pair() -> Result<(OwnedFd, OwnedFd)> {
     nix::unistd::pipe2(OFlag::O_CLOEXEC).context("pipe2()")
 }
 
+/// A close-on-exec `SOCK_STREAM` socketpair for the launcher->child "go"
+/// handshake, as `(child_end, launcher_end)`. A stream socket (rather than a
+/// pipe) lets the launcher signal with `MSG_NOSIGNAL`, so a send to an
+/// already-dead child cannot raise SIGPIPE and kill the launcher before it reaps
+/// the child and reports its exit status — while the child still sees EOF if the
+/// launcher dies first.
+fn child_wait_pair() -> Result<(OwnedFd, OwnedFd)> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .context("socketpair() for the child handshake")
+}
+
 fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).context("fcntl O_NONBLOCK")?;
@@ -779,7 +834,7 @@ fn create_pid_socketpair() -> Result<(OwnedFd, OwnedFd)> {
 /// Used on the clone-child setup path, where we cannot return a `Result`.
 /// Generic in the (never produced) return type so it fits `unwrap_or_else`.
 fn die_in_child<T>(e: Error) -> T {
-    eprintln!("{}", crate::log::error_line(&e.to_string()));
+    crate::log::emit_err(&crate::log::error_line(&e.to_string()));
     bwrap_sys::process::exit_immediately(1)
 }
 
@@ -907,10 +962,10 @@ fn compute_cwd(
     if chdir(old_cwd).is_ok() {
         return Ok(old_cwd.as_os_str().as_bytes().to_vec());
     }
-    if let Some(home) = get_env(env, "HOME") {
-        if chdir(home).is_ok() {
-            return Ok(home.to_vec());
-        }
+    if let Some(home) = get_env(env, "HOME")
+        && chdir(home).is_ok()
+    {
+        return Ok(home.to_vec());
     }
     Ok(b"/".to_vec())
 }

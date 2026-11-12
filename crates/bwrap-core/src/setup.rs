@@ -139,13 +139,6 @@ fn bind_opts(kind: BindKind, not_a_security_boundary: bool) -> BindOptions {
     }
 }
 
-/// Component-aware `/proc` prefix test (bwrap's `has_path_prefix`): a `/proc`
-/// source is opened directly, since the in-root resolver rejects its magic
-/// symlinks (e.g. `/proc/self/ns/user`).
-fn has_proc_prefix(path: &[u8]) -> bool {
-    path == b"/proc" || path.starts_with(b"/proc/")
-}
-
 /// The writable-layer part of an overlay, independent of fds (for testing the
 /// options string).
 enum OverlayOpt {
@@ -180,7 +173,12 @@ fn overlay_options(upper: &OverlayOpt, lowers: &[String]) -> String {
 /// sources are opened directly (magic links). Returns `Ok(None)` when the
 /// source is missing and `allow_notexist` is set (the `--bind-try` variants).
 fn open_source(src: &[u8], allow_notexist: bool) -> Result<Option<OwnedFd>> {
-    let r = if has_proc_prefix(src) {
+    // Component-aware `/proc` prefix test (bwrap's `has_path_prefix(source,
+    // "/proc")`): a `/proc` source is opened directly, since the in-root resolver
+    // rejects its magic symlinks (e.g. `/proc/self/ns/user`). Must ignore leading
+    // and repeated slashes, so `//proc/self/ns/user` is handled too — the single
+    // correct copy of the check lives in `mountinfo`.
+    let r = if crate::mount::mountinfo::has_path_prefix(src, b"/proc") {
         let mut p = b"/oldroot".to_vec();
         p.extend_from_slice(src);
         nix::fcntl::open(
@@ -1040,12 +1038,19 @@ mod tests {
     }
 
     #[test]
-    fn has_proc_prefix_is_component_aware() {
-        assert!(has_proc_prefix(b"/proc"));
-        assert!(has_proc_prefix(b"/proc/self/ns/user"));
-        assert!(!has_proc_prefix(b"/process"));
-        assert!(!has_proc_prefix(b"/procfs"));
-        assert!(!has_proc_prefix(b"/var/proc"));
+    fn proc_prefix_check_is_component_aware() {
+        use crate::mount::mountinfo::has_path_prefix;
+        let is_proc = |p: &[u8]| has_path_prefix(p, b"/proc");
+        assert!(is_proc(b"/proc"));
+        assert!(is_proc(b"/proc/self/ns/user"));
+        // Leading/repeated slashes are a /proc path too (bwrap's has_path_prefix),
+        // the regression from the old `== "/proc" || starts_with("/proc/")` check.
+        assert!(is_proc(b"//proc/self/ns/user"));
+        assert!(is_proc(b"//proc/self"));
+        assert!(is_proc(b"proc/self"));
+        assert!(!is_proc(b"/process"));
+        assert!(!is_proc(b"/procfs"));
+        assert!(!is_proc(b"/var/proc"));
     }
 
     #[test]
