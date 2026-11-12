@@ -240,8 +240,12 @@ fn main() -> ExitCode {
         Ok(ForkResult::Child) => std::process::exit(child(&base, real_uid, real_gid)),
         Ok(ForkResult::Parent { child: c }) => wait(c),
         Err(ForkError::Sys(Errno::EPERM | Errno::ENOSPC | Errno::EINVAL | Errno::EUSERS)) => {
-            println!("test mount_host ... SKIP (user namespaces unavailable)");
             let _ = std::fs::remove_dir_all(&base);
+            if std::env::var_os("BWRAP_RS_REQUIRE_USERNS").is_some() {
+                println!("test mount_host ... FAILED (BWRAP_RS_REQUIRE_USERNS set but user namespaces unavailable)");
+                return ExitCode::FAILURE;
+            }
+            println!("test mount_host ... SKIP (user namespaces unavailable)");
             return ExitCode::SUCCESS;
         }
         Err(e) => {

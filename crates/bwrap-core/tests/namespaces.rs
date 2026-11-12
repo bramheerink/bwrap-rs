@@ -470,10 +470,17 @@ fn main() -> ExitCode {
         ("caps drop everything", test_caps_drop_all),
         ("fs::ensure_newroot_parents", test_newroot_parents),
     ];
+    // BWRAP_RS_REQUIRE_USERNS=1 (set in CI) turns a skip into a failure, so a
+    // run that silently never exercised the namespace paths cannot pass green.
+    let require_userns = std::env::var_os("BWRAP_RS_REQUIRE_USERNS").is_some();
     let mut failed = 0;
     for (name, test) in tests {
         match test() {
             Outcome::Pass => println!("test {name} ... ok"),
+            Outcome::Skip(why) if require_userns => {
+                println!("test {name} ... FAILED (BWRAP_RS_REQUIRE_USERNS set but skipped): {why}");
+                failed += 1;
+            }
             Outcome::Skip(why) => println!("test {name} ... SKIP ({why})"),
             Outcome::Fail(why) => {
                 println!("test {name} ... FAILED: {why}");

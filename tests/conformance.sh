@@ -24,6 +24,17 @@ if [ -x "$REAL" ] && [ "$("$REAL" --version 2>/dev/null)" = "bubblewrap 0.13.1" 
     HAVE_REAL=1
 fi
 
+# REQUIRE_REAL=1 / REQUIRE_USERNS=1 turn a missing oracle or unavailable user
+# namespaces into a hard failure instead of a silent pass/skip. CI sets both, so
+# a run that cannot actually compare against bubblewrap 0.13.1 fails loudly
+# rather than reporting green against nothing.
+REQUIRE_REAL="${REQUIRE_REAL:-0}"
+REQUIRE_USERNS="${REQUIRE_USERNS:-0}"
+if [ "$REQUIRE_REAL" = 1 ] && [ "$HAVE_REAL" != 1 ]; then
+    echo "conformance: REQUIRE_REAL=1 but no bubblewrap 0.13.1 oracle at REAL=$REAL"
+    exit 1
+fi
+
 # A minimal read-only sandbox that is identical on any usr-merged distribution:
 # bind /usr and recreate the usr-merge symlinks, so the command, its loader and
 # its libraries resolve through /usr whether libc lives in /usr/lib64 (Fedora)
@@ -31,6 +42,10 @@ fi
 # sbin usr.
 BASE=(--unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc)
 if ! "$OURS" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
+    if [ "$REQUIRE_USERNS" = 1 ]; then
+        echo "conformance: REQUIRE_USERNS=1 but the base sandbox cannot start (user namespaces unavailable)"
+        exit 1
+    fi
     echo "SKIP: user namespaces unavailable in this environment"
     exit 0
 fi
@@ -48,12 +63,17 @@ ab() {
     local name="$1"; shift 2
     local oo oe oc ro re rc
     oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" = 1 ]; then
-        ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-        [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
-        [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-        [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    if [ "$HAVE_REAL" != 1 ]; then
+        # No oracle: we ran ours (a smoke check) but cannot prove byte-identity,
+        # so report SKIP rather than a dishonest pass. REQUIRE_REAL would already
+        # have aborted the run above.
+        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
+        return
     fi
+    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
+    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
+    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
+    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
     ok "$name"
 }
 
@@ -63,12 +83,14 @@ abx() {
     local name="$1" tmpl="$2"
     local oo oe oc ro re rc
     oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" = 1 ]; then
-        ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-        [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
-        [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-        [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    if [ "$HAVE_REAL" != 1 ]; then
+        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
+        return
     fi
+    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
+    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
+    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
+    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
     ok "$name"
 }
 
@@ -321,6 +343,6 @@ ab  file-label-bad   -- "${BASE[@]}" --file-label not_a_valid_label_t --dir /d /
 
 # ---- report ---------------------------------------------------------------
 echo
-echo "conformance: $PASS passed, $FAIL failed, $SKIP skipped (of $((PASS+FAIL)))"
+echo "conformance: $PASS passed, $FAIL failed, $SKIP skipped (of $((PASS+FAIL+SKIP)))"
 if [ "$FAIL" -gt 0 ]; then printf '%s\n' "${FAILED[@]}"; exit 1; fi
 echo "ALL PASS — every case byte-identical to /usr/bin/bwrap 0.13.1 (or ours-only invariant held)"
