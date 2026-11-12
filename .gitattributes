@@ -1,0 +1,5 @@
+# The C files under crates/bwrap-core/tests/oracle are differential-test
+# oracles (they compile the reference C logic so the Rust port can be checked
+# against it). They are test scaffolding, not part of the shipped port, so keep
+# them out of GitHub's language statistics — this is a native Rust project.
+crates/bwrap-core/tests/oracle/*.c linguist-vendored
