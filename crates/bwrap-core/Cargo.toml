@@ -17,6 +17,11 @@ bwrap-sys.workspace = true
 # hostname: sethostname(2) for --hostname.
 nix = { workspace = true, features = ["fs", "process", "sched", "mount", "net", "socket", "poll", "signal", "user", "term", "hostname"] }
 
+[features]
+# Opt-in setup profiler (BWRAP_RS_PROFILE). OFF by default so the shipped binary
+# is a byte-exact drop-in that ignores the variable entirely; see src/profile.rs.
+profile = []
+
 [dev-dependencies]
 nix = { workspace = true, features = ["fs", "process", "mount", "sched", "user"] }
 
