@@ -279,6 +279,21 @@ invx file-fd-leak      2 "No such file" '%B --file 7 /f '"$B"' /bin/sh -c "ls /p
 invx bind-data-fd-leak 2 "No such file" '%B --bind-data 7 /bd '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7<"'"$WORK"'/data.txt"'
 invx bind-fd-leak      2 "No such file" '%B --bind-fd 7 /bf '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7<"'"$WORK"'"'
 
+# Regression (#2, ours-only): if the launcher fails before releasing the child
+# (here an --info-fd write to a full fd makes the launcher exit 1), the child
+# must NOT run the command — no stray, unmonitored sandbox process. bwrap-rs
+# exits the child on EOF; bubblewrap would instead leave it blocked forever, so
+# this is an ours-only invariant, not an A/B case.
+noexec_marker="$WORK/noexec.marker"; rm -f "$noexec_marker"
+timeout 5 "$OURS" --ro-bind / / --bind "$WORK" "$WORK" --info-fd 9 \
+    /bin/sh -c "echo ran > '$noexec_marker'" 9>/dev/full >/dev/null 2>&1
+nc=$?
+if [ "$nc" = 1 ] && [ ! -e "$noexec_marker" ]; then
+    ok failed-launch-no-exec
+else
+    fail failed-launch-no-exec "rc=$nc marker=$([ -e "$noexec_marker" ] && echo present || echo absent)"
+fi
+
 # The monitor must not busy-loop: a sleeping sandbox should consume ~no CPU (a
 # POLLHUP spin would peg a core). Ours-only resource invariant (B1 regression).
 if command -v /usr/bin/time >/dev/null 2>&1; then

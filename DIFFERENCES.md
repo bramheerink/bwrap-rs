@@ -49,6 +49,19 @@ well-formed invocation.
    processes arbitrary byte strings. This is a current limitation, not a design
    choice, and is planned to be lifted.
 
+7. **A launcher that dies before releasing the child aborts the child instead of
+   leaking it.** bubblewrap signals the child to proceed through an eventfd; if
+   the launcher dies after the clone but before signalling (for example an
+   `--info-fd`/`--json-status-fd` write that fails, or the launcher being killed
+   while it waits on `--userns-block-fd`), its child blocks on that eventfd
+   forever — an unmonitored sandbox is left set up but idle. `bwrap-rs` uses a
+   socketpair for the handshake, so the child sees EOF in that case and exits 1
+   without ever building the sandbox or running the command. On the normal path
+   the child receives the go byte and proceeds identically. The launcher sends
+   with `MSG_NOSIGNAL` and ignores the result, so if the child has already died
+   the launcher still reaps it and reports its real exit status, where bubblewrap
+   would be killed by SIGPIPE and exit 141.
+
 ## Everything else
 
 Outside this list, any divergence from bubblewrap 0.13.1 is a bug. Please report

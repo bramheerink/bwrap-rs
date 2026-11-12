@@ -110,8 +110,11 @@ pub fn run(
         None
     };
 
-    // Handshake and lifecycle pipes (8-byte payloads, like bwrap's eventfds).
-    let (cw_r, cw_w) = pipe_pair()?; // launcher -> child: "maps ready, go"
+    // Handshake and lifecycle fds (8-byte payloads, like bwrap's eventfds). The
+    // launcher->child "go" channel is a socketpair, not a pipe, so the launcher
+    // can signal with MSG_NOSIGNAL (see parent()) without risking SIGPIPE, while
+    // a stream socket still gives the child EOF if the launcher dies (see child()).
+    let (cw_r, cw_w) = child_wait_pair()?; // launcher -> child: "maps ready, go"
     // The event pipe (pid-1 -> monitor: exit status + 1) exists ONLY when there
     // is a pid-namespace init to report through it, exactly as bwrap creates its
     // eventfd only for `opt_unshare_pid && !opt_as_pid_1`. In every other case
@@ -270,8 +273,18 @@ fn parent(
         bwrap_sys::fd::close_raw(fd);
     }
 
-    // Let the child proceed now that its maps are set up.
-    write_all(cw_w.as_fd(), &1u64.to_ne_bytes())?;
+    // Let the child proceed now that its maps are set up. Ignore the result,
+    // exactly as bwrap does (bubblewrap.c:3181, "Ignore res, if e.g. the child
+    // died"): if the child is already gone the send fails, but we must still fall
+    // through to monitor_child to reap it and report its real exit status —
+    // instead of dying here (e.g. SIGPIPE/exit 141) and losing that status.
+    // MSG_NOSIGNAL keeps this one send from raising SIGPIPE; the launcher's own
+    // --info-fd/--json-status-fd writes keep C's SIG_DFL behaviour.
+    let _ = nix::sys::socket::send(
+        cw_w.as_raw_fd(),
+        &1u64.to_ne_bytes(),
+        nix::sys::socket::MsgFlags::MSG_NOSIGNAL,
+    );
     drop(cw_w);
 
     let json = config.json_status_fd.map(borrow);
@@ -313,11 +326,34 @@ fn child(
         bwrap_sys::fd::close_raw(fd);
     }
 
-    // Wait for the launcher to finish its setup. The launcher is alive here
-    // (it just signalled us), so this is the valid parent for die-with-parent.
+    // Wait for the launcher to finish its setup. A full 8-byte read is "go".
+    // Anything else — EOF (the launcher died before signalling) or an error —
+    // means the launcher is gone: exit without printing and without running the
+    // command, so a failed or aborted launch never leaves an unmonitored sandbox
+    // process behind (e.g. a `?` error in parent(), or the launcher killed while
+    // waiting on --userns-block-fd). This is stricter than bubblewrap, whose
+    // eventfd child would block forever instead; recorded in DIFFERENCES.md.
     let mut buf = [0u8; 8];
-    let _ = read(cw_r.as_fd(), &mut buf);
+    let mut got = 0;
+    let launcher_ready = loop {
+        match read(cw_r.as_fd(), &mut buf[got..]) {
+            Ok(0) => break false, // EOF: the launcher is gone
+            Ok(n) => {
+                got += n;
+                if got == buf.len() {
+                    break true;
+                }
+            }
+            Err(Errno::EINTR) => {}
+            Err(_) => break false,
+        }
+    };
+    if !launcher_ready {
+        bwrap_sys::process::exit_immediately(1);
+    }
     drop(cw_r);
+    // The launcher is alive here (it just signalled us), so this is the valid
+    // parent for die-with-parent.
     let mut exec_parent = nix::unistd::getppid();
 
     let sp = crate::profile::span("child.switch_user");
@@ -675,6 +711,23 @@ fn namespace_ids_read(
 /// A close-on-exec pipe returned as `(read, write)` owned fds.
 fn pipe_pair() -> Result<(OwnedFd, OwnedFd)> {
     nix::unistd::pipe2(OFlag::O_CLOEXEC).context("pipe2()")
+}
+
+/// A close-on-exec `SOCK_STREAM` socketpair for the launcher->child "go"
+/// handshake, as `(child_end, launcher_end)`. A stream socket (rather than a
+/// pipe) lets the launcher signal with `MSG_NOSIGNAL`, so a send to an
+/// already-dead child cannot raise SIGPIPE and kill the launcher before it reaps
+/// the child and reports its exit status — while the child still sees EOF if the
+/// launcher dies first.
+fn child_wait_pair() -> Result<(OwnedFd, OwnedFd)> {
+    use nix::sys::socket::{AddressFamily, SockFlag, SockType, socketpair};
+    socketpair(
+        AddressFamily::Unix,
+        SockType::Stream,
+        None,
+        SockFlag::SOCK_CLOEXEC,
+    )
+    .context("socketpair() for the child handshake")
 }
 
 fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<()> {
