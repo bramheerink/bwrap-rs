@@ -8,6 +8,7 @@
 //! that with a single atomic, set via the parser's host and consulted by every
 //! place that writes `bwrap: …` to stderr.
 
+use std::io::Write;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 static LEVEL_PREFIX: AtomicBool = AtomicBool::new(false);
@@ -42,6 +43,37 @@ pub fn error_line(msg: &str) -> String {
 /// `--level-prefix`.
 pub fn warning_line(msg: &str) -> String {
     line(LOG_WARNING, msg)
+}
+
+/// Write a preformatted line to stderr, swallowing any write error.
+///
+/// bwrap's `die()`/`warn()` write with `vfprintf` and ignore the result: a
+/// failed write (stderr redirected to a full disk, a closed pipe, …) must not
+/// change the exit status. Rust's `eprintln!` instead *panics* when the write
+/// fails, and with `panic = "abort"` that panic becomes `SIGABRT` (exit 134) —
+/// diverging from bwrap's plain exit 1. Every `bwrap: …` diagnostic goes through
+/// this helper (and [`emit_out`]) so the byte-exact exit-code contract holds
+/// even when the output cannot be written.
+pub fn emit_err(line: &str) {
+    let _ = writeln!(std::io::stderr().lock(), "{line}");
+}
+
+/// Write raw text to stderr with no added newline, swallowing write errors
+/// (the full-usage dump bwrap prints to stderr on the "no command" error).
+pub fn emit_err_raw(text: &str) {
+    let _ = write!(std::io::stderr().lock(), "{text}");
+}
+
+/// Write a line to stdout, swallowing write errors (`--version`, the assumed
+/// kernel line). See [`emit_err`] for why the failure is ignored.
+pub fn emit_out(line: &str) {
+    let _ = writeln!(std::io::stdout().lock(), "{line}");
+}
+
+/// Write raw text to stdout with no added newline, swallowing write errors
+/// (the `--help` usage dump).
+pub fn emit_out_raw(text: &str) {
+    let _ = write!(std::io::stdout().lock(), "{text}");
 }
 
 #[cfg(test)]

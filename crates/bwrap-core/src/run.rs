@@ -177,7 +177,7 @@ pub fn run(
             match code {
                 Ok(c) => bwrap_sys::process::exit_immediately(c),
                 Err(e) => {
-                    eprintln!("{}", crate::log::error_line(&e.to_string()));
+                    crate::log::emit_err(&crate::log::error_line(&e.to_string()));
                     bwrap_sys::process::exit_immediately(1);
                 }
             }
@@ -779,7 +779,7 @@ fn create_pid_socketpair() -> Result<(OwnedFd, OwnedFd)> {
 /// Used on the clone-child setup path, where we cannot return a `Result`.
 /// Generic in the (never produced) return type so it fits `unwrap_or_else`.
 fn die_in_child<T>(e: Error) -> T {
-    eprintln!("{}", crate::log::error_line(&e.to_string()));
+    crate::log::emit_err(&crate::log::error_line(&e.to_string()));
     bwrap_sys::process::exit_immediately(1)
 }
 

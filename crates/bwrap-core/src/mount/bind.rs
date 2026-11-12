@@ -258,14 +258,11 @@ fn mount_setattr_fallback(resolved_dest: &[u8], opts: BindOptions) -> BindResult
                     if opts.fail_open {
                         // --not-a-security-boundary: warn and keep going, exactly
                         // as bwrap's warn() does (bind-mount.c:545).
-                        eprintln!(
-                            "{}",
-                            crate::log::warning_line(&format!(
-                                "Can't remount {} submount ({}), ignoring error",
-                                String::from_utf8_lossy(&sub.mountpoint),
-                                bwrap_sys::strerror(e),
-                            ))
-                        );
+                        crate::log::emit_err(&crate::log::warning_line(&format!(
+                            "Can't remount {} submount ({}), ignoring error",
+                            String::from_utf8_lossy(&sub.mountpoint),
+                            bwrap_sys::strerror(e),
+                        )));
                         continue;
                     }
                     return Err(BindError::new(

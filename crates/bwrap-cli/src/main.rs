@@ -63,7 +63,7 @@ impl ParseHost for Host {
     }
 
     fn warn(&mut self, msg: &str) {
-        eprintln!("{}", bwrap_core::log::warning_line(msg));
+        bwrap_core::log::emit_err(&bwrap_core::log::warning_line(msg));
     }
 
     fn set_level_prefix(&mut self, on: bool) {
@@ -95,7 +95,7 @@ fn main() -> ExitCode {
         Ok(v) => v,
         Err(_) => {
             trace::outcome("err=non-utf8-argv");
-            eprintln!("bwrap: non-UTF-8 arguments are not yet supported by this build");
+            bwrap_core::log::emit_err("bwrap: non-UTF-8 arguments are not yet supported by this build");
             return ExitCode::FAILURE;
         }
     };
@@ -104,20 +104,20 @@ fn main() -> ExitCode {
     let config = match parse(&args, &mut host) {
         Ok(Outcome::Run(cfg)) => *cfg,
         Ok(Outcome::Help) => {
-            print!("{}", usage(&argv0));
+            bwrap_core::log::emit_out_raw(&usage(&argv0));
             return ExitCode::SUCCESS;
         }
         Ok(Outcome::Version) => {
-            println!("{VERSION}");
+            bwrap_core::log::emit_out(VERSION);
             return ExitCode::SUCCESS;
         }
         Ok(Outcome::PrintAssumedKernel) => {
-            println!("0.0.0");
+            bwrap_core::log::emit_out("0.0.0");
             return ExitCode::SUCCESS;
         }
         Err(e) => {
             trace::outcome(&format!("err={e}"));
-            eprintln!("{}", bwrap_core::log::error_line(&e.to_string()));
+            bwrap_core::log::emit_err(&bwrap_core::log::error_line(&e.to_string()));
             return ExitCode::FAILURE;
         }
     };
@@ -130,12 +130,12 @@ fn main() -> ExitCode {
         // bwrap prints the full usage to stderr for the "no command" error.
         Err(Error::Usage) => {
             trace::outcome("err=usage");
-            eprint!("{}", usage(&argv0));
+            bwrap_core::log::emit_err_raw(&usage(&argv0));
             ExitCode::FAILURE
         }
         Err(e) => {
             trace::outcome(&format!("err={e}"));
-            eprintln!("{}", bwrap_core::log::error_line(&e.to_string()));
+            bwrap_core::log::emit_err(&bwrap_core::log::error_line(&e.to_string()));
             ExitCode::FAILURE
         }
     }
