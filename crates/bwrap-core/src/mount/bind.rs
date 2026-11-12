@@ -110,10 +110,10 @@ impl fmt::Display for BindError {
             BindErrorKind::MountSetattr => format!("mount_setattr() failed at \"{path}\""),
         };
         f.write_str(&s)?;
-        if self.wants_errno() {
-            if let Some(e) = self.errno {
-                write!(f, ": {}", self.errno_text(e))?;
-            }
+        if self.wants_errno()
+            && let Some(e) = self.errno
+        {
+            write!(f, ": {}", self.errno_text(e))?;
         }
         Ok(())
     }

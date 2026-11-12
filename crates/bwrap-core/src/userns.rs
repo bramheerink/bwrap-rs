@@ -227,16 +227,16 @@ impl UsernsProbe for SystemUsernsProbe {
 
     fn unprivileged_userns_disabled(&self) -> bool {
         // RHEL7 module parameter: 'N' means disabled.
-        if let Ok(s) = fs::read_to_string("/sys/module/user_namespace/parameters/enable") {
-            if s.starts_with('N') {
-                return true;
-            }
+        if let Ok(s) = fs::read_to_string("/sys/module/user_namespace/parameters/enable")
+            && s.starts_with('N')
+        {
+            return true;
         }
         // max_user_namespaces == 0 means disabled (Debian and others).
-        if let Ok(s) = fs::read_to_string("/proc/sys/user/max_user_namespaces") {
-            if s.trim() == "0" {
-                return true;
-            }
+        if let Ok(s) = fs::read_to_string("/proc/sys/user/max_user_namespaces")
+            && s.trim() == "0"
+        {
+            return true;
         }
         false
     }

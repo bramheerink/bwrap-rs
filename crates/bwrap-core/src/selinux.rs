@@ -92,15 +92,13 @@ fn check_context(label: &str) -> std::result::Result<(), Errno> {
 /// libselinux `setexeccon`): write the label to `/proc/self/attr/exec`. A no-op
 /// when `label` is `None` or SELinux is disabled.
 pub fn label_exec(label: Option<&str>) -> Result<()> {
-    if let Some(label) = label {
-        if is_selinux_enabled() {
-            return write_attr("/proc/self/attr/exec", label.as_bytes()).map_err(|errno| {
-                Error::Sys {
-                    message: format!("label_exec {label}").into(),
-                    errno,
-                }
-            });
-        }
+    if let Some(label) = label
+        && is_selinux_enabled()
+    {
+        return write_attr("/proc/self/attr/exec", label.as_bytes()).map_err(|errno| Error::Sys {
+            message: format!("label_exec {label}").into(),
+            errno,
+        });
     }
     Ok(())
 }
@@ -109,15 +107,15 @@ pub fn label_exec(label: Option<&str>) -> Result<()> {
 /// `setfscreatecon`): write the label to `/proc/self/attr/fscreate`. A no-op
 /// when `label` is `None` or SELinux is disabled.
 pub fn label_create_file(label: Option<&str>) -> Result<()> {
-    if let Some(label) = label {
-        if is_selinux_enabled() {
-            return write_attr("/proc/self/attr/fscreate", label.as_bytes()).map_err(|errno| {
-                Error::Sys {
-                    message: format!("label_create_file {label}").into(),
-                    errno,
-                }
-            });
-        }
+    if let Some(label) = label
+        && is_selinux_enabled()
+    {
+        return write_attr("/proc/self/attr/fscreate", label.as_bytes()).map_err(|errno| {
+            Error::Sys {
+                message: format!("label_create_file {label}").into(),
+                errno,
+            }
+        });
     }
     Ok(())
 }

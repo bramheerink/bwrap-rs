@@ -52,13 +52,19 @@ fn no_raw_output_macros_in_production_src() {
     let crates_dir = root.join("crates");
 
     let mut files = Vec::new();
-    for entry in std::fs::read_dir(&crates_dir).expect("crates/ exists").flatten() {
+    for entry in std::fs::read_dir(&crates_dir)
+        .expect("crates/ exists")
+        .flatten()
+    {
         let src = entry.path().join("src");
         if src.is_dir() {
             rs_files(&src, &mut files);
         }
     }
-    assert!(!files.is_empty(), "found no production source files to scan");
+    assert!(
+        !files.is_empty(),
+        "found no production source files to scan"
+    );
 
     // `print!` also matches `eprint!`; `println!` also matches `eprintln!`.
     const FORBIDDEN: [&str; 2] = ["print!", "println!"];

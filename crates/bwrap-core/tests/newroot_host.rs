@@ -142,7 +142,9 @@ fn main() -> ExitCode {
         Ok(ForkResult::Parent { child: c }) => wait(c),
         Err(ForkError::Sys(Errno::EPERM | Errno::ENOSPC | Errno::EINVAL | Errno::EUSERS)) => {
             if std::env::var_os("BWRAP_RS_REQUIRE_USERNS").is_some() {
-                println!("test newroot_host ... FAILED (BWRAP_RS_REQUIRE_USERNS set but user namespaces unavailable)");
+                println!(
+                    "test newroot_host ... FAILED (BWRAP_RS_REQUIRE_USERNS set but user namespaces unavailable)"
+                );
                 return ExitCode::FAILURE;
             }
             println!("test newroot_host ... SKIP (user/mount namespaces unavailable)");

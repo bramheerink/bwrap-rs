@@ -960,10 +960,10 @@ fn compute_cwd(
     if chdir(old_cwd).is_ok() {
         return Ok(old_cwd.as_os_str().as_bytes().to_vec());
     }
-    if let Some(home) = get_env(env, "HOME") {
-        if chdir(home).is_ok() {
-            return Ok(home.to_vec());
-        }
+    if let Some(home) = get_env(env, "HOME")
+        && chdir(home).is_ok()
+    {
+        return Ok(home.to_vec());
     }
     Ok(b"/".to_vec())
 }

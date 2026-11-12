@@ -78,8 +78,13 @@ impl Program {
         if u16::try_from(instructions).is_err() {
             return Err(ProgramError::TooLong { instructions });
         }
+        // len is a multiple of INSN_SIZE (checked above), so the remainder is
+        // empty; `as_chunks` yields fixed-size `&[u8; INSN_SIZE]` with no
+        // per-element bounds checks.
         let insns = bytes
-            .chunks_exact(INSN_SIZE)
+            .as_chunks::<INSN_SIZE>()
+            .0
+            .iter()
             .map(|c| sock_filter {
                 code: u16::from_ne_bytes([c[0], c[1]]),
                 jt: c[2],

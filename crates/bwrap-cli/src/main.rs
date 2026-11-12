@@ -95,7 +95,9 @@ fn main() -> ExitCode {
         Ok(v) => v,
         Err(_) => {
             trace::outcome("err=non-utf8-argv");
-            bwrap_core::log::emit_err("bwrap: non-UTF-8 arguments are not yet supported by this build");
+            bwrap_core::log::emit_err(
+                "bwrap: non-UTF-8 arguments are not yet supported by this build",
+            );
             return ExitCode::FAILURE;
         }
     };

@@ -46,12 +46,12 @@ pub fn mount_tmpfs(
     dest_display: &str,
     file_label: Option<&str>,
 ) -> Result<()> {
-    if let Some(s) = size {
-        if s > MAX_TMPFS_BYTES {
-            return Err(Error::invalid(format!(
-                "Specified tmpfs size too large ({s} > {MAX_TMPFS_BYTES})"
-            )));
-        }
+    if let Some(s) = size
+        && s > MAX_TMPFS_BYTES
+    {
+        return Err(Error::invalid(format!(
+            "Specified tmpfs size too large ({s} > {MAX_TMPFS_BYTES})"
+        )));
     }
     // perms is a Mode; take its low bits for the %#o rendering.
     let mode_bits = u16::try_from(perms.bits() & 0o7777).unwrap_or(0);

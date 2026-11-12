@@ -242,7 +242,9 @@ fn main() -> ExitCode {
         Err(ForkError::Sys(Errno::EPERM | Errno::ENOSPC | Errno::EINVAL | Errno::EUSERS)) => {
             let _ = std::fs::remove_dir_all(&base);
             if std::env::var_os("BWRAP_RS_REQUIRE_USERNS").is_some() {
-                println!("test mount_host ... FAILED (BWRAP_RS_REQUIRE_USERNS set but user namespaces unavailable)");
+                println!(
+                    "test mount_host ... FAILED (BWRAP_RS_REQUIRE_USERNS set but user namespaces unavailable)"
+                );
                 return ExitCode::FAILURE;
             }
             println!("test mount_host ... SKIP (user namespaces unavailable)");

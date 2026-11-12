@@ -98,6 +98,12 @@ mod imp {
     /// A zero-cost placeholder span (see [`span`]).
     #[derive(Debug)]
     pub struct Span;
+
+    // An explicit (empty) Drop so callers can end a span early with `drop(sp)`
+    // without clippy's `drop_non_drop` firing on the no-op build.
+    impl Drop for Span {
+        fn drop(&mut self) {}
+    }
 }
 
 pub use imp::{Span, init, span};
