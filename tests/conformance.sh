@@ -155,6 +155,10 @@ ab  bind-missing     -- "${BASE[@]}" --bind /no/such /x /bin/true
 ab  bind-try         -- "${BASE[@]}" --bind-try /no/such /x /bin/true
 ab  robind-missing   -- "${BASE[@]}" --ro-bind /no/such /x /bin/true
 ab  robind-try       -- "${BASE[@]}" --ro-bind-try /no/such /x /bin/true
+# Regression (#6): a /proc source with a leading double slash must still be
+# treated as /proc (bwrap's component-aware has_path_prefix), so its magic link
+# is opened directly instead of failing in the in-root resolver.
+ab  robind-dslash-proc -- "${BASE[@]}" --tmpfs /t --ro-bind-try //proc/self/ns/user /t/x /bin/sh -c 'test -e /t/x && echo yes || echo no'
 ab  robind-is-ro     -- "${BASE[@]}" --ro-bind /usr /u /bin/sh -c 'touch /u/x 2>&1; echo e=$?'
 ab  dev-bind         -- "${BASE[@]}" --dev-bind /dev /d /bin/sh -c 'test -c /d/null && echo yes'
 ab  dev-bind-try     -- "${BASE[@]}" --dev-bind-try /no/such /x /bin/true
