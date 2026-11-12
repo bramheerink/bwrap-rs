@@ -113,11 +113,12 @@ def main():
         tally[verdict] += 1
         if verdict in ("MISMATCH", "other", "timeout"):
             had_mismatch = had_mismatch or verdict == "MISMATCH"
-            shown = " ".join(av)
-            if len(shown) > 300:
-                shown = shown[:300] + " …"
-            print(f"[{time.strftime('%H:%M:%S')}] {verdict}\n  ARGS: {shown}\n{out}\n",
-                  file=results, flush=True)
+            # One greppable line per divergence: timestamp, verdict, the flattened
+            # diff/detail (what differs), and a paste-ready argv to reproduce.
+            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
+            detail = " ".join(out.split()) or "(no detail)"
+            argv = " ".join(shlex.quote(a) for a in av)
+            print(f"{ts} {verdict} :: {detail} :: argv: {argv}", file=results, flush=True)
 
     with open(args.log, "r", errors="replace") as f:
         for line in f:
