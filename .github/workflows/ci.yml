@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege: the default GITHUB_TOKEN is read-only; no job needs write.
+permissions:
+  contents: read
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -13,11 +17,12 @@ jobs:
     name: fmt / clippy / test / conformance
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install the Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # pinned 'stable' branch
         with:
+          toolchain: stable
           components: rustfmt, clippy
 
       - name: Formatting
@@ -29,22 +34,43 @@ jobs:
       - name: Build
         run: cargo build --workspace --release
 
-      # Ubuntu 24.04 restricts unprivileged user namespaces via AppArmor, which
-      # the host/differential tests and the conformance matrix need. Relax it
-      # (best-effort) BEFORE running them; where it cannot be relaxed, those
-      # tests skip themselves cleanly rather than fail.
+      # Build the drop-in target — bubblewrap 0.13.1 — from source, so the
+      # conformance matrix compares byte-for-byte against it rather than running
+      # ours-only. SELinux is enabled to match the distro binary; man pages and
+      # upstream tests are off to keep the build deps minimal.
+      - name: Build the bubblewrap 0.13.1 oracle
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            meson ninja-build gcc pkg-config libcap-dev libselinux1-dev
+          git clone --depth 1 --branch v0.13.1 \
+            https://github.com/containers/bubblewrap.git "$RUNNER_TEMP/bubblewrap"
+          meson setup "$RUNNER_TEMP/bubblewrap/_build" "$RUNNER_TEMP/bubblewrap" \
+            -Dman=disabled -Dtests=false
+          ninja -C "$RUNNER_TEMP/bubblewrap/_build" bwrap
+          test "$("$RUNNER_TEMP/bubblewrap/_build/bwrap" --version)" = "bubblewrap 0.13.1"
+          echo "REAL=$RUNNER_TEMP/bubblewrap/_build/bwrap" >> "$GITHUB_ENV"
+
+      # The host/differential tests and the conformance matrix need unprivileged
+      # user namespaces, which Ubuntu restricts via AppArmor. Relax it; no
+      # `|| true`, so if it cannot be relaxed the run fails loudly here (and the
+      # REQUIRE_USERNS guards below) instead of silently skipping every sandbox.
       - name: Allow unprivileged user namespaces
-        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+        run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Unit and host tests
-        run: cargo test --workspace
+        run: BWRAP_RS_REQUIRE_USERNS=1 cargo test --workspace
 
-      # The conformance matrix runs the built binary through real user namespaces
-      # — the sandboxing syscall paths the unit tests skip when namespaces are
-      # unavailable. Byte-for-byte A/B against the real binary needs bubblewrap
-      # *0.13.1* specifically (the drop-in target); distro packages differ, so
-      # here the matrix runs our-binary-only (exercising the paths and the
-      # ours-only invariants). The byte-identical oracle run is done on a Fedora
-      # host that ships 0.13.1.
-      - name: Behavioural conformance (real sandbox)
-        run: OURS=target/release/bwrap tests/conformance.sh
+      - name: Behavioural conformance (byte-identical vs bubblewrap 0.13.1)
+        run: REQUIRE_REAL=1 REQUIRE_USERNS=1 OURS=target/release/bwrap tests/conformance.sh
+
+  msrv:
+    name: MSRV (1.88) builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Install Rust 1.88 (the declared MSRV)
+        uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # pinned 'stable' branch
+        with:
+          toolchain: "1.88.0"
+      - run: cargo check --workspace --all-targets
