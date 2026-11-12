@@ -173,6 +173,12 @@ ab  remount-ro       -- "${BASE[@]}" --tmpfs /t --remount-ro /t /bin/sh -c 'touc
 
 # === fs construction ======================================================
 ab  symlink          -- "${BASE[@]}" --symlink /usr /u /bin/sh -c 'readlink /u'
+# Regression (#8): a mount whose destination inside the new root is a symlink
+# must be refused ("Can't mount on symlink destination"), so a symlink can't
+# redirect a bind/tmpfs/remount elsewhere. Cover the bind, tmpfs and remount ops.
+ab  symlink-dest-bind    -- "${BASE[@]}" --tmpfs /t --symlink /usr /t/x --bind /usr /t/x /bin/true
+ab  symlink-dest-tmpfs   -- "${BASE[@]}" --tmpfs /t --symlink /usr /t/x --tmpfs /t/x /bin/true
+ab  symlink-dest-remount -- "${BASE[@]}" --tmpfs /t --symlink /usr /t/x --remount-ro /t/x /bin/true
 ab  dir              -- "${BASE[@]}" --dir /made /bin/sh -c 'test -d /made && echo yes'
 ab  tmpfs            -- "${BASE[@]}" --tmpfs /t /bin/sh -c 'test -d /t && echo yes'
 ab  perms-dir        -- "${BASE[@]}" --perms 0750 --dir /d /bin/sh -c 'stat -c %a /d'
