@@ -60,13 +60,22 @@ impl ParseHost for Host {
 }
 
 fn main() -> ExitCode {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+
+    // Dump mode (`BWRAP_RS_DUMP=1`): print bwrap-rs's own resolved plan — the
+    // symmetric counterpart to the C oracle's dry-run — and exit. This is how
+    // shadow_replay.py obtains our side; the plan comes from the real library
+    // parse+resolve, with no sandbox ever run.
+    if std::env::var_os("BWRAP_RS_DUMP").is_some_and(|v| !v.is_empty()) {
+        return dump_mode(&args);
+    }
+
     let Some(oracle) = std::env::var_os("BWRAP_RS_SHADOW").filter(|v| !v.is_empty()) else {
         eprintln!(
             "shadow_oracle: set BWRAP_RS_SHADOW=<path to a patched bwrap 0.13.1 dry-run oracle>"
         );
         return ExitCode::FAILURE;
     };
-    let args: Vec<String> = std::env::args().skip(1).collect();
 
     // --args/--add-seccomp-fd read their fds during parsing; those fds cannot be
     // replayed into the separate oracle process, so this tool cannot compare
@@ -124,6 +133,29 @@ fn main() -> ExitCode {
 fn say(msg: &str) -> ExitCode {
     println!("{msg}");
     ExitCode::SUCCESS
+}
+
+/// Print bwrap-rs's resolved plan (same format as the C dry-run oracle), or an
+/// `__ERROR__ <message>` / `__NOTHING__ <reason>` marker line. Always exits 0 so
+/// the caller reads the result uniformly from stdout.
+fn dump_mode(args: &[String]) -> ExitCode {
+    let mut host = Host;
+    let config = match parse(args, &mut host) {
+        Ok(Outcome::Run(cfg)) => *cfg,
+        Ok(Outcome::Help) => return say("__NOTHING__ --help"),
+        Ok(Outcome::Version) => return say("__NOTHING__ --version"),
+        Ok(Outcome::PrintAssumedKernel) => return say("__NOTHING__ --assume-kernel"),
+        Err(e) => return say(&format!("__ERROR__ {e}")),
+    };
+    let real_uid = nix::unistd::getuid().as_raw();
+    let real_gid = nix::unistd::getgid().as_raw();
+    match config.resolve(real_uid, real_gid, &SystemUsernsProbe) {
+        Ok(resolved) => {
+            print!("{}", plan(&config, &resolved));
+            ExitCode::SUCCESS
+        }
+        Err(e) => say(&format!("__ERROR__ {e}")),
+    }
 }
 
 /// When bwrap-rs rejects the argv, confirm the C oracle rejects it too.

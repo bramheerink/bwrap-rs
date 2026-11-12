@@ -87,6 +87,27 @@ BWRAP_RS_SHADOW=/path/to/c-oracle/build/bwrap \
   ./shadow_replay.py --follow --results ~/bwrap-rs-shadow.log ~/bwrap-rs.log
 ```
 
+### Output format
+
+Each genuine divergence is written as one JSON object per line (JSONL): a line
+is greppable, and `jq .` expands it to a readable record. Every record carries
+the **call** and what **each side** did with it:
+
+```jsonc
+{
+  "verdict": "MISMATCH",
+  "argv": ["--size", "0b10000000000000000", "--tmpfs", "/s", ...],
+  "bwrap_rs": { "outcome": "error", "error": "--size takes a non-zero number of bytes" },
+  "bwrap_c":  { "outcome": "plan",  "plan": [ ... "op MOUNT_TMPFS ... size=65536", ... ] },
+  "diff": [ { "i": 3, "rs": "...", "c": "..." } ]   // present when both sides built a plan
+}
+```
+
+Review a soak with e.g. `jq -c '{verdict, argv}' ~/bwrap-rs-shadow.log` or expand
+one fully with `jq . ~/bwrap-rs-shadow.log`. Both sides are obtained from a
+dry-run: `bwrap-rs` via `BWRAP_RS_DUMP=1` on the `shadow_oracle` example, C via
+`BWRAP_DRYRUN=1` on the patched oracle.
+
 ## Scope and honest limits
 
 - Invocations using `--args`/`--add-seccomp-fd` are **skipped**: those fds are

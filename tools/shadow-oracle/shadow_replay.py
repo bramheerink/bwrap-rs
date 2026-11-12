@@ -1,28 +1,27 @@
 #!/usr/bin/env python3
-"""Differential parity check: replay bwrap-rs invocations through a dry-run
-bubblewrap 0.13.1 oracle and diff the sandbox plan each would build.
+"""Differential parity check: replay bwrap-rs invocations and, for each, compare
+the sandbox plan bwrap-rs resolves against the plan upstream bubblewrap 0.13.1
+would build. bwrap-rs does the real work in production; this tool only *reads* a
+log of invocations and runs two side-effect-free dry-runs per entry:
 
-bwrap-rs does the real work in production; this tool only *reads* a log of
-invocations and, for each, (a) asks the bwrap-rs library what plan it resolves
-(a pure, side-effect-free parse+resolve, via the `shadow_oracle` example) and
-(b) asks a patched C bubblewrap what plan it *would* build (dry-run: it parses,
-validates, prints the plan and exits before any mount/namespace/exec). The two
-plans are compared. Nothing is ever actually sandboxed by this tool, and the C
-oracle never changes anything.
+  * bwrap-rs's plan  — `shadow_oracle` example with BWRAP_RS_DUMP=1 (a pure
+    parse+resolve; no mounts/namespaces/exec).
+  * bubblewrap's plan — a patched C bubblewrap with BWRAP_DRYRUN=1 (parses,
+    validates, prints the plan it *would* build, exits before any setup).
+
+Neither ever changes the system. Each genuine divergence is written as one JSON
+object per line (JSONL) carrying the call, what each side did, and the diff — so
+a line is greppable yet `jq .` expands it to a readable multi-line record.
 
 See README.md for how to build the dry-run oracle.
 
 Usage:
     BWRAP_RS_SHADOW=/path/to/bwrap-dryrun \\
-        ./shadow_replay.py [--follow] [--tool PATH] LOGFILE
-
-    --follow      keep running, diffing new invocations as they are logged
-    --tool PATH   the built `shadow_oracle` example (default: autodetect under
-                  target/{release,debug}/examples/)
+        ./shadow_replay.py [--follow] [--tool PATH] [--results FILE] LOGFILE
 
 Exit status is 0 when no genuine divergence was seen, 1 otherwise.
 """
-import argparse, collections, os, shlex, subprocess, sys, time
+import argparse, collections, json, os, shlex, subprocess, sys, time
 
 
 def find_tool(explicit):
@@ -39,28 +38,61 @@ def find_tool(explicit):
              "or pass --tool PATH")
 
 
-def classify(args, tool, oracle):
-    try:
-        r = subprocess.run([tool, *args], env={**os.environ, "BWRAP_RS_SHADOW": oracle},
-                           capture_output=True, text=True, timeout=30)
-    except subprocess.TimeoutExpired:
-        return "timeout", ""
-    out = r.stdout.strip()
-    first = out.split("\n", 1)[0] if out else "(no output)"
-    if first.startswith("MATCH"):
-        return "MATCH", out
-    if first.startswith("SKIP"):
-        return "SKIP", out
-    if first.startswith("MISMATCH"):
-        return "MISMATCH", out
-    if "also errored" in out:
-        return "both-rejected", out
-    if first.startswith("nothing to compare"):
-        return "trivial", out
-    if first.startswith("bwrap-rs:"):
-        # one side errored but not matched as both-rejected
-        return "MISMATCH", out
-    return "other", out
+def normalize(plan_text):
+    """Comparable plan lines: trim, drop blanks, drop C's SET_HOSTNAME op
+    (hostname is compared via the `hostname` header line)."""
+    out = []
+    for ln in plan_text.splitlines():
+        ln = ln.rstrip()
+        if not ln or ln.startswith("op SET_HOSTNAME"):
+            continue
+        out.append(ln)
+    return out
+
+
+def rs_side(args, tool):
+    """bwrap-rs's plan via dump mode -> ('plan', [lines]) | ('error', msg) |
+    ('nothing', reason)."""
+    r = subprocess.run([tool, *args], env={**os.environ, "BWRAP_RS_DUMP": "1"},
+                       capture_output=True, text=True, timeout=30)
+    out = r.stdout
+    first = out.splitlines()[0] if out.strip() else ""
+    if first.startswith("__ERROR__"):
+        return ("error", first[len("__ERROR__"):].strip())
+    if first.startswith("__NOTHING__"):
+        return ("nothing", first[len("__NOTHING__"):].strip())
+    return ("plan", normalize(out))
+
+
+def c_side(args, oracle):
+    """bubblewrap's plan via dry-run -> ('plan', [lines]) | ('error', stderr)."""
+    env = {k: v for k, v in os.environ.items() if k != "BWRAP_DRYRUN_FD"}
+    env["BWRAP_DRYRUN"] = "1"
+    r = subprocess.run([oracle, *args], env=env, capture_output=True, text=True, timeout=30)
+    if r.returncode == 0 and r.stdout.strip():
+        return ("plan", normalize(r.stdout))
+    return ("error", " ".join(r.stderr.split()) or f"exit {r.returncode}")
+
+
+def compare(rs, c):
+    """Return (verdict, diff) where verdict in MATCH/MISMATCH/both-rejected/trivial."""
+    rk, rv = rs
+    ck, cv = c
+    if rk == "nothing":
+        return ("trivial", None)
+    if rk == "plan" and ck == "plan":
+        if rv == cv:
+            return ("MATCH", None)
+        diff = []
+        for i in range(max(len(rv), len(cv))):
+            a = rv[i] if i < len(rv) else None
+            b = cv[i] if i < len(cv) else None
+            if a != b:
+                diff.append({"i": i, "rs": a, "c": b})
+        return ("MISMATCH", diff)
+    if rk == "error" and ck == "error":
+        return ("both-rejected", None)
+    return ("MISMATCH", None)  # one produced a plan, the other errored
 
 
 def argvs_from_line(line):
@@ -74,13 +106,23 @@ def argvs_from_line(line):
     return toks[1:] if len(toks) > 1 else []
 
 
+def record(side):
+    """Shape one side ('plan'|'error'|'nothing', value) for the JSON output."""
+    kind, val = side
+    if kind == "plan":
+        return {"outcome": "plan", "plan": val}
+    if kind == "error":
+        return {"outcome": "error", "error": val}
+    return {"outcome": kind, "detail": val}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("log")
     ap.add_argument("--follow", action="store_true")
     ap.add_argument("--tool", default=None)
     ap.add_argument("--results", default=None,
-                    help="append MISMATCH/verdict detail to this file (default: stderr)")
+                    help="append one JSON object per divergence here (default: stdout)")
     args = ap.parse_args()
 
     oracle = os.environ.get("BWRAP_RS_SHADOW", "")
@@ -90,11 +132,10 @@ def main():
 
     tally = collections.Counter()
     seen = set()
-    had_mismatch = False
-    results = open(args.results, "a") if args.results else sys.stderr
+    had_mismatch = [False]
+    results = open(args.results, "a") if args.results else sys.stdout
 
     def handle(line):
-        nonlocal had_mismatch
         av = argvs_from_line(line)
         if av is None:
             return
@@ -104,21 +145,34 @@ def main():
         if not av:
             tally["no-args"] += 1
             return
+        if any(a in ("--args", "--add-seccomp-fd") for a in av):
+            tally["SKIP(--args/seccomp-fd)"] += 1
+            return
         key = "\0".join(av)
         if key in seen:
             tally["dup"] += 1
             return
         seen.add(key)
-        verdict, out = classify(av, tool, oracle)
+        try:
+            rs = rs_side(av, tool)
+            c = c_side(av, oracle)
+        except subprocess.TimeoutExpired:
+            tally["timeout"] += 1
+            return
+        verdict, diff = compare(rs, c)
         tally[verdict] += 1
-        if verdict in ("MISMATCH", "other", "timeout"):
-            had_mismatch = had_mismatch or verdict == "MISMATCH"
-            # One greppable line per divergence: timestamp, verdict, the flattened
-            # diff/detail (what differs), and a paste-ready argv to reproduce.
-            ts = time.strftime("%Y-%m-%dT%H:%M:%S")
-            detail = " ".join(out.split()) or "(no detail)"
-            argv = " ".join(shlex.quote(a) for a in av)
-            print(f"{ts} {verdict} :: {detail} :: argv: {argv}", file=results, flush=True)
+        if verdict == "MISMATCH":
+            had_mismatch[0] = True
+            obj = {
+                "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "verdict": verdict,
+                "argv": av,
+                "bwrap_rs": record(rs),
+                "bwrap_c": record(c),
+            }
+            if diff is not None:
+                obj["diff"] = diff
+            print(json.dumps(obj, ensure_ascii=False), file=results, flush=True)
 
     with open(args.log, "r", errors="replace") as f:
         for line in f:
@@ -136,7 +190,7 @@ def main():
             except KeyboardInterrupt:
                 print_tally(tally)
 
-    return 1 if had_mismatch else 0
+    return 1 if had_mismatch[0] else 0
 
 
 def print_tally(tally):
