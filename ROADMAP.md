@@ -40,6 +40,14 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   *not* prevent, so they need explicit negative tests.
 - **Supply-chain CI** — `cargo-deny` (advisories/bans/sources) over the tiny
   (single external) dependency tree. Done. `cargo-audit` is redundant with it.
+- **Mutation testing** (`cargo-mutants`) — the third leg beside the conformance
+  oracle and the fuzzer: it measures whether the *tests* would catch a
+  subtly-wrong implementation (oracle = is the behaviour right; fuzzer = does the
+  code survive weird input; mutants = would the tests notice if it broke). A
+  scoped run on the number parser (`cnum.rs`) already found and closed one real
+  gap — an unguarded base-0 `0x` autodetect case. A full run across all modules
+  needs the complete test environment (user namespaces, the real oracle) and
+  belongs on the build box rather than CI.
 
 ## Later
 
@@ -61,6 +69,17 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   `// nix-upstream-kandidaat` in the source (`_exit`, the caps prctls,
   `mount_setattr`) could become genuinely-safe `nix` APIs and delete an unsafe
   block each.
+- **Architecture / structure review** — a deliberate, read-only design pass (not
+  a rewrite): re-examine the module boundaries and type seams through the lens of
+  the threat model, because *structure is itself a safety mechanism*. The
+  strongest fixes so far were structural — the unsafe quarantine, the planned
+  fd-ownership table, types that make illegal states unrepresentable — not point
+  patches. Questions to ask: is `parse → Config → setup` the cleanest
+  untrusted-input seam? Can the privilege roles (userns / real-root /
+  setuid-refused) be kept apart by type rather than by branch? Which remaining
+  invariants can move from discipline into the type system so the compiler
+  enforces them? Findings first; small structural improvements only where they
+  clearly pay off.
 
 ## Skip (for now)
 

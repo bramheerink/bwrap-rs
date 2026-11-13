@@ -167,6 +167,14 @@ mod tests {
         assert_eq!(c.val, 0);
         assert_eq!(c.end, 1);
         assert_eq!(c.digits, 1);
+        // "0x" is a hex prefix ONLY when a hex digit follows. "0xZ" is therefore
+        // octal zero with "xZ" trailing (endptr at the 'x'), exactly as C's
+        // strtoul(…, 0) does — the hex prefix is not consumed. Guards the
+        // `is_ascii_hexdigit()` check in the base-0 autodetect.
+        let c = c_strtou64("0xZ", 0);
+        assert_eq!(c.val, 0);
+        assert_eq!(c.end, 1);
+        assert_eq!(c.digits, 1);
     }
 
     #[test]
