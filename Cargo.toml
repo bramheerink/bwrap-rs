@@ -1,6 +1,9 @@
 [workspace]
 resolver = "3"
 members = ["crates/bwrap-sys", "crates/bwrap-core", "crates/bwrap-cli"]
+# The cargo-fuzz harness is a detached, nightly-only tooling crate; keep
+# libfuzzer-sys out of the runtime crates' build and dependency audits.
+exclude = ["fuzz"]
 
 [workspace.package]
 version = "0.1.3-alpha"

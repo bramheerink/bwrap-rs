@@ -100,6 +100,26 @@ jobs:
       - name: Check advisories, bans and sources
         run: cargo deny check advisories bans sources
 
+  fuzz-smoke:
+    name: Fuzz smoke (parse / seccomp)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # pinned branch
+        with:
+          toolchain: nightly
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+      - name: Build fuzz targets
+        run: cargo +nightly fuzz build
+      # A short regression smoke, not a deep campaign: catches a parser/validator
+      # that starts panicking on a reachable input. A real crash fails the job
+      # (cargo-fuzz exits non-zero and writes the reproducer).
+      - name: Short fuzz run
+        run: |
+          cargo +nightly fuzz run parse   -- -max_total_time=60
+          cargo +nightly fuzz run seccomp -- -max_total_time=60
+
   msrv:
     name: MSRV (1.88) builds
     runs-on: ubuntu-latest

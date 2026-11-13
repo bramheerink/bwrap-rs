@@ -23,11 +23,14 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
 
 ## Now
 
-- **Differential fuzzing of the two untrusted-input paths** — the argv/CLI
-  grammar and the seccomp-BPF blob. Reuse the existing byte-exact oracle as the
-  comparison target so the harness goes from example-based to coverage-guided
-  (`cargo-fuzz` + `arbitrary` for structure-aware argv). Highest-value work: it
-  directly de-risks the parser, the exact path where memory safety pays off.
+- **Fuzzing the two untrusted-input paths** — the argv/CLI grammar and the
+  seccomp-BPF blob. **In place:** `cargo-fuzz` crash/panic targets (`fuzz/`,
+  targets `parse` and `seccomp`) run in CI as a short regression smoke; both
+  survive millions of iterations without panicking. **Enhancement (later):** make
+  the `parse` target *differential* — reuse the byte-exact oracle so a divergence
+  (not just a crash) is a finding; this needs an out-of-process compare against
+  the C binary, so it belongs in a slower, scheduled campaign rather than the CI
+  smoke.
 - **Threat model + divergence register** — [THREAT-MODEL.md](THREAT-MODEL.md)
   and [DIFFERENCES.md](DIFFERENCES.md) as the public, versioned record of every
   intentional deviation (fail-closed) vs. deliberately-replicated C quirk.
