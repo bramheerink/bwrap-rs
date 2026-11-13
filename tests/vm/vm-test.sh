@@ -61,7 +61,11 @@ invr() {
     rec_ok
 }
 
-BASE="--ro-bind /usr /usr --ro-bind /lib64 /lib64 --ro-bind /bin /bin --proc /proc"
+# Distro-agnostic base: bind /usr and recreate the usr-merge symlinks, so the
+# command and its loader resolve through /usr whether libc lives in /usr/lib64
+# (Fedora VM) or /usr/lib/<triplet> (the Ubuntu CI runner). A Fedora-only
+# `--ro-bind /bin /lib64` base left /bin/sh unresolvable on Ubuntu.
+BASE="--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc"
 
 if [ "$run_setuid" = 1 ]; then
 echo "--- A) setuid role: must be REFUSED, identically ---"
