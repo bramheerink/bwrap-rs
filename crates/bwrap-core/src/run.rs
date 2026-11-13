@@ -20,6 +20,8 @@ use std::os::fd::AsRawFd;
 
 use nix::unistd::{Pid, chdir, execvp, read, setsid};
 
+use bwrap_sys::fd::FdTable;
+
 use crate::caps::{drop_bounding_set, set_ambient};
 use crate::error::{Context, Error, Result};
 use crate::privs::{acquire_privs, drop_privs, switch_to_user_with_privs};
@@ -37,11 +39,15 @@ use crate::userns::{IdMap, MapTarget, OverflowIds};
 
 /// Run the sandbox described by `config` (already resolved into `resolved`).
 /// Returns the exit code to propagate. `real_uid`/`real_gid` are the launcher's.
+/// `fds` is the process fd-ownership table, already holding the `--args`/
+/// `--seccomp` descriptors read at parse time; the inherited runtime fds are
+/// registered here and every borrow/close of them goes through it.
 pub fn run(
     config: &Config,
     resolved: &ResolvedConfig,
     real_uid: u32,
     real_gid: u32,
+    fds: &mut FdTable,
 ) -> Result<i32> {
     // Wire the `--debug-opt=force-*-fallback` toggles from the parsed config into
     // the resolver and the mount engine (bwrap's global `opt_force_*`). Set before
@@ -62,6 +68,38 @@ pub fn run(
     // sandbox child inherits the fd. A no-op when the variable is unset.
     crate::profile::init();
 
+    // Record every inherited runtime caller fd in the ownership table before the
+    // clone, so both the launcher and the sandbox child — which closes some of
+    // them with no preceding borrow — operate on owned numbers rather than bare
+    // integers. Each use site re-registers idempotently to mirror bubblewrap's
+    // per-fd-variable reuse (a second `--file N` reads the now-closed number and
+    // fails with EBADF), and every close goes through the table so a number is
+    // closed exactly once.
+    for &fd in config
+        .userns_fd
+        .iter()
+        .chain(config.userns2_fd.iter())
+        .chain(config.pidns_fd.iter())
+        .chain(config.userns_block_fd.iter())
+        .chain(config.info_fd.iter())
+        .chain(config.json_status_fd.iter())
+        .chain(config.block_fd.iter())
+        .chain(config.sync_fds.iter())
+    {
+        fds.register(fd);
+    }
+    if let crate::types::SeccompSource::Single(fd) = &config.seccomp {
+        fds.register(*fd);
+    }
+    for op in &config.ops {
+        match op {
+            SetupOp::File { fd, .. }
+            | SetupOp::BindData { fd, .. }
+            | SetupOp::BindFd { fd, .. } => fds.register(*fd),
+            _ => {}
+        }
+    }
+
     // The process that invoked bwrap, captured before the clone, for the
     // launcher's die-with-parent reparent check (#700).
     let invoker = nix::unistd::getppid();
@@ -81,7 +119,9 @@ pub fn run(
     // in it (it must be a descendant of ours). `--unshare-user` is mutually
     // exclusive with this, so the clone below won't also make a new userns.
     if let Some(fd) = config.userns_fd {
-        nix::sched::setns(borrow(fd), CloneFlags::CLONE_NEWUSER).map_err(|e| {
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("userns_fd just registered");
+        nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER).map_err(|e| {
             if e == Errno::EINVAL {
                 Error::invalid(
                     "Joining the specified user namespace failed, it might not be a descendant of the current user namespace.",
@@ -154,7 +194,9 @@ pub fn run(
             // intermediate forks, only the final sandbox process continues here.
             if let Some((s0, s1)) = pid_sockets {
                 if let Some(fd) = config.pidns_fd {
-                    nix::sched::setns(borrow(fd), CloneFlags::CLONE_NEWPID)
+                    fds.register(fd);
+                    let bf = fds.borrow(fd).expect("pidns_fd just registered");
+                    nix::sched::setns(bf, CloneFlags::CLONE_NEWPID)
                         .map_err(|e| Error::Sys {
                             message: "Setting pidns failed".into(),
                             errno: e,
@@ -177,7 +219,7 @@ pub fn run(
             }
             let code = child(
                 config, resolved, real_uid, real_gid, requested, cap_used, is_root, &host_tty,
-                cw_r, ev_w, setup_w,
+                cw_r, ev_w, setup_w, fds,
             );
             match code {
                 Ok(c) => bwrap_sys::process::exit_immediately(c),
@@ -211,7 +253,7 @@ pub fn run(
                 None => child,
             };
             parent(
-                config, resolved, child, invoker, cap_used, is_root, cw_w, ev_r, setup_r,
+                config, resolved, child, invoker, cap_used, is_root, cw_w, ev_r, setup_r, fds,
             )
         }
         Err(e) => Err(clone_error(
@@ -234,12 +276,14 @@ fn parent(
     cw_w: OwnedFd,
     ev_r: Option<OwnedFd>,
     setup_r: Option<OwnedFd>,
+    fds: &mut FdTable,
 ) -> Result<i32> {
     let ns_ids = namespace_ids_read(child, &resolved.namespaces)?;
     // Optionally join a second user namespace (bwrap's `--userns2`).
     if let Some(fd) = config.userns2_fd {
-        nix::sched::setns(borrow(fd), CloneFlags::CLONE_NEWUSER)
-            .context("Setting userns2 failed")?;
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("userns2_fd just registered");
+        nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER).context("Setting userns2 failed")?;
     }
     // The launcher needs no privileges.
     drop_privs(None, cap_used, is_root)?;
@@ -252,11 +296,13 @@ fn parent(
             child.as_raw(),
             &ns_ids,
         );
-        crate::process::dump_info(borrow(fd), doc.as_bytes())?;
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("info_fd just registered");
+        crate::process::dump_info(bf, doc.as_bytes())?;
         // bwrap closes --info-fd here, right after writing and before the
         // --userns-block-fd wait, so a helper that reads the info pipe to EOF
         // before releasing the block fd does not deadlock.
-        bwrap_sys::fd::close_raw(fd);
+        fds.close(fd);
     }
     if let Some(fd) = config.json_status_fd {
         let doc = crate::process::sandbox_info_json(
@@ -264,15 +310,22 @@ fn parent(
             child.as_raw(),
             &ns_ids,
         );
-        crate::process::dump_info(borrow(fd), doc.as_bytes())?;
+        // Re-register: if `--json-status-fd` aliased `--info-fd`, the close above
+        // removed the number, and C writes json to that same (now closed) number
+        // and fails at the write — so borrow the stale number to reproduce it.
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("json_status_fd just registered");
+        crate::process::dump_info(bf, doc.as_bytes())?;
     }
 
     // With `--userns-block-fd`, an external process writes the child's maps and
     // signals us here (it learned the child pid from `--info-fd`). Wait for it.
     if let Some(fd) = config.userns_block_fd {
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("userns_block_fd just registered");
         let mut b = [0u8; 1];
-        let _ = read(borrow(fd), &mut b);
-        bwrap_sys::fd::close_raw(fd);
+        let _ = read(bf, &mut b);
+        fds.close(fd);
     }
 
     // Let the child proceed now that its maps are set up. Ignore the result,
@@ -289,7 +342,12 @@ fn parent(
     );
     drop(cw_w);
 
-    let json = config.json_status_fd.map(borrow);
+    let json = if let Some(fd) = config.json_status_fd {
+        fds.register(fd);
+        fds.borrow(fd)
+    } else {
+        None
+    };
     monitor_child(
         ev_r.as_ref().map(AsFd::as_fd),
         child,
@@ -314,18 +372,21 @@ fn child(
     cw_r: OwnedFd,
     ev_w: Option<OwnedFd>,
     setup_w: Option<OwnedFd>,
+    fds: &mut FdTable,
 ) -> Result<i32> {
     let ns = &resolved.namespaces;
     let unshare_user = ns.user == NsPolicy::Unshare;
 
     // The caller's status fds must not leak into the sandbox (bwrap closes them
     // in the child right after the clone). Our copies are a separate fd table
-    // after the clone, so closing them here does not affect the launcher.
+    // after the clone, so closing them here does not affect the launcher. The
+    // numbers were registered before the clone, so the table closes them once
+    // (an alias of the same number is already gone and closing is a no-op).
     if let Some(fd) = config.info_fd {
-        bwrap_sys::fd::close_raw(fd);
+        fds.close(fd);
     }
     if let Some(fd) = config.json_status_fd {
-        bwrap_sys::fd::close_raw(fd);
+        fds.close(fd);
     }
 
     // Wait for the launcher to finish its setup. A full 8-byte read is "go".
@@ -433,7 +494,7 @@ fn child(
     // (and fail early on a missing source with the right message).
     let resolved_ops = resolve_symlinks_in_ops(&config.ops)?;
     let sp = crate::profile::span("child.setup_newroot");
-    let old_cwd = pivot_into_newroot(&resolved_ops, &ctx)?;
+    let old_cwd = pivot_into_newroot(&resolved_ops, &ctx, fds)?;
     drop(sp);
 
     // Close the op source fds now that setup has consumed them, so the exec'd
@@ -442,11 +503,15 @@ fn child(
     // oldroot teardown it also performed does not touch these fds, so closing
     // here is equivalent to bwrap's placement. Without this, a launcher fd
     // passed to `--file`/`--bind-data`/`--bind-fd` would leak into the sandbox.
+    // `setup_newroot` already closed each op's data fd through the table as it
+    // applied the op (so a reused `--file N` fails with EBADF), so these closes
+    // are now no-ops on the table; they remain as a defensive backstop matching
+    // bwrap's `close_ops_fd` placement.
     for op in &config.ops {
         match op {
             SetupOp::File { fd, .. }
             | SetupOp::BindData { fd, .. }
-            | SetupOp::BindFd { fd, .. } => bwrap_sys::fd::close_raw(*fd),
+            | SetupOp::BindFd { fd, .. } => fds.close(*fd),
             _ => {}
         }
     }
@@ -454,8 +519,9 @@ fn child(
     // Optionally join a second user namespace (bwrap's `--userns2`), after the
     // pivot, as the sandbox side does.
     if let Some(fd) = config.userns2_fd {
-        nix::sched::setns(borrow(fd), CloneFlags::CLONE_NEWUSER)
-            .context("Setting userns2 failed")?;
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("userns2_fd just registered");
+        nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER).context("Setting userns2 failed")?;
     }
 
     // Second-level user namespace: map back to the sandbox uid/gid after the
@@ -500,14 +566,19 @@ fn child(
 
     // `--block-fd`: wait for an external process to let us continue.
     if let Some(fd) = config.block_fd {
+        fds.register(fd);
+        let bf = fds.borrow(fd).expect("block_fd just registered");
         let mut b = [0u8; 1];
-        let _ = read(borrow(fd), &mut b);
-        bwrap_sys::fd::close_raw(fd);
+        let _ = read(bf, &mut b);
+        fds.close(fd);
     }
 
-    // Load seccomp now (reads the fds), apply just before exec.
+    // Load seccomp now (reads the fds), apply just before exec. The single
+    // `--seccomp FD` is read through the table (bwrap's `seccomp_program_new`
+    // reads the fd and closes it before the pid-1 fork, so it cannot leak into
+    // the sandbox); `--add-seccomp-fd` programs were already read at parse time.
     let sp = crate::profile::span("child.seccomp_load");
-    let seccomp = SeccompPrograms::load(&config.seccomp, read_all_fd)?;
+    let seccomp = SeccompPrograms::load(&config.seccomp, |fd| read_all_fd(fd, fds))?;
     drop(sp);
 
     nix::sys::stat::umask(old_umask);
@@ -578,7 +649,7 @@ fn child(
     // sandboxed command never inherits them.
     if !config.as_pid_1 {
         for &fd in &config.sync_fds {
-            bwrap_sys::fd::close_raw(fd);
+            fds.close(fd);
         }
     }
 
@@ -614,11 +685,6 @@ fn child(
             Err(e)
         }
     }
-}
-
-/// Borrow a caller-supplied RawFd (from the parsed config).
-fn borrow(fd: std::os::fd::RawFd) -> BorrowedFd<'static> {
-    bwrap_sys::fd::borrow_raw(fd)
 }
 
 /// Build the `CLONE_*` flag set from the resolved namespace decisions. The mount
@@ -901,9 +967,12 @@ fn read_pid(sock: BorrowedFd<'_>) -> Result<Pid> {
     Err(Error::invalid("No pid returned on socket"))
 }
 
-/// Read all bytes from a caller fd (for `--seccomp`/`--add-seccomp-fd`).
-fn read_all_fd(fd: std::os::fd::RawFd) -> Result<Vec<u8>> {
-    let bf = bwrap_sys::fd::borrow_raw(fd);
+/// Read all bytes from a caller fd (for `--seccomp`), then close it through the
+/// table. Re-registers first so a stale (reused) number still borrows and fails
+/// at the `read` with the same errno as C, rather than at an earlier gate.
+fn read_all_fd(fd: std::os::fd::RawFd, fds: &mut FdTable) -> Result<Vec<u8>> {
+    fds.register(fd);
+    let bf = fds.borrow(fd).expect("seccomp fd just registered");
     let mut out = Vec::new();
     let mut buf = [0u8; 4096];
     let result = loop {
@@ -921,7 +990,7 @@ fn read_all_fd(fd: std::os::fd::RawFd) -> Result<Vec<u8>> {
     };
     // bwrap's `seccomp_program_new` reads the fd and closes it (before the pid-1
     // fork), so `--seccomp FD` cannot leak into the sandboxed process.
-    bwrap_sys::fd::close_raw(fd);
+    fds.close(fd);
     result
 }
 

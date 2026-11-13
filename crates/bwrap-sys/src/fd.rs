@@ -5,10 +5,25 @@
 //! command line (`--bind-fd`, `--file`, `--args`, `--seccomp`, `--info-fd`, …)
 //! arrive as raw integers inherited from the launcher. [`FdTable`] records which
 //! of those numbers are still open, so the upper crates can borrow them through a
-//! safe API ([`FdTable::borrow`] → `Option`) and close them explicitly, instead
-//! of the free `borrow_raw`/`close_raw` functions whose safety rests on an
-//! unwritten caller contract. The migration to [`FdTable`] is in progress; the
-//! two free functions remain until every call site is moved over.
+//! safe API ([`FdTable::borrow`] → `Option`) and close them exactly once. It is
+//! the sole way those crates touch an inherited fd; there is no free
+//! `borrow_raw`/`close_raw`, so the `unsafe` [`BorrowedFd::borrow_raw`] is
+//! confined here and every borrow handed upward is tied to the table's lifetime.
+//!
+//! Two record paths, matching how bubblewrap itself treats these fds:
+//!
+//! - [`claim`](FdTable::claim) verifies the number is open (`F_GETFD`) first and
+//!   reports `EBADF` otherwise. Used where C reads the fd during argument parsing
+//!   (`--args`, `--seccomp`): a bad or reused number must fail with `EBADF`, and
+//!   claiming is what stops a closed number from being re-recorded and closed
+//!   again.
+//! - [`register`](FdTable::register) records an inherited number without a syscall
+//!   check. Used for the runtime fds (`--info-fd`, `--userns`, `--bind-fd`, …),
+//!   which bubblewrap also uses without a prior openness check: a bad number
+//!   surfaces at the actual `setns`/`read`/`write`, byte-for-byte as in C, rather
+//!   than at an earlier gate that C does not have. It is idempotent, so a site
+//!   may re-register before borrowing to reproduce C's per-fd-variable reuse (a
+//!   second `--file N` reads the now-closed number and fails with `EBADF`).
 
 use std::collections::HashSet;
 use std::io;
@@ -65,6 +80,17 @@ impl FdTable {
         Ok(())
     }
 
+    /// Record an inherited runtime fd number without a syscall check, the way
+    /// bubblewrap uses `--info-fd`/`--userns`/`--bind-fd`/… — it never probes
+    /// them first, so a bad number must surface at the actual `setns`/`read`/
+    /// `write` with that call's errno, not at an earlier gate C does not have.
+    /// Idempotent: a site re-registers right before borrowing so that reusing a
+    /// now-closed number (a second `--file N`) borrows the stale number and fails
+    /// at the syscall with `EBADF`, exactly as C's reuse of the variable does.
+    pub fn register(&mut self, fd: RawFd) {
+        self.open.insert(fd);
+    }
+
     /// Borrow a claimed, still-open fd, or `None` if it was never claimed or has
     /// since been closed (the caller maps `None` to `EBADF`).
     pub fn borrow(&self, fd: RawFd) -> Option<BorrowedFd<'_>> {
@@ -92,33 +118,6 @@ impl FdTable {
             let _ = nix::unistd::close(fd);
         }
     }
-}
-
-/// Borrow a caller-supplied raw fd for the lifetime `'a`.
-///
-/// The returned [`BorrowedFd`] must not outlive the fd. In bwrap these fds are
-/// inherited and stay open throughout sandbox setup, and `bwrap-core` only
-/// borrows them transiently within a single setup op, so the borrow is sound.
-///
-/// Being superseded by [`FdTable`], which makes the lifetime contract checkable.
-pub fn borrow_raw<'a>(fd: RawFd) -> BorrowedFd<'a> {
-    // SAFETY: the caller guarantees `fd` is an open descriptor that stays open
-    // for the whole of `'a` (see the contract above). We never close it here.
-    unsafe { BorrowedFd::borrow_raw(fd) }
-}
-
-/// Close a caller-supplied raw fd by number, ignoring the result.
-///
-/// Used to stop caller descriptors (`--info-fd`, `--json-status-fd`, `--sync-fd`)
-/// from leaking into the sandboxed process, mirroring bwrap's explicit `close`
-/// calls. The fd is a plain integer owned by the process, not an `OwnedFd`; a
-/// bad or already-closed number simply yields `EBADF`, which is ignored.
-///
-/// Safe: `nix::unistd::close` wraps the same `close(2)` with no unsafe at the
-/// call site; the result (including `EBADF`) is deliberately discarded. Being
-/// superseded by [`FdTable::close`].
-pub fn close_raw(fd: RawFd) {
-    let _ = nix::unistd::close(fd);
 }
 
 #[cfg(test)]
@@ -166,6 +165,29 @@ mod tests {
         t.claim(fd).unwrap();
         t.claim(fd).unwrap(); // no error, still one entry
         assert!(t.borrow(fd).is_some());
+        t.close(fd);
+        drop(w);
+    }
+
+    #[test]
+    fn register_is_unchecked_and_reregister_after_close() {
+        let (r, w) = nix::unistd::pipe().expect("pipe");
+        let fd = r.as_raw_fd();
+        std::mem::forget(r);
+        let mut t = FdTable::new();
+        // register records without probing the fd (unlike claim).
+        t.register(fd);
+        assert!(t.borrow(fd).is_some());
+        t.close(fd);
+        assert!(t.borrow(fd).is_none(), "closed -> not borrowable");
+        // Re-registering a closed number makes it borrowable again, mirroring C
+        // reusing the stale fd variable; the borrow then fails at the syscall.
+        t.register(fd);
+        assert!(t.borrow(fd).is_some(), "re-registered stale number");
+        // A number that is almost certainly not open registers all the same
+        // (no syscall check); it would only fail when actually used.
+        t.register(99999);
+        assert!(t.borrow(99999).is_some());
         t.close(fd);
         drop(w);
     }

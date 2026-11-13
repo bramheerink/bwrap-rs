@@ -157,7 +157,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match launch(config) {
+    match launch(config, &mut fds) {
         Ok(code) => {
             trace::outcome(&format!("exit={code}"));
             ExitCode::from(u8::try_from(code).unwrap_or(255))
@@ -176,9 +176,9 @@ fn main() -> ExitCode {
     }
 }
 
-fn launch(config: Config) -> Result<i32, Error> {
+fn launch(config: Config, fds: &mut bwrap_sys::fd::FdTable) -> Result<i32, Error> {
     let real_uid = nix::unistd::getuid().as_raw();
     let real_gid = nix::unistd::getgid().as_raw();
     let resolved = config.resolve(real_uid, real_gid, &SystemUsernsProbe)?;
-    run(&config, &resolved, real_uid, real_gid)
+    run(&config, &resolved, real_uid, real_gid, fds)
 }

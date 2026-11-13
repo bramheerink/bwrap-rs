@@ -14,7 +14,7 @@
 
 #[cfg(feature = "profile")]
 mod imp {
-    use std::os::fd::{AsRawFd, OwnedFd};
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
     use std::os::unix::fs::OpenOptionsExt;
     use std::sync::OnceLock;
     use std::sync::atomic::{AtomicI32, Ordering};
@@ -78,7 +78,11 @@ mod imp {
                 std::process::id()
             );
             // Best-effort: a profiling write must never change observable output.
-            let _ = nix::unistd::write(bwrap_sys::fd::borrow_raw(fd), line.as_bytes());
+            // Write through the `OwnedFd` we opened in `init` (inherited by the
+            // clone child via the COW `OnceLock`); `FD >= 0` guarantees it is set.
+            if let Some(Some(owned)) = HANDLE.get() {
+                let _ = nix::unistd::write(owned.as_fd(), line.as_bytes());
+            }
         }
     }
 }

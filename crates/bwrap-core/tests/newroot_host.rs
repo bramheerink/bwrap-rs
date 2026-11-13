@@ -79,7 +79,9 @@ fn child(real_uid: u32, real_gid: u32) -> i32 {
     ];
     let ctx = NewrootCtx::default(); // unshare_pid=false -> /proc host-bound
 
-    if let Err(e) = pivot_into_newroot(&ops, &ctx) {
+    // No op in this test carries a caller fd, so a fresh empty table suffices.
+    let mut fds = bwrap_sys::fd::FdTable::new();
+    if let Err(e) = pivot_into_newroot(&ops, &ctx, &mut fds) {
         eprintln!("  pivot_into_newroot: {e}");
         return 4;
     }

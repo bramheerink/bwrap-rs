@@ -14,6 +14,8 @@ use std::ffi::{CStr, CString};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 
+use bwrap_sys::fd::FdTable;
+
 use nix::errno::Errno;
 use nix::fcntl::{AtFlags, OFlag, openat, readlinkat};
 use nix::mount::{MsFlags, mount};
@@ -327,7 +329,7 @@ fn op_label(op: &SetupOp) -> &'static str {
     }
 }
 
-pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
+pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx, fds: &mut FdTable) -> Result<()> {
     let mut tmp_overlay_idx = 0usize;
 
     for op in ops {
@@ -372,7 +374,8 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
             }
 
             SetupOp::BindFd { fd, dest, kind } => {
-                let src_fd = bwrap_sys::fd::borrow_raw(*fd);
+                fds.register(*fd);
+                let src_fd = fds.borrow(*fd).expect("bind-fd src just registered");
                 // Resolve the caller's fd to its real path (bwrap resolves the
                 // `/proc/self/fd/N` source to the realpath), then bind that path
                 // from the old root like a normal source — binding the magic link
@@ -412,7 +415,7 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                 }
                 // Close the caller's fd after the op (bubblewrap.c:1571) so a
                 // reused --bind-fd/--ro-bind-fd fd fails instead of binding twice.
-                bwrap_sys::fd::close_raw(*fd);
+                fds.close(*fd);
             }
 
             SetupOp::Overlay { lower, upper, dest } => {
@@ -577,13 +580,14 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                     false,
                 )?;
                 let dest_fd = dest_fd.expect("file dest is created");
-                let src = bwrap_sys::fd::borrow_raw(*fd);
+                fds.register(*fd);
+                let src = fds.borrow(*fd).expect("file src just registered");
                 copy_file_data(src, dest_fd.as_fd())
                     .with_context(|| format!("Can't write data to file {}", disp(dest_b)))?;
                 // bwrap closes the data fd after copying (bubblewrap.c:1306), so a
                 // reused `--file N … --file N` re-reads a closed fd and fails with
                 // EBADF, instead of silently producing an empty second file.
-                bwrap_sys::fd::close_raw(*fd);
+                fds.close(*fd);
             }
 
             SetupOp::BindData {
@@ -605,7 +609,7 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                 // unlink so the sandbox can never reach the backing file. The
                 // unlink is AFTER the bind: binding a deleted /proc/self/fd path
                 // fails with ENOENT.
-                let (tmp, name) = bind_data_tmpfile(*perms, *fd, dest_b)?;
+                let (tmp, name) = bind_data_tmpfile(*perms, *fd, dest_b, fds)?;
                 setup_op_bind_mount_fd(
                     bind_opts(*kind, ctx.not_a_security_boundary),
                     tmp.as_fd(),
@@ -696,7 +700,11 @@ fn get_current_dir_name() -> nix::Result<std::path::PathBuf> {
 /// default sandbox cwd, or `None` when the launcher's cwd no longer exists —
 /// bwrap treats that as a NULL `old_cwd` and falls back to `$HOME` then `/`.
 /// Must run in the sandbox's own mount namespace.
-pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<Option<std::path::PathBuf>> {
+pub fn pivot_into_newroot(
+    ops: &[SetupOp],
+    ctx: &NewrootCtx,
+    fds: &mut FdTable,
+) -> Result<Option<std::path::PathBuf>> {
     use nix::mount::{MntFlags, umount2};
     use nix::unistd::{chdir, fchdir, mkdir, pivot_root};
 
@@ -775,7 +783,7 @@ pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<Option<st
     )
     .with_mount_context(|| "mounting proc".to_string())?;
 
-    setup_newroot(ops, ctx)?;
+    setup_newroot(ops, ctx, fds)?;
 
     // The old root must be rprivate or unmounts would propagate to the parent.
     mount(
@@ -930,6 +938,7 @@ fn bind_data_tmpfile(
     perms: Mode,
     fd: std::os::fd::RawFd,
     dest_display: &[u8],
+    fds: &mut FdTable,
 ) -> Result<(OwnedFd, String)> {
     // A fresh, exclusively-created file in the root tmpfs ("/" is the new tmpfs
     // root at this point in setup). The caller binds it and THEN unlinks the
@@ -949,12 +958,13 @@ fn bind_data_tmpfile(
             disp(dest_display)
         )
     })?;
-    let src = bwrap_sys::fd::borrow_raw(fd);
+    fds.register(fd);
+    let src = fds.borrow(fd).expect("bind-data src just registered");
     copy_file_data(src, tmp.as_fd())
         .with_context(|| format!("Can't write data to file {}", disp(dest_display)))?;
     // Close the data fd after copying (bubblewrap.c:1547) so a reused
     // --bind-data/--ro-bind-data fd fails with EBADF like bubblewrap.
-    bwrap_sys::fd::close_raw(fd);
+    fds.close(fd);
     Ok((tmp, name))
 }
 
