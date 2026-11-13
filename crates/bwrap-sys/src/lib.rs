@@ -3,7 +3,14 @@
 //!
 //! This is the **only** crate in the workspace that may contain `unsafe`.
 //! Every unsafe block carries a `// SAFETY:` justification, and every public
-//! function is safe to call.
+//! function is safe to call, with two documented exceptions whose soundness
+//! rests on a caller contract the compiler cannot check (both to be removed by
+//! the planned fd-ownership table):
+//!
+//! - [`fd::borrow_raw`] — the caller chooses the `BorrowedFd` lifetime for an
+//!   arbitrary raw fd; it must not outlive the fd.
+//! - [`process::close_extra_fds`] — must not be called while any `OwnedFd`
+//!   outside its keep-set is still live, or the later drop double-closes.
 //!
 //! | Module         | Syscall(s)                                             |
 //! |----------------|--------------------------------------------------------|

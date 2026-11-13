@@ -151,6 +151,9 @@ pub fn fork_single_threaded() -> Result<ForkResult, ForkError> {
 /// Unlike [`std::process::exit`], this runs no `atexit` handlers and flushes
 /// no stdio buffers. That is what a forked or cloned child must use, because
 /// those handlers and buffers belong to the parent. nix has no wrapper for it.
+//
+// nix-upstream-kandidaat: `_exit(c_int) -> !` has no soundness precondition, so
+// a nix `pub fn` for it would be genuinely safe and could replace this block.
 pub fn exit_immediately(status: i32) -> ! {
     // SAFETY: `_exit` takes a plain integer, touches no memory of ours and
     // never returns. It is async-signal-safe and valid in any process state.
@@ -180,104 +183,115 @@ pub fn wait_raw(pid: pid_t, nohang: bool) -> nix::Result<Option<(Pid, c_int)>> {
     }
 }
 
-/// Edit the process environment in place, mirroring bwrap's handling of
-/// `--clearenv`/`--setenv`/`--unsetenv`: `clearenv`/`setenv`/`unsetenv` applied
-/// to the inherited `environ`, then `execvp`.
+/// How to change the environment (bwrap's `--clearenv`/`--setenv`/`--unsetenv`),
+/// applied in order by [`apply_env`].
+#[derive(Debug)]
+pub enum EnvOp {
+    /// `--clearenv`: drop the entire environment.
+    Clear,
+    /// `--setenv NAME VALUE`.
+    Set(std::ffi::CString, std::ffi::CString),
+    /// `--unsetenv NAME`.
+    Unset(std::ffi::CString),
+}
+
+/// Apply `ops` to the real process environment in order, editing `environ` in
+/// place (clearenv/setenv/unsetenv) rather than rebuilding it from a snapshot —
+/// so malformed or duplicate inherited entries pass through unchanged and a
+/// `--setenv` on a duplicated name behaves like bubblewrap. `execvp`'s `PATH`
+/// search and the child's environment both come from this `environ`.
 ///
-/// bwrap never rebuilds the environment from a snapshot (which would drop
-/// malformed entries and collapse duplicates); it mutates the real `environ`, so
-/// the command's `PATH` search and the child's environment both come from it.
-/// These four wrappers own that mutation (`std::env::set_var` is `unsafe` under
-/// edition 2024 and forbidden in the pure-safe crates).
-///
-/// Sound because the sandbox child is single-threaded at exec time (see the
-/// module caveat): no other thread can race on `environ`.
-pub fn env_clear() {
-    // SAFETY: clears `environ`; single-threaded here, so nothing races.
+/// Refuses unless the process is single-threaded: mutating `environ` while
+/// another thread accesses it is a data race — the reason `std::env::set_var`
+/// became `unsafe` in edition 2024. bwrap's child is single-threaded by
+/// construction (it just cloned/forked from a single-threaded parent and spawns
+/// no threads), so this always succeeds there; the check is what makes the
+/// function a sound *safe* `pub fn`. Reading the environment stays safe via
+/// `std::env::var_os`, so no getenv wrapper is exposed.
+pub fn apply_env(ops: &[EnvOp]) -> Result<(), ForkError> {
+    ensure_single_threaded()?;
+    for op in ops {
+        match op {
+            EnvOp::Clear => env_clear(),
+            EnvOp::Set(name, value) => env_set(name, value),
+            EnvOp::Unset(name) => env_unset(name),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn env_clear() {
+    // SAFETY: clears `environ`; apply_env verified single-threadedness first, so
+    // nothing races.
     unsafe {
         libc::clearenv();
     }
 }
 
-/// Set `name=value` (`setenv` with overwrite), as `--setenv` does.
-pub fn env_set(name: &std::ffi::CStr, value: &std::ffi::CStr) {
+pub(crate) fn env_set(name: &std::ffi::CStr, value: &std::ffi::CStr) {
     // SAFETY: both are valid NUL-terminated C strings borrowed for this call;
-    // setenv copies them. Single-threaded as above.
+    // setenv copies them. Single-threaded (apply_env checked).
     unsafe {
         libc::setenv(name.as_ptr(), value.as_ptr(), 1);
     }
 }
 
-/// Remove `name` from the environment (`unsetenv`), as `--unsetenv` does.
-pub fn env_unset(name: &std::ffi::CStr) {
-    // SAFETY: a valid NUL-terminated C string; single-threaded as above.
+pub(crate) fn env_unset(name: &std::ffi::CStr) {
+    // SAFETY: a valid NUL-terminated C string; single-threaded (apply_env checked).
     unsafe {
         libc::unsetenv(name.as_ptr());
     }
 }
 
-/// Look up `name` in the environment (`getenv`), copying the value out.
-pub fn env_get(name: &std::ffi::CStr) -> Option<Vec<u8>> {
-    // SAFETY: `getenv` reads `environ` and returns a pointer to a NUL-terminated
-    // string owned by the environment (or null); single-threaded, so it stays
-    // valid while we copy it.
-    let p = unsafe { libc::getenv(name.as_ptr()) };
-    if p.is_null() {
-        return None;
-    }
-    // SAFETY: a non-null `getenv` result points to a NUL-terminated C string.
-    let bytes = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec();
-    Some(bytes)
-}
+/// Whether the process inherited SIG_IGN for each signal the Rust runtime
+/// overrides, captured before the runtime runs (see
+/// [`CAPTURE_INHERITED_DISPOSITIONS`]).
+///
+/// A single bool suffices: bwrap is always reached through `execve`, which resets
+/// every caught handler to `SIG_DFL` and preserves only `SIG_IGN`. So at entry
+/// the inherited disposition of these signals can only be `SIG_DFL` or `SIG_IGN`
+/// — never a custom handler — and restoring it is just "re-ignore if it was
+/// ignored, else default". Default (`false`) is C's usual case.
+static SIGPIPE_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SIGSEGV_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static SIGBUS_IGNORED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// A signal disposition the process was started with, captured before the Rust
-/// runtime replaces it (see [`CAPTURE_INHERITED_DISPOSITIONS`]). Stored as the
-/// raw `sighandler_t` (`SIG_DFL` is 0, `SIG_IGN` is 1, else a handler address).
-/// Initialised to `SIG_DFL` so a missed capture degrades to C's usual case, not
-/// to the runtime's handler.
-static INHERITED_SIGPIPE: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
-static INHERITED_SIGSEGV: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
-static INHERITED_SIGBUS: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
-
-/// Query the current disposition of `signum` (`sigaction` with a null `act`),
-/// returning the raw `sa_sigaction` value, or `None` if the query failed.
-fn query_disposition(signum: c_int) -> Option<usize> {
-    // SAFETY: an all-zero `sigaction` is a valid value (SIG_DFL, no flags,
-    // empty mask); it is overwritten by the query below before being read.
+/// Was `signum` inherited with `SIG_IGN`? Queries via `sigaction` with a null
+/// `act`. `None` on failure.
+fn inherited_ignored(signum: c_int) -> Option<bool> {
+    // SAFETY: an all-zero `sigaction` is a valid value (SIG_DFL, no flags, empty
+    // mask); it is overwritten by the query below before being read.
     let mut cur: libc::sigaction = unsafe { std::mem::zeroed() };
     // SAFETY: runs single-threaded during ELF startup. A null `act` pointer only
     // reads the current disposition into `cur`; nothing is installed.
     let rc = unsafe { libc::sigaction(signum, std::ptr::null(), &mut cur) };
-    (rc == 0).then_some(cur.sa_sigaction)
+    (rc == 0).then_some(cur.sa_sigaction == libc::SIG_IGN)
 }
 
-/// Install `disp` (a raw `sighandler_t`) as the disposition of `signum`.
-fn set_disposition(signum: c_int, disp: usize) {
+/// Install `SIG_IGN` (if `ignored`) or `SIG_DFL` as the disposition of `signum`.
+fn install(signum: c_int, ignored: bool) {
+    let disp = if ignored {
+        libc::SIG_IGN
+    } else {
+        libc::SIG_DFL
+    };
     // SAFETY: called on the single-threaded startup path (first thing in `main`,
-    // and again before the clone). `disp` is a `sighandler_t` value — a captured
-    // real disposition or a `SIG_DFL`/`SIG_IGN` constant — valid to install.
-    // `signal` touches none of our memory.
+    // and again before the clone). `disp` is the `SIG_DFL`/`SIG_IGN` constant;
+    // `signal` installs it and touches none of our memory.
     unsafe {
         libc::signal(signum, disp);
     }
 }
 
-/// Record the dispositions of the signals the Rust runtime overrides at startup
-/// (SIGPIPE → `SIG_IGN`; SIGSEGV/SIGBUS → its stack-overflow handler), captured
-/// during ELF startup — before `main` and before the runtime runs — so that
-/// [`reset_runtime_signal_state`] can put back exactly what bubblewrap's child
-/// would inherit.
+/// Record whether SIGPIPE/SIGSEGV/SIGBUS were inherited ignored, captured during
+/// ELF startup — before `main` and before the Rust runtime overrides them
+/// (SIGPIPE → `SIG_IGN`; SIGSEGV/SIGBUS → its stack-overflow handler) — so that
+/// [`reset_runtime_signal_state`] can put back what bubblewrap's child inherits.
 ///
-/// bwrap (C) installs no handlers at all and never touches these signals: the
-/// sandboxed command inherits whatever disposition bwrap itself was launched
-/// with — normally `SIG_DFL`, but a parent that ignores a signal passes
-/// `SIG_IGN` through. The Rust runtime replaces all three, and that survives
-/// `exec`, so to stay a faithful drop-in we must restore the *inherited*
-/// disposition, not force a value. The inherited values are only observable
-/// before the runtime runs, so this `.init_array` constructor records them then.
+/// bwrap (C) installs no handlers and never touches these signals; the command
+/// inherits whatever bwrap was launched with. Since that is only `SIG_DFL` or
+/// `SIG_IGN` (see [`SIGPIPE_IGNORED`]) and the runtime clobbers all three, this
+/// constructor records the one bit that matters while it still can.
 #[used]
 #[cfg_attr(
     any(target_os = "linux", target_os = "android"),
@@ -285,30 +299,26 @@ fn set_disposition(signum: c_int, disp: usize) {
 )]
 static CAPTURE_INHERITED_DISPOSITIONS: extern "C" fn() = {
     extern "C" fn capture() {
-        if let Some(d) = query_disposition(libc::SIGPIPE) {
-            INHERITED_SIGPIPE.store(d, std::sync::atomic::Ordering::Relaxed);
+        if let Some(b) = inherited_ignored(libc::SIGPIPE) {
+            SIGPIPE_IGNORED.store(b, std::sync::atomic::Ordering::Relaxed);
         }
-        if let Some(d) = query_disposition(libc::SIGSEGV) {
-            INHERITED_SIGSEGV.store(d, std::sync::atomic::Ordering::Relaxed);
+        if let Some(b) = inherited_ignored(libc::SIGSEGV) {
+            SIGSEGV_IGNORED.store(b, std::sync::atomic::Ordering::Relaxed);
         }
-        if let Some(d) = query_disposition(libc::SIGBUS) {
-            INHERITED_SIGBUS.store(d, std::sync::atomic::Ordering::Relaxed);
+        if let Some(b) = inherited_ignored(libc::SIGBUS) {
+            SIGBUS_IGNORED.store(b, std::sync::atomic::Ordering::Relaxed);
         }
     }
     capture
 };
 
 /// Restore SIGPIPE to the disposition the process inherited at startup, undoing
-/// the Rust runtime's `SIG_IGN` so the sandbox and the exec'd command see
-/// exactly what C's child would. Call it before the clone.
-///
-/// (`SIG_DFL`/`SIG_IGN` are reinstalled faithfully; an inherited *custom*
-/// handler — essentially nonexistent for SIGPIPE — is reinstalled with default
-/// flags, still closer to C than forcing `SIG_DFL`.)
+/// the Rust runtime's `SIG_IGN` so the sandbox and the exec'd command see what
+/// C's child would. Call it before the clone.
 pub fn restore_inherited_sigpipe() {
-    set_disposition(
+    install(
         libc::SIGPIPE,
-        INHERITED_SIGPIPE.load(std::sync::atomic::Ordering::Relaxed),
+        SIGPIPE_IGNORED.load(std::sync::atomic::Ordering::Relaxed),
     );
 }
 
@@ -316,11 +326,10 @@ pub fn restore_inherited_sigpipe() {
 /// launcher, the pid-1 reaper and the sandboxed command run with bubblewrap's
 /// signal state instead of Rust's. Call it as the very first thing in `main`.
 ///
-/// - SIGPIPE, SIGSEGV and SIGBUS: put back the inherited disposition the
-///   `.init_array` constructor captured (normally `SIG_DFL`; an inherited
-///   `SIG_IGN` is preserved). C installs no handlers, so this leaves the
-///   launcher's `SigCgt` empty like bubblewrap's and lets a crash signal kill it
-///   as it kills C, instead of the std handler swallowing the first one.
+/// - SIGPIPE, SIGSEGV and SIGBUS: put back the inherited disposition (`SIG_IGN`
+///   if it was ignored, else `SIG_DFL`). C installs no handlers, so this leaves
+///   the launcher's `SigCgt` empty like bubblewrap's and lets a crash signal kill
+///   it as it kills C, instead of the std handler swallowing the first one.
 /// - SIGCHLD: reset to `SIG_DFL` unconditionally, as bubblewrap.c:2905 does
 ///   ("Reset SIGCHILD to SIG_DFL allowing signalfd working properly if the
 ///   parent process had set SIGCHLD to SIG_IGN"). A launcher started with
@@ -329,15 +338,15 @@ pub fn restore_inherited_sigpipe() {
 ///   ignore would leak into the sandboxed command.
 pub fn reset_runtime_signal_state() {
     restore_inherited_sigpipe();
-    set_disposition(
+    install(
         libc::SIGSEGV,
-        INHERITED_SIGSEGV.load(std::sync::atomic::Ordering::Relaxed),
+        SIGSEGV_IGNORED.load(std::sync::atomic::Ordering::Relaxed),
     );
-    set_disposition(
+    install(
         libc::SIGBUS,
-        INHERITED_SIGBUS.load(std::sync::atomic::Ordering::Relaxed),
+        SIGBUS_IGNORED.load(std::sync::atomic::Ordering::Relaxed),
     );
-    set_disposition(libc::SIGCHLD, libc::SIG_DFL);
+    install(libc::SIGCHLD, false);
 }
 
 /// Close every open file descriptor greater than 2 (stdio) that is not in

@@ -516,10 +516,16 @@ fn child(
     // real environ exactly as C does (clearenv/setenv/unsetenv), never rebuilt
     // from a snapshot — so malformed/duplicate inherited entries pass through
     // unchanged and a `--setenv` on a duplicated name behaves like bubblewrap.
-    apply_env_ops(&config.env_ops);
+    apply_env_ops(&config.env_ops)?;
     let new_cwd = compute_cwd(config, old_cwd.as_deref())?;
+    // PWD is set after the cwd is known (bwrap sets it last), so it is a separate
+    // single op routed through the same gated apply_env. The NUL case cannot
+    // occur for a path, so skip defensively rather than panicking.
     if let Ok(pwd) = CString::new(new_cwd.clone()) {
-        bwrap_sys::process::env_set(c"PWD", &pwd);
+        env_apply(&[bwrap_sys::process::EnvOp::Set(
+            CString::new("PWD").expect("PWD has no NUL"),
+            pwd,
+        )])?;
     }
 
     if config.new_session {
@@ -929,29 +935,44 @@ fn read_all_fd(fd: std::os::fd::RawFd) -> Result<Vec<u8>> {
 /// a byte-exact drop-in may do to the block it passes on. Editing in place keeps
 /// the inherited block verbatim and changes only what the ops name, exactly as
 /// bubblewrap does. (`setenv` on a duplicated name updates the first entry and
-/// leaves the rest, so `getenv`/`execvp` see what C sees.)
-fn apply_env_ops(ops: &[crate::types::config::EnvOp]) {
+/// leaves the rest, so the command and `execvp` see what C sees.)
+///
+/// All mutation funnels through the single gated `bwrap_sys::process::apply_env`
+/// (which refuses unless single-threaded), so the primitives are not exposed as
+/// safe `pub fn`s that safe multithreaded code could misuse.
+fn apply_env_ops(ops: &[crate::types::config::EnvOp]) -> Result<()> {
     use crate::types::config::EnvOp;
+    use bwrap_sys::process::EnvOp as SysOp;
+    let mut sys_ops: Vec<SysOp> = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
-            EnvOp::Clear => bwrap_sys::process::env_clear(),
+            EnvOp::Clear => sys_ops.push(SysOp::Clear),
+            // argv-derived strings are NUL-free, so CString::new succeeds; skip
+            // defensively if that ever fails rather than panicking.
             EnvOp::Set { name, value } => {
-                // argv-derived strings are NUL-free, so CString::new succeeds;
-                // skip defensively if that ever fails rather than panicking.
                 if let (Ok(n), Ok(v)) = (
                     CString::new(name.as_bytes()),
                     CString::new(value.as_bytes()),
                 ) {
-                    bwrap_sys::process::env_set(&n, &v);
+                    sys_ops.push(SysOp::Set(n, v));
                 }
             }
             EnvOp::Unset { name } => {
                 if let Ok(n) = CString::new(name.as_bytes()) {
-                    bwrap_sys::process::env_unset(&n);
+                    sys_ops.push(SysOp::Unset(n));
                 }
             }
         }
     }
+    env_apply(&sys_ops)
+}
+
+/// Apply environment ops through the single-threaded-gated syscall wrapper,
+/// mapping its refusal to an `Error`. (It can only fail if the process is
+/// multi-threaded, which never happens in bwrap's cloned/forked child.)
+fn env_apply(ops: &[bwrap_sys::process::EnvOp]) -> Result<()> {
+    bwrap_sys::process::apply_env(ops)
+        .map_err(|e| Error::invalid(format!("refusing to change the environment: {e}")))
 }
 
 /// bwrap's cwd logic: `--chdir`, else the old cwd if reachable, else `$HOME`,
@@ -970,11 +991,13 @@ fn compute_cwd(config: &Config, old_cwd: Option<&std::path::Path>) -> Result<Vec
         return Ok(old.as_os_str().as_bytes().to_vec());
     }
     // HOME is read from the real environ (after the env ops have been applied),
-    // exactly as bwrap's getenv("HOME") is.
-    if let Some(home) = bwrap_sys::process::env_get(c"HOME")
-        && chdir(home.as_slice()).is_ok()
-    {
-        return Ok(home);
+    // like bwrap's getenv("HOME"). Reading is safe (std::env::var_os), so no
+    // getenv wrapper is needed; only the mutation is gated (apply_env).
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.as_bytes();
+        if chdir(home).is_ok() {
+            return Ok(home.to_vec());
+        }
     }
     Ok(b"/".to_vec())
 }
