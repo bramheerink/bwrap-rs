@@ -16,7 +16,10 @@ version = 2
 # a duplicate (e.g. two bitflags majors via nix) is visible without hard-failing
 # CI on a transitive quirk.
 multiple-versions = "warn"
+# Catch a real `foo = "*"` external dependency, but exempt internal path/workspace
+# crates (bwrap-sys/bwrap-core), which cargo-deny otherwise reports as wildcards.
 wildcards = "deny"
+allow-wildcard-paths = true
 
 [sources]
 unknown-registry = "deny"
