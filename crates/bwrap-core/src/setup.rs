@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
+// Ported from bubblewrap, Copyright (C) 2016 Alexander Larsson and contributors.
 //! The new-root setup executor and its op helpers — the port of bubblewrap's
 //! `setup_newroot` dispatch. It runs after the root tmpfs and `pivot_root` are
 //! prepared, consuming the resolved `SetupOp` list to build the sandbox
@@ -32,6 +34,17 @@ use crate::types::op::{BindKind, Mode, OnMissing, OverlayUpper, SetupOp};
 /// sandbox paths are effectively always UTF-8).
 fn disp(bytes: &[u8]) -> Cow<'_, str> {
     String::from_utf8_lossy(bytes)
+}
+
+/// Format a mode the way C's `%#o` does: a leading `0`, except `0` itself prints
+/// as `"0"` (not `"00"`). Rust's `{:#o}` would print `0o700`, which diverges
+/// from bubblewrap's `die_with_error ("Can't chmod %#o ...")`.
+fn c_alt_octal(mode: u16) -> String {
+    if mode == 0 {
+        "0".into()
+    } else {
+        format!("0{mode:o}")
+    }
 }
 
 /// Compose a bind failure the way bwrap's `die_with_bind_result` prints it:
@@ -397,6 +410,9 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                 if fd_st.st_ino != mount_st.st_ino || fd_st.st_dev != mount_st.st_dev {
                     return Err(Error::invalid("Race condition binding dirfd"));
                 }
+                // Close the caller's fd after the op (bubblewrap.c:1571) so a
+                // reused --bind-fd/--ro-bind-fd fd fails instead of binding twice.
+                bwrap_sys::fd::close_raw(*fd);
             }
 
             SetupOp::Overlay { lower, upper, dest } => {
@@ -469,16 +485,19 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                 );
                 drop(layer_fds);
                 if let Err(e) = r {
+                    // bubblewrap prints the destination as `(null)` here: its
+                    // error path has advanced `op` past the overlay op onto a
+                    // SETUP_OVERLAY_SRC entry (whose `dest` is NULL) before
+                    // formatting `op->dest` (bubblewrap.c:1359-1363). Match that
+                    // byte-for-byte rather than printing the real destination.
                     if e == Errno::ELOOP {
                         return Err(Error::invalid(format!(
-                            "Can't make overlay mount on {} with options {options}: Overlay directories may not overlap",
-                            disp(dest_b)
+                            "Can't make overlay mount on (null) with options {options}: Overlay directories may not overlap"
                         )));
                     }
                     return Err(Error::Mount {
                         message: format!(
-                            "Can't make overlay mount on {} with options {options}",
-                            disp(dest_b)
+                            "Can't make overlay mount on (null) with options {options}"
                         )
                         .into(),
                         errno: e,
@@ -561,6 +580,10 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                 let src = bwrap_sys::fd::borrow_raw(*fd);
                 copy_file_data(src, dest_fd.as_fd())
                     .with_context(|| format!("Can't write data to file {}", disp(dest_b)))?;
+                // bwrap closes the data fd after copying (bubblewrap.c:1306), so a
+                // reused `--file N … --file N` re-reads a closed fd and fails with
+                // EBADF, instead of silently producing an empty second file.
+                bwrap_sys::fd::close_raw(*fd);
             }
 
             SetupOp::BindData {
@@ -625,7 +648,9 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<()> {
                     nixmode(*perms),
                     FchmodatFlags::FollowSymlink,
                 )
-                .with_context(|| format!("Can't chmod {:#o} {}", perms.bits(), disp(dest_b)))?;
+                .with_context(|| {
+                    format!("Can't chmod {} {}", c_alt_octal(perms.bits()), disp(dest_b))
+                })?;
             }
         }
     }
@@ -668,8 +693,10 @@ fn get_current_dir_name() -> nix::Result<std::path::PathBuf> {
 /// second pivot so `/newroot` becomes `/`.
 ///
 /// Returns the pre-pivot working directory (bwrap's `old_cwd`), used later as a
-/// default sandbox cwd. Must run in the sandbox's own mount namespace.
-pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<std::path::PathBuf> {
+/// default sandbox cwd, or `None` when the launcher's cwd no longer exists —
+/// bwrap treats that as a NULL `old_cwd` and falls back to `$HOME` then `/`.
+/// Must run in the sandbox's own mount namespace.
+pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<Option<std::path::PathBuf>> {
     use nix::mount::{MntFlags, umount2};
     use nix::unistd::{chdir, fchdir, mkdir, pivot_root};
 
@@ -698,7 +725,10 @@ pub fn pivot_into_newroot(ops: &[SetupOp], ctx: &NewrootCtx) -> Result<std::path
     .with_mount_context(|| "Failed to mount tmpfs".to_string())?;
 
     // CWD during the whole setup; old/new root reached via "oldroot"/"newroot".
-    let old_cwd = get_current_dir_name().context("get_current_dir_name")?;
+    // glibc's get_current_dir_name() returns NULL when the cwd has been removed;
+    // bwrap ignores that and lets the later chdir fall back to $HOME then /. A
+    // failed lookup is therefore None here, not a fatal error.
+    let old_cwd = get_current_dir_name().ok();
     chdir(BASE).context("chdir base_path")?;
 
     mkdir("newroot", dir_mode).context("Creating newroot failed")?;
@@ -914,14 +944,17 @@ fn bind_data_tmpfile(
     .with_context(|| format!("Can't create tmpfile for {}", disp(dest_display)))?;
     fchmod(tmp.as_fd(), nixmode(perms)).with_context(|| {
         format!(
-            "Can't set mode {:#o} on file to be used for {}",
-            perms.bits(),
+            "Can't set mode {} on file to be used for {}",
+            c_alt_octal(perms.bits()),
             disp(dest_display)
         )
     })?;
     let src = bwrap_sys::fd::borrow_raw(fd);
     copy_file_data(src, tmp.as_fd())
         .with_context(|| format!("Can't write data to file {}", disp(dest_display)))?;
+    // Close the data fd after copying (bubblewrap.c:1547) so a reused
+    // --bind-data/--ro-bind-data fd fails with EBADF like bubblewrap.
+    bwrap_sys::fd::close_raw(fd);
     Ok((tmp, name))
 }
 

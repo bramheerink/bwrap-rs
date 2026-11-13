@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
+// Ported from bubblewrap, Copyright (C) 2016 Alexander Larsson and contributors.
 //! Parsing `/proc/self/mountinfo` into the mount subtree under a given mount
 //! point, for the pre-5.12 `mount_setattr` fallback.
 //!

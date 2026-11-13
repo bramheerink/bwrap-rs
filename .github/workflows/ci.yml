@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
 
 # Least privilege: the default GITHUB_TOKEN is read-only; no job needs write.
@@ -49,7 +50,11 @@ jobs:
             -Dman=disabled -Dtests=false
           ninja -C "$RUNNER_TEMP/bubblewrap/_build" bwrap
           test "$("$RUNNER_TEMP/bubblewrap/_build/bwrap" --version)" = "bubblewrap 0.13.1"
+          # REAL for tests/conformance.sh; BWRAP_REAL for the Rust differential
+          # suite (which reads BWRAP_REAL). Export both so neither silently falls
+          # back to the runner's own bwrap (which is not 0.13.1).
           echo "REAL=$RUNNER_TEMP/bubblewrap/_build/bwrap" >> "$GITHUB_ENV"
+          echo "BWRAP_REAL=$RUNNER_TEMP/bubblewrap/_build/bwrap" >> "$GITHUB_ENV"
 
       # The host/differential tests and the conformance matrix need unprivileged
       # user namespaces, which Ubuntu restricts via AppArmor. Relax it; no
@@ -59,10 +64,28 @@ jobs:
         run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Unit and host tests
-        run: BWRAP_RS_REQUIRE_USERNS=1 cargo test --workspace
+        # REQUIRE_USERNS + REQUIRE_REAL: the host/differential suites must fail,
+        # not skip or silently degrade to ours-only, if the user namespace or the
+        # 0.13.1 oracle (BWRAP_REAL, set above) is missing.
+        run: BWRAP_RS_REQUIRE_USERNS=1 BWRAP_RS_REQUIRE_REAL=1 cargo test --workspace
 
       - name: Behavioural conformance (byte-identical vs bubblewrap 0.13.1)
         run: REQUIRE_REAL=1 REQUIRE_USERNS=1 OURS=target/release/bwrap tests/conformance.sh
+
+      # Real-root and setuid-refusal roles (bwrap's two privileged paths that the
+      # unprivileged-userns tests above never reach). Runs LAST because it disables
+      # unprivileged user namespaces, which the steps above require. No QEMU: the
+      # runner's passwordless sudo gives real root for role B, and setpriv drops to
+      # a non-root uid for the setuid-refusal role A.
+      - name: Privilege-role tests (real root + setuid refusal)
+        run: |
+          sudo install -m0755 target/release/bwrap /usr/local/bin/bwrap-ours
+          sudo install -m0755 "$BWRAP_REAL" /usr/local/bin/bwrap-real
+          testdir="$RUNNER_TEMP/vmtest"; mkdir -p "$testdir"
+          printf 'hello-from-fd' > "$testdir/data.txt"
+          sudo env OURS=/usr/local/bin/bwrap-ours REAL=/usr/local/bin/bwrap-real \
+            TESTDIR="$testdir" sh tests/vm/vm-test.sh --role=all | tee "$RUNNER_TEMP/vmout.txt"
+          grep -q 'VM-RESULT: ALL-PASS' "$RUNNER_TEMP/vmout.txt"
 
   msrv:
     name: MSRV (1.88) builds
@@ -74,3 +97,35 @@ jobs:
         with:
           toolchain: "1.88.0"
       - run: cargo check --workspace --all-targets
+
+  release:
+    name: Release artifact (tag push)
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [check, msrv]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # only this job may upload the release asset
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # pinned 'stable' branch
+        with:
+          toolchain: stable
+      - name: Crate version must equal the tag
+        run: |
+          v=$(cargo metadata --no-deps --format-version 1 \
+                | jq -r '.packages[] | select(.name=="bwrap-cli") | .version')
+          echo "crate version = $v, tag = $GITHUB_REF_NAME"
+          test "v$v" = "$GITHUB_REF_NAME"
+      - name: Build with embedded git sha
+        run: |
+          BWRAP_RS_GIT_SHA="$(git rev-parse --short HEAD)" \
+            cargo build --release --locked
+          # The embedded marker must be present and identify this build.
+          strings -a target/release/bwrap | grep -E '^bwrap-rs '
+      - name: Checksum and upload
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd target/release
+          sha256sum bwrap > bwrap.sha256
+          gh release upload "$GITHUB_REF_NAME" bwrap bwrap.sha256 --clobber

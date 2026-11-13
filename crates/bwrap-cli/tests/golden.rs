@@ -72,9 +72,12 @@ fn help_text_matches_golden_for_that_argv0() {
 }
 
 #[test]
-fn help_uses_argv0_and_falls_back_to_bwrap() {
+fn help_prints_argv0_verbatim() {
     assert!(usage::usage("./mybw").starts_with("usage: ./mybw [OPTIONS...]"));
-    assert!(usage::usage("").starts_with("usage: bwrap [OPTIONS...]"));
+    // An empty argv0 is printed verbatim, as C does (it substitutes "bwrap" only
+    // for a NULL argv0, which the kernel never delivers). The "bwrap" fallback
+    // for a truly missing argv is applied in `main`, not here.
+    assert!(usage::usage("").starts_with("usage:  [OPTIONS...]"));
 }
 
 #[test]

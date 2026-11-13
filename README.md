@@ -18,5 +18,8 @@ cargo test  --workspace
 
 ## Credit & license
 
-An independent reimplementation; all design credit belongs to the bubblewrap
-authors. Licensed under [LGPL-2.0-or-later](LICENSE), the same as bubblewrap.
+A port (derivative work) of bubblewrap 0.13.1; all design credit belongs to the
+bubblewrap authors. Licensed under [LGPL-2.1-or-later](LICENSE) — compatible with
+bubblewrap's own LGPL-2.0-or-later and with the LGPL-2.1-or-later
+`chroot_realpath` code it ports. The directly ported source files carry their
+upstream copyright and SPDX notices.

@@ -1,3 +1,7 @@
+// SPDX-License-Identifier: LGPL-2.1-or-later
+// Ported from bubblewrap's chroot_realpath.c, itself based on realpath.c
+// Copyright (C) 1993 Rick Sladkey; chroot adaptation 2005 Dan Howell,
+// 2019-2020 Giuseppe Scrivano. The original grant is LGPL-2.1-or-later.
 //! `chroot_realpath`: resolve a path as if `chroot` were `/`, following
 //! symlinks but never escaping `chroot`.
 //!

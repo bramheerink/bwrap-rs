@@ -24,10 +24,9 @@ pub fn borrow_raw<'a>(fd: RawFd) -> BorrowedFd<'a> {
 /// from leaking into the sandboxed process, mirroring bwrap's explicit `close`
 /// calls. The fd is a plain integer owned by the process, not an `OwnedFd`; a
 /// bad or already-closed number simply yields `EBADF`, which is ignored.
+///
+/// Safe: `nix::unistd::close` wraps the same `close(2)` with no unsafe at the
+/// call site; the result (including `EBADF`) is deliberately discarded.
 pub fn close_raw(fd: RawFd) {
-    // SAFETY: `close` takes an fd number and touches none of our memory. We do
-    // not use the fd afterwards, and a stale/invalid number is a harmless EBADF.
-    unsafe {
-        nix::libc::close(fd);
-    }
+    let _ = nix::unistd::close(fd);
 }

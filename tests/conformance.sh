@@ -24,6 +24,21 @@ if [ -x "$REAL" ] && [ "$("$REAL" --version 2>/dev/null)" = "bubblewrap 0.13.1" 
     HAVE_REAL=1
 fi
 
+# Reject an oracle that is actually the port itself: the same file as OURS, or
+# any bwrap-rs build (identified by its embedded `bwrap-rs <version>` marker,
+# which the C binary never carries). On a host where bwrap-rs is deployed as the
+# drop-in /usr/bin/bwrap — the project's own goal — the default
+# REAL=/usr/bin/bwrap would otherwise compare the port with itself and report a
+# green "byte-identical" verdict that proves nothing. `--version` cannot tell
+# them apart (the port reproduces it exactly), so use the marker.
+ORACLE_IS_PORT=0
+if [ "$HAVE_REAL" = 1 ]; then
+    if [ "$REAL" -ef "$OURS" ] || strings -a -- "$REAL" 2>/dev/null | grep -qE '^bwrap-rs '; then
+        HAVE_REAL=0
+        ORACLE_IS_PORT=1
+    fi
+fi
+
 # REQUIRE_REAL=1 / REQUIRE_USERNS=1 turn a missing oracle or unavailable user
 # namespaces into a hard failure instead of a silent pass/skip. CI sets both, so
 # a run that cannot actually compare against bubblewrap 0.13.1 fails loudly
@@ -31,7 +46,11 @@ fi
 REQUIRE_REAL="${REQUIRE_REAL:-0}"
 REQUIRE_USERNS="${REQUIRE_USERNS:-0}"
 if [ "$REQUIRE_REAL" = 1 ] && [ "$HAVE_REAL" != 1 ]; then
-    echo "conformance: REQUIRE_REAL=1 but no bubblewrap 0.13.1 oracle at REAL=$REAL"
+    if [ "$ORACLE_IS_PORT" = 1 ]; then
+        echo "conformance: REQUIRE_REAL=1 but the oracle at REAL=$REAL is bwrap-rs itself, not bubblewrap 0.13.1"
+    else
+        echo "conformance: REQUIRE_REAL=1 but no bubblewrap 0.13.1 oracle at REAL=$REAL"
+    fi
     exit 1
 fi
 
@@ -42,8 +61,22 @@ fi
 # sbin usr.
 BASE=(--unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc)
 if ! "$OURS" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
+    # Distinguish "user namespaces unavailable here" from "our binary is broken"
+    # by probing with something independent of OURS: the real oracle's own base
+    # sandbox if we have one, else `unshare -Ur`. If the independent probe works
+    # but OURS does not, that is a real failure, not an environment limitation.
+    userns_ok=0
+    if [ "$HAVE_REAL" = 1 ] && "$REAL" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
+        userns_ok=1
+    elif command -v unshare >/dev/null 2>&1 && unshare -Ur true >/dev/null 2>&1; then
+        userns_ok=1
+    fi
+    if [ "$userns_ok" = 1 ]; then
+        echo "conformance: user namespaces work, but OURS=$OURS cannot start the base sandbox — our binary is broken"
+        exit 1
+    fi
     if [ "$REQUIRE_USERNS" = 1 ]; then
-        echo "conformance: REQUIRE_USERNS=1 but the base sandbox cannot start (user namespaces unavailable)"
+        echo "conformance: REQUIRE_USERNS=1 but user namespaces are unavailable in this environment"
         exit 1
     fi
     echo "SKIP: user namespaces unavailable in this environment"
@@ -114,6 +147,36 @@ invx() {
     ok "$name"
 }
 
+# ab0 / abx0: like ab / abx, but ALSO require exit 0 from both binaries. A "yes
+# form" must actually succeed and observe the option's effect; otherwise a case
+# that fails identically in both (a malformed command, or a mutant that drops the
+# option so it errors out) would pass as "they agree". Use ab0/abx0 for yes forms
+# and keep ab/abx/inv for guardrails that expect a specific non-zero exit.
+ab0() {
+    local name="$1"; shift 2
+    local oo oe oc ro re rc
+    oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
+    if [ "$HAVE_REAL" != 1 ]; then skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"; return; fi
+    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
+    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
+    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
+    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    [ "$rc" = 0 ] || { fail "$name" "yes-form must succeed but exit=$rc (err=$re)"; return; }
+    ok "$name"
+}
+abx0() {
+    local name="$1" tmpl="$2"
+    local oo oe oc ro re rc
+    oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
+    if [ "$HAVE_REAL" != 1 ]; then skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"; return; fi
+    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
+    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
+    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
+    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    [ "$rc" = 0 ] || { fail "$name" "yes-form must succeed but exit=$rc (err=$re)"; return; }
+    ok "$name"
+}
+
 # ---- fixtures -------------------------------------------------------------
 printf '\x06\x00\x00\x00\x00\x00\xff\x7f' > "$WORK/allow.bpf"   # RET ALLOW
 python3 - "$WORK/deny.bpf" <<'PY'
@@ -131,6 +194,13 @@ printf -- '--setenv\0AFD\0yes\0/bin/sh\0-c\0echo $AFD\0' > "$WORK/args.nul"
 mkdir -p "$WORK/cbin"; printf '#!/bin/sh\necho CUSTOM-PATH-OK\n' > "$WORK/cbin/zzconform"; chmod +x "$WORK/cbin/zzconform"
 printf '%s\0' --setenv X Y > "$WORK/argsx.nul"       # a passed-fd whose fd must not leak
 mkdir -p "$WORK/real"; ln -sfn real "$WORK/link"      # logical-cwd ($PWD) via a symlink
+# Overlay layers (sources must be HOST paths) and a pre-created lock file, for
+# the overlay/lock "yes form" cases that actually exercise the success path.
+mkdir -p "$WORK"/ov/{low,low2,up,work}
+printf 'from-lower\n'  > "$WORK/ov/low/f"
+printf 'from-lower2\n' > "$WORK/ov/low2/g"
+: > "$WORK/lock"
+host_ipc=$(readlink /proc/self/ns/ipc 2>/dev/null)   # for the ipc-isolation observation
 
 echo "Running conformance matrix (HAVE_REAL=$HAVE_REAL)..."
 
@@ -139,8 +209,15 @@ ab  version          -- --version
 ab  help             -- --help
 inv argv0-missing 1 "" -- --argv0
 ab  argv0-sets       -- "${BASE[@]}" --argv0 ZZZ /bin/sh -c 'printf %s "$0"'
+# An empty argv0 (exec -a '') is printed verbatim in the usage line, as C does
+# (C substitutes "bwrap" only for a NULL argv0, which the kernel never delivers).
+abx argv0-empty       "(exec -a '' %B --help)"
 abx args-from-fd     '%B --args 8 '"$B"' 8<"'"$WORK"'/args.nul"'
 invx args-bad-fd 1 "" '%B --args 8 '"$B"' /bin/true'
+# Closed stdin is reopened as /dev/null by the Rust runtime (DIFFERENCES.md #9),
+# so --args 0 reads EOF (empty args) and succeeds where bubblewrap would fail
+# with EBADF. Ours-only invariant pinning the documented behaviour.
+invx closed-stdin-args 0 "" '%B --ro-bind / / --args 0 /bin/true 0<&-'
 ab  setenv           -- "${BASE[@]}" --setenv FOO bar /bin/sh -c 'echo $FOO'
 ab  unsetenv         -- "${BASE[@]}" --unsetenv PATH /bin/sh -c 'echo p=${PATH-unset}'
 ab  clearenv         -- "${BASE[@]}" --clearenv --setenv ONLY me /usr/bin/env
@@ -163,6 +240,19 @@ abx seccomp-fd-noleak '%B --bind / / --dev /dev --proc /proc --seccomp 9 /bin/sh
 # both the port and C. Both ambients are pinned so neither regresses.
 ab  sigpipe          -- --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok'
 abx sigpipe-ign       "( trap '' PIPE; %B --bind / / --dev /dev /bin/sh -c 'yes | head -1 >/dev/null; echo ok' )"
+# A launcher started with SIGCHLD ignored (a common daemon idiom, trap '' CHLD)
+# must still reap the sandbox child: C resets SIGCHLD to SIG_DFL at startup, so
+# the port does too. Otherwise the monitor hangs/spins and the ignore leaks into
+# the command, so the sandboxed SigIgn line would differ from C.
+abx sigchld-ign       "( trap '' CHLD; %B --bind / / /bin/sh -c 'grep SigIgn /proc/self/status; exit 7' )"
+# A child killed by a real-time signal (which nix's WaitStatus cannot represent)
+# must map to 128+signal like C, both with and without a pid namespace, instead
+# of hanging the launcher or taking the whole sandbox down.
+abx rt-signal         "%B --bind / / /bin/sh -c 'kill -34 \$\$'"
+abx rt-signal-pid     "%B --bind / / --unshare-pid /bin/sh -c 'kill -34 \$\$'"
+# A data fd reused by a second op must fail with EBADF like C, not silently
+# produce an empty second file: the fd is closed after its op.
+abx file-fd-reuse     "%B --ro-bind / / --tmpfs /tmp --file 3 /tmp/a --file 3 /tmp/b /bin/sh -c 'wc -c /tmp/a /tmp/b' 3<<<hi"
 # Logical cwd: $PWD reached through a symlink is kept (get_current_dir_name),
 # not canonicalised to the physical path.
 abx cwd-logical       'cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd'
@@ -186,7 +276,10 @@ ab  robind-try       -- "${BASE[@]}" --ro-bind-try /no/such /x /bin/true
 # is opened directly instead of failing in the in-root resolver.
 ab  robind-dslash-proc -- "${BASE[@]}" --tmpfs /t --ro-bind-try //proc/self/ns/user /t/x /bin/sh -c 'test -e /t/x && echo yes || echo no'
 ab  robind-is-ro     -- "${BASE[@]}" --ro-bind /usr /u /bin/sh -c 'touch /u/x 2>&1; echo e=$?'
-ab  dev-bind         -- "${BASE[@]}" --dev-bind /dev /d /bin/sh -c 'test -c /d/null && echo yes'
+# --dev-bind must make the device USABLE (no nodev), where a plain --bind would
+# mount nodev and block device access. Observing the write catches a regression
+# that turns --dev-bind into a plain bind (the node type alone would not).
+ab  dev-bind         -- "${BASE[@]}" --dev-bind /dev /d /bin/sh -c 'echo x > /d/null 2>&1 && echo ok || echo fail'
 ab  dev-bind-try     -- "${BASE[@]}" --dev-bind-try /no/such /x /bin/true
 # Regression (glycin): --dev WITHOUT --proc. --dev triggers bwrap's devpts
 # "second user namespace" path, which writes a uid/gid map and walks fds after
@@ -210,16 +303,24 @@ ab  tmpfs            -- "${BASE[@]}" --tmpfs /t /bin/sh -c 'test -d /t && echo y
 ab  perms-dir        -- "${BASE[@]}" --perms 0750 --dir /d /bin/sh -c 'stat -c %a /d'
 ab  size-no-tmpfs    -- "${BASE[@]}" --size 4096 /bin/true
 ab  chmod            -- "${BASE[@]}" --dir /d --chmod 0700 /d /bin/sh -c 'stat -c %a /d'
-ab  mqueue           -- "${BASE[@]}" --mqueue /q /bin/sh -c 'test -d /q && echo yes || echo no'
+# A failing --chmod prints the mode with C's %#o formatting (0700, 0), not Rust's
+# {:#o} (0o700, 0o0).
+ab  chmod-ro-msg     -- --ro-bind / / --chmod 700 /etc true
+ab  chmod-zero-msg   -- --ro-bind / / --chmod 0 /etc true
+ab0 mqueue           -- "${BASE[@]}" --unshare-ipc --mqueue /q /bin/sh -c 'grep -c " - mqueue " /proc/self/mountinfo'
 abx file             '%B '"$B"' --file 8 /f /bin/sh -c "cat /f" 8<"'"$WORK"'/data.txt"'
 abx file-bad-fd      '%B '"$B"' --file 8 /f /bin/true'
 abx bind-data        '%B '"$B"' --bind-data 8 /c /bin/sh -c "cat /c" 8<"'"$WORK"'/data.txt"'
 abx ro-bind-data     '%B '"$B"' --ro-bind-data 8 /c /bin/sh -c "touch /c 2>&1; echo e=\$?" 8<"'"$WORK"'/data.txt"'
-ab  lock-file        -- "${BASE[@]}" --dir /run --lock-file /run/l /bin/true
+ab0 lock-file        -- "${BASE[@]}" --ro-bind "$WORK/lock" /lock --lock-file /lock /bin/sh -c 'echo ran'
+# The lock is actually held: a READ lock appears in /proc/locks (ours-only, since
+# the holder pid differs from the oracle's). Catches a regression that drops the
+# lock while still exiting 0.
+inv lock-held 0 'held'  -- "${BASE[@]}" --ro-bind "$WORK/lock" /lock --lock-file /lock /bin/sh -c 'grep -q READ /proc/locks && echo held || echo none'
 abx bind-fd          '%B '"$B"' --bind-fd 8 /u /bin/sh -c "test -d /u && echo yes" 8</usr'
 abx ro-bind-fd       '%B '"$B"' --ro-bind-fd 8 /u /bin/sh -c "touch /u/x 2>&1; echo e=\$?" 8</usr'
 ab  bind-fd-bad      -- "${BASE[@]}" --bind-fd 99 /u /bin/true
-ab  overlay          -- "${BASE[@]}" --tmpfs /s --dir /s/up --dir /s/work --overlay-src /usr --overlay /s/up /s/work /ov /bin/sh -c 'ls /ov >/dev/null 2>&1; echo e=$?'
+ab0 overlay          -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --overlay "$WORK/ov/up" "$WORK/ov/work" /ov /bin/sh -c 'cat /ov/f; touch /ov/n && echo wrote'
 
 # === namespaces: deterministic observable A/B =============================
 ab  uts-hostname     -- "${BASE[@]}" --unshare-uts --hostname sandbox /bin/hostname
@@ -229,6 +330,9 @@ ab  share-net-ifs    -- "${BASE[@]}" --unshare-all --share-net --ro-bind /usr /u
 ab  cgroup-root      -- "${BASE[@]}" --unshare-cgroup /bin/sh -c 'cat /proc/self/cgroup'
 ab  cgroup-try       -- "${BASE[@]}" --unshare-cgroup-try /bin/true
 ab  ipc              -- "${BASE[@]}" --unshare-ipc /bin/true
+# ...and it actually isolates: the ipc namespace inode differs from the host's
+# (ours-only, since the oracle's inode differs too). Catches a dropped --unshare-ipc.
+inv ipc-isolated 0 'isolated' -- "${BASE[@]}" --unshare-ipc /bin/sh -c '[ "$(readlink /proc/self/ns/ipc)" != "'"$host_ipc"'" ] && echo isolated || echo shared'
 ab  user-try         -- "${BASE[@]}" --unshare-user-try /bin/true
 ab  uid-gid          -- "${BASE[@]}" --uid 0 --gid 0 /bin/sh -c 'id -u; id -g'
 ab  as-pid-1         -- "${BASE[@]}" --unshare-pid --as-pid-1 /bin/sh -c 'echo $$'
@@ -297,8 +401,12 @@ ab  die-with-parent  -- "${BASE[@]}" --die-with-parent /bin/true
 ab  not-a-boundary   -- "${BASE[@]}" --not-a-security-boundary /bin/true
 
 # === overlayfs (oracle decides; both fail identically if kernel lacks it) =
-ab  ro-overlay       -- "${BASE[@]}" --overlay-src /usr --ro-overlay /ov /bin/sh -c 'touch /ov/x 2>&1; echo e=$?'
-ab  tmp-overlay      -- "${BASE[@]}" --tmp-overlay /ov --overlay-src /usr /bin/sh -c 'echo done'
+ab0 ro-overlay       -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --overlay-src "$WORK/ov/low2" --ro-overlay /ov /bin/sh -c 'cat /ov/f /ov/g; touch /ov/x 2>&1; echo e=$?'
+ab0 tmp-overlay      -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --tmp-overlay /ov /bin/sh -c 'cat /ov/f; touch /ov/n && echo wrote'
+# Overlapping lowerdirs: bubblewrap's error prints the destination as "(null)"
+# (it formats op->dest after advancing op onto an overlay-src entry); match it
+# byte-for-byte, including that quirk.
+ab  overlay-overlap  -- --unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --overlay-src /usr --overlay-src /usr --ro-overlay /mnt /bin/true
 
 # === security invariants (ours-only; module-11 review regressions) ========
 inv nnp-set       0 "NoNewPrivs:	1" -- "${BASE[@]}" /bin/sh -c 'grep NoNewPrivs /proc/self/status'
@@ -349,4 +457,17 @@ ab  file-label-bad   -- "${BASE[@]}" --file-label not_a_valid_label_t --dir /d /
 echo
 echo "conformance: $PASS passed, $FAIL failed, $SKIP skipped (of $((PASS+FAIL+SKIP)))"
 if [ "$FAIL" -gt 0 ]; then printf '%s\n' "${FAILED[@]}"; exit 1; fi
-echo "ALL PASS — every case byte-identical to /usr/bin/bwrap 0.13.1 (or ours-only invariant held)"
+# Strict by default: cases that were skipped for lack of a real oracle were NOT
+# compared, so claiming "byte-identical" would be dishonest. Only print the pass
+# banner when every case actually ran; otherwise report INCOMPLETE and exit 3,
+# unless the caller opts into an oracle-less smoke run with ALLOW_NO_ORACLE=1.
+if [ "$SKIP" -gt 0 ] && [ "${ALLOW_NO_ORACLE:-0}" != 1 ]; then
+    echo "INCOMPLETE — $SKIP case(s) not compared (no bubblewrap 0.13.1 oracle at REAL=$REAL)."
+    echo "Set REAL to a real 0.13.1 oracle, or ALLOW_NO_ORACLE=1 to accept an ours-only smoke run."
+    exit 3
+fi
+if [ "$SKIP" -gt 0 ]; then
+    echo "OURS-ONLY SMOKE — $PASS invariant(s) held; $SKIP case(s) NOT compared (ALLOW_NO_ORACLE=1)."
+    exit 0
+fi
+echo "ALL PASS — every case byte-identical to bubblewrap 0.13.1 at REAL=$REAL"

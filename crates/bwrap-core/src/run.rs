@@ -512,10 +512,15 @@ fn child(
 
     nix::sys::stat::umask(old_umask);
 
-    // Environment, then cwd, then PWD (bwrap's order).
-    let mut env = build_env(config);
-    let new_cwd = compute_cwd(config, &old_cwd, &env)?;
-    set_env(&mut env, "PWD", &new_cwd);
+    // Environment, then cwd, then PWD (bwrap's order), applied in place to the
+    // real environ exactly as C does (clearenv/setenv/unsetenv), never rebuilt
+    // from a snapshot — so malformed/duplicate inherited entries pass through
+    // unchanged and a `--setenv` on a duplicated name behaves like bubblewrap.
+    apply_env_ops(&config.env_ops);
+    let new_cwd = compute_cwd(config, old_cwd.as_deref())?;
+    if let Ok(pwd) = CString::new(new_cwd.clone()) {
+        bwrap_sys::process::env_set(c"PWD", &pwd);
+    }
 
     if config.new_session {
         setsid().context("setsid")?;
@@ -593,7 +598,7 @@ fn child(
         let _ = write_all(sf.as_fd(), &[0u8]);
     }
 
-    match exec_command(config, &env) {
+    match exec_command(config) {
         // exec_command only returns on failure; on success execvpe replaced us.
         Ok(code) => Ok(code),
         Err(e) => {
@@ -915,57 +920,61 @@ fn read_all_fd(fd: std::os::fd::RawFd) -> Result<Vec<u8>> {
     result
 }
 
-/// The post-env environment as an ordered list of `NAME=VALUE` entries.
-fn build_env(config: &Config) -> Vec<(Vec<u8>, Vec<u8>)> {
+/// Apply the `--clearenv`/`--setenv`/`--unsetenv` operations to the real process
+/// environment in order (bwrap's env handling), editing `environ` in place via
+/// `clearenv`/`setenv`/`unsetenv` rather than rebuilding it from a snapshot.
+///
+/// Rebuilding through `std::env::vars_os()` is lossy: entries without `=`, or
+/// starting with `=`, are dropped, and duplicate names collapse — none of which
+/// a byte-exact drop-in may do to the block it passes on. Editing in place keeps
+/// the inherited block verbatim and changes only what the ops name, exactly as
+/// bubblewrap does. (`setenv` on a duplicated name updates the first entry and
+/// leaves the rest, so `getenv`/`execvp` see what C sees.)
+fn apply_env_ops(ops: &[crate::types::config::EnvOp]) {
     use crate::types::config::EnvOp;
-    use std::os::unix::ffi::OsStrExt;
-    let mut env: Vec<(Vec<u8>, Vec<u8>)> = std::env::vars_os()
-        .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-        .collect();
-    for op in &config.env_ops {
+    for op in ops {
         match op {
-            EnvOp::Clear => env.clear(),
-            EnvOp::Set { name, value } => set_env(&mut env, name, value.as_bytes()),
-            EnvOp::Unset { name } => env.retain(|(k, _)| k != name.as_bytes()),
+            EnvOp::Clear => bwrap_sys::process::env_clear(),
+            EnvOp::Set { name, value } => {
+                // argv-derived strings are NUL-free, so CString::new succeeds;
+                // skip defensively if that ever fails rather than panicking.
+                if let (Ok(n), Ok(v)) = (
+                    CString::new(name.as_bytes()),
+                    CString::new(value.as_bytes()),
+                ) {
+                    bwrap_sys::process::env_set(&n, &v);
+                }
+            }
+            EnvOp::Unset { name } => {
+                if let Ok(n) = CString::new(name.as_bytes()) {
+                    bwrap_sys::process::env_unset(&n);
+                }
+            }
         }
     }
-    env
-}
-
-fn set_env(env: &mut Vec<(Vec<u8>, Vec<u8>)>, name: &str, value: &[u8]) {
-    let name = name.as_bytes();
-    if let Some(e) = env.iter_mut().find(|(k, _)| k == name) {
-        e.1 = value.to_vec();
-    } else {
-        env.push((name.to_vec(), value.to_vec()));
-    }
-}
-
-fn get_env<'a>(env: &'a [(Vec<u8>, Vec<u8>)], name: &str) -> Option<&'a [u8]> {
-    env.iter()
-        .find(|(k, _)| k == name.as_bytes())
-        .map(|(_, v)| v.as_slice())
 }
 
 /// bwrap's cwd logic: `--chdir`, else the old cwd if reachable, else `$HOME`,
 /// else `/`. Returns the resulting cwd (for `PWD`).
-fn compute_cwd(
-    config: &Config,
-    old_cwd: &std::path::Path,
-    env: &[(Vec<u8>, Vec<u8>)],
-) -> Result<Vec<u8>> {
+fn compute_cwd(config: &Config, old_cwd: Option<&std::path::Path>) -> Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     if let Some(dir) = &config.chdir {
         chdir(dir.as_str()).with_context(|| format!("Can't chdir to {dir}"))?;
         return Ok(dir.as_bytes().to_vec());
     }
-    if chdir(old_cwd).is_ok() {
-        return Ok(old_cwd.as_os_str().as_bytes().to_vec());
-    }
-    if let Some(home) = get_env(env, "HOME")
-        && chdir(home).is_ok()
+    // chdir to the old cwd if we captured one and it is reachable in the sandbox;
+    // a NULL/unreachable old cwd falls through to $HOME then / (bwrap's order).
+    if let Some(old) = old_cwd
+        && chdir(old).is_ok()
     {
-        return Ok(home.to_vec());
+        return Ok(old.as_os_str().as_bytes().to_vec());
+    }
+    // HOME is read from the real environ (after the env ops have been applied),
+    // exactly as bwrap's getenv("HOME") is.
+    if let Some(home) = bwrap_sys::process::env_get(c"HOME")
+        && chdir(home.as_slice()).is_ok()
+    {
+        return Ok(home);
     }
     Ok(b"/".to_vec())
 }
@@ -973,15 +982,15 @@ fn compute_cwd(
 /// `execvp` the command with `argv0` applied and the computed environment,
 /// exactly as bwrap does.
 ///
-/// The environment is applied to the real `environ` first ([`replace_environ`],
-/// the one place that mutation lives), then `execvp` resolves the command and
-/// runs it. This matters: `execvp`'s `PATH` search reads the global `environ`,
+/// The environment is applied to the real `environ` first (in place, by
+/// [`apply_env_ops`]), then `execvp` resolves the command and runs it. This
+/// matters: `execvp`'s `PATH` search reads the global `environ`,
 /// so the sandbox `PATH` must be installed there — not merely passed as an
 /// `envp` vector. Using `execvpe` with an `envp` instead looks the command up in
 /// bwrap's *own* `PATH`, which is the bug that broke every flatpak launch
 /// (`execvp smile: No such file`). Deferring to real `execvp` also gives the
 /// `_CS_PATH` default and the ENOEXEC shell fallback for free.
-fn exec_command(config: &Config, env: &[(Vec<u8>, Vec<u8>)]) -> Result<i32> {
+fn exec_command(config: &Config) -> Result<i32> {
     let exec_path = CString::new(config.command[0].as_bytes())
         .map_err(|_| Error::invalid("command contains a NUL byte"))?;
     let mut argv: Vec<CString> = Vec::with_capacity(config.command.len());
@@ -993,11 +1002,9 @@ fn exec_command(config: &Config, env: &[(Vec<u8>, Vec<u8>)]) -> Result<i32> {
     for a in &config.command[1..] {
         argv.push(CString::new(a.as_bytes()).map_err(|_| Error::invalid("arg NUL"))?);
     }
-    let envp: Vec<(CString, CString)> = env
-        .iter()
-        .filter_map(|(k, v)| Some((CString::new(k.clone()).ok()?, CString::new(v.clone()).ok()?)))
-        .collect();
-    bwrap_sys::process::replace_environ(&envp);
+    // The environment was already applied to the real `environ` in place
+    // (apply_env_ops); execvp reads that global environ for the PATH search and
+    // passes it to the command.
     match execvp(&exec_path, &argv) {
         Ok(_) => unreachable!("execvp returns only on error"),
         Err(e) => Err(Error::Sys {
