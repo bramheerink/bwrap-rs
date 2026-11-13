@@ -87,6 +87,19 @@ jobs:
             TESTDIR="$testdir" sh tests/vm/vm-test.sh --role=all | tee "$RUNNER_TEMP/vmout.txt"
           grep -q 'VM-RESULT: ALL-PASS' "$RUNNER_TEMP/vmout.txt"
 
+  supply-chain:
+    name: cargo-deny (advisories / bans / sources)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # pinned 'stable' branch
+        with:
+          toolchain: stable
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+      - name: Check advisories, bans and sources
+        run: cargo deny check advisories bans sources
+
   msrv:
     name: MSRV (1.88) builds
     runs-on: ubuntu-latest

@@ -73,6 +73,10 @@ pub enum Recursion {
 ///
 /// `fd` is typically opened with `O_PATH` on the mount point *after* the
 /// mount was made. Returns `ENOSYS` on kernels older than 5.12.
+//
+// nix-upstream-kandidaat: a borrowed fd + plain-data `mount_attr` + fixed size,
+// no uncheckable invariant — a safe nix wrapper (in its mount module) would be
+// genuinely safe and could replace this block.
 pub fn mount_setattr(
     fd: BorrowedFd<'_>,
     recursion: Recursion,

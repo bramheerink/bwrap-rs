@@ -1,0 +1,23 @@
+# cargo-deny configuration. CI runs `cargo deny check advisories bans sources`.
+#
+# The unsafe layer in bwrap-sys leans entirely on nix/libc, so security
+# advisories against the (tiny) dependency tree are the priority. Licenses are
+# not gated here yet — the workspace is LGPL-2.1-or-later and the only
+# dependency, nix, plus its transitive libc/bitflags/cfg-if, are permissive.
+
+[advisories]
+version = 2
+# cargo-deny v2 defaults: vulnerabilities = deny, unmaintained = warn, yanked =
+# warn. Keep vulnerabilities fatal; the tree is small enough that an advisory is
+# always worth a look.
+
+[bans]
+# A tiny dependency tree should not quietly pull two copies of a crate; warn so
+# a duplicate (e.g. two bitflags majors via nix) is visible without hard-failing
+# CI on a transitive quirk.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

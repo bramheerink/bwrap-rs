@@ -100,6 +100,9 @@ pub fn capset(state: &CapState) -> nix::Result<()> {
     Errno::result(ret).map(drop)
 }
 
+// nix-upstream-kandidaat: PR_CAPBSET_READ/DROP and PR_CAP_AMBIENT take integer
+// args only, so safe nix `prctl` wrappers (like the existing set_keepcaps) would
+// be genuinely safe and could replace this helper's callers.
 fn prctl(option: c_int, arg2: c_ulong, arg3: c_ulong) -> nix::Result<c_int> {
     let zero: c_ulong = 0;
     // SAFETY: only used for the PR_CAPBSET_* and PR_CAP_AMBIENT options below,

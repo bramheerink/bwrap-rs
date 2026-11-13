@@ -50,11 +50,25 @@ pub(crate) fn outcome(outcome: &str) {
 
 /// Resolve where to write the log, or `None` to disable it. `BWRAP_RS_LOG`
 /// (non-empty) wins; otherwise the first line of `/etc/bwrap-rs-log`, if present.
+///
+/// Hardening: the log records argv, which may contain secrets.
+/// - When running as root (euid 0) `BWRAP_RS_LOG` is ignored, so an inherited
+///   env var cannot redirect a privileged invocation's log to an attacker path.
+/// - `/etc/bwrap-rs-log` is honoured only when it is a regular file owned by
+///   root and not group/world-writable, so an unprivileged user cannot point the
+///   log by editing (or symlinking) it.
 fn log_path() -> Option<OsString> {
-    if let Some(p) = std::env::var_os("BWRAP_RS_LOG")
+    let is_root = nix::unistd::geteuid().is_root();
+    if !is_root
+        && let Some(p) = std::env::var_os("BWRAP_RS_LOG")
         && !p.is_empty()
     {
         return Some(p);
+    }
+    use std::os::unix::fs::MetadataExt as _;
+    let meta = std::fs::symlink_metadata("/etc/bwrap-rs-log").ok()?;
+    if !meta.is_file() || meta.uid() != 0 || (meta.mode() & 0o022) != 0 {
+        return None;
     }
     let contents = std::fs::read_to_string("/etc/bwrap-rs-log").ok()?;
     let line = contents.lines().next().unwrap_or("").trim();
@@ -62,12 +76,16 @@ fn log_path() -> Option<OsString> {
 }
 
 /// Append one line to `path`. Best-effort: any error (unwritable path, full
-/// disk) is ignored.
+/// disk) is ignored. Opened mode-0600 and `O_NOFOLLOW` so the (secret-bearing)
+/// log is private and a symlink at the target cannot redirect the write.
 fn append(path: &OsStr, record: &str) {
     use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
     if let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(nix::libc::O_NOFOLLOW)
         .open(path)
     {
         let _ = f.write_all(record.as_bytes());
