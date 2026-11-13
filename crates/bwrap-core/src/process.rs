@@ -16,27 +16,32 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
 use nix::errno::Errno;
 use nix::fcntl::{FcntlArg, OFlag, fcntl, open};
-use nix::libc;
+use nix::libc::{self, c_int};
 use nix::poll::{PollFd, PollFlags, PollTimeout};
 use nix::sys::prctl::set_pdeathsig;
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, sigprocmask};
 use nix::sys::signalfd::{SfdFlags, SignalFd};
 use nix::sys::stat::Mode;
-use nix::sys::wait::{WaitPidFlag, WaitStatus, wait, waitpid};
 use nix::unistd::{Pid, read};
 
 use crate::error::{Context, Error, Result};
 use crate::seccomp::SeccompPrograms;
 use crate::types::SandboxPath;
 
-/// Translate a child's wait status into the exit code bwrap reports
+/// Translate a child's raw wait status into the exit code bwrap reports
 /// (`propagate_exit_status`): a normal exit keeps its code; a fatal signal
 /// becomes `128 + signal` (bash convention); anything else is 255.
-pub fn propagate_exit_status(status: WaitStatus) -> i32 {
-    match status {
-        WaitStatus::Exited(_, code) => code,
-        WaitStatus::Signaled(_, sig, _) => 128 + sig as i32,
-        _ => 255,
+///
+/// Decoded with the `W*` macros exactly as C does, so real-time signals
+/// (32..=64), which nix's `WaitStatus` cannot represent, map correctly instead
+/// of losing the status.
+pub fn propagate_exit_status(status: c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        255
     }
 }
 
@@ -193,10 +198,9 @@ pub fn block_sigchild() -> Result<()> {
     let mut mask = SigSet::empty();
     mask.add(Signal::SIGCHLD);
     sigprocmask(SigmaskHow::SIG_BLOCK, Some(&mask), None).context("sigprocmask")?;
-    // Reap any outstanding zombies we may have inherited.
-    while let Ok(status) = waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG))
-        && status != WaitStatus::StillAlive
-    {}
+    // Reap any outstanding zombies we may have inherited. Uses the raw wait so a
+    // zombie killed by a real-time signal cannot abort the reap with EINVAL.
+    while let Ok(Some(_)) = bwrap_sys::process::wait_raw(-1, true) {}
     Ok(())
 }
 
@@ -287,6 +291,9 @@ pub fn monitor_child(
     setup_finished_fd: Option<BorrowedFd<'_>>,
     json_status_fd: Option<BorrowedFd<'_>>,
 ) -> Result<i32> {
+    // Local, so the eventfd can be dropped from the poll set if it reaches EOF
+    // (a dead pid 1 that wrote nothing) instead of spinning the loop.
+    let mut event_fd = event_fd;
     // Close all extra fds in the monitoring process; the child already has the
     // ones it needs. Keep the fds we still use here.
     let mut keep: Vec<RawFd> = Vec::new();
@@ -335,6 +342,10 @@ pub fn monitor_child(
                     report_child_exit_status(exitc, setup_finished_fd, json_status_fd)?;
                     return Ok(exitc);
                 }
+                // EOF: every writer (pid 1) is gone and nothing was written.
+                // Drop the fd from the poll set so a dead pid 1 cannot turn the
+                // loop into a 100%-CPU spin; the signalfd path reports the status.
+                Ok(0) => event_fd = None,
                 Ok(_) | Err(Errno::EINTR | Errno::EAGAIN) => {}
                 Err(e) => {
                     return Err(Error::Sys {
@@ -359,19 +370,26 @@ pub fn monitor_child(
 
         // Several SIGCHLDs can coalesce into one, so reap all ready children.
         loop {
-            match waitpid(Pid::from_raw(-1), Some(WaitPidFlag::WNOHANG)) {
-                Ok(WaitStatus::StillAlive) => break,
-                Ok(status) => {
+            match bwrap_sys::process::wait_raw(-1, true) {
+                Ok(None) => break, // nothing ready to reap this round
+                Ok(Some((pid, status))) => {
                     // We may reap unrelated children (someone forked then
                     // exec'd bwrap); only our sandbox process counts.
-                    if status.pid() == Some(child_pid) {
+                    if pid == child_pid {
                         let exitc = propagate_exit_status(status);
                         report_child_exit_status(exitc, setup_finished_fd, json_status_fd)?;
                         return Ok(exitc);
                     }
                 }
                 Err(Errno::EINTR) => {}
-                Err(_) => break, // ECHILD: nothing left to reap this round
+                Err(Errno::ECHILD) => break, // nothing left to reap
+                Err(e) => {
+                    // A lost status must never become a silent hang: fail loudly.
+                    return Err(Error::Sys {
+                        message: "waitpid".into(),
+                        errno: e,
+                    });
+                }
             }
         }
     }
@@ -401,9 +419,9 @@ pub fn do_init(
 
     let mut initial_exit_status = 1;
     loop {
-        match wait() {
-            Ok(status) => {
-                if status.pid() == Some(initial_pid) {
+        match bwrap_sys::process::wait_raw(-1, false) {
+            Ok(Some((pid, status))) => {
+                if pid == initial_pid {
                     initial_exit_status = propagate_exit_status(status);
                     if let Some(efd) = event_fd {
                         let val = u64::from(initial_exit_status as u32).wrapping_add(1);
@@ -413,6 +431,8 @@ pub fn do_init(
                     }
                 }
             }
+            // Only possible with WNOHANG, which we do not pass; harmless.
+            Ok(None) => {}
             Err(Errno::EINTR) => {}
             Err(Errno::ECHILD) => break,
             Err(e) => {
@@ -429,30 +449,20 @@ pub fn do_init(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use nix::sys::signal::Signal;
-    use nix::unistd::Pid;
 
     #[test]
     fn exit_status_mapping_matches_bwrap() {
-        assert_eq!(
-            propagate_exit_status(WaitStatus::Exited(Pid::from_raw(1), 0)),
-            0
-        );
-        assert_eq!(
-            propagate_exit_status(WaitStatus::Exited(Pid::from_raw(1), 42)),
-            42
-        );
-        // Killed by SIGKILL (9) -> 128 + 9.
-        assert_eq!(
-            propagate_exit_status(WaitStatus::Signaled(
-                Pid::from_raw(1),
-                Signal::SIGKILL,
-                false
-            )),
-            137
-        );
-        // Anything else -> 255.
-        assert_eq!(propagate_exit_status(WaitStatus::StillAlive), 255);
+        // Raw wait statuses, decoded with the same W* macros as bubblewrap.
+        // Normal exit: status is `code << 8`.
+        assert_eq!(propagate_exit_status(0), 0);
+        assert_eq!(propagate_exit_status(42 << 8), 42);
+        // Killed by a signal: status low 7 bits are the signal -> 128 + sig.
+        assert_eq!(propagate_exit_status(libc::SIGKILL), 128 + libc::SIGKILL); // 137
+        // Real-time signal 34: nix's WaitStatus has no variant for it, but the
+        // raw decode must still give 128 + 34 = 162.
+        assert_eq!(propagate_exit_status(34), 162);
+        // Stopped / unknown (low byte 0x7f): neither exited nor signalled -> 255.
+        assert_eq!(propagate_exit_status(0x7f), 255);
     }
 
     #[test]

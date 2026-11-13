@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
+// Ported from bubblewrap, Copyright (C) 2016 Alexander Larsson and contributors.
 //! `safe_open`: open a path confined to a root, never escaping it.
 //!
 //! Mirrors bwrap's `safe_openat`. The fast path is `openat2` with

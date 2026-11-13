@@ -1,7 +1,35 @@
-/* Differential-test oracle: a verbatim copy of bubblewrap's chroot_realpath()
- * (LGPL-2.0-or-later, containers/bubblewrap, chroot_realpath.c) plus a small
- * main() that resolves argv[2] within argv[1] and prints the result. Used only
- * by tests/chroot_realpath_oracle.rs to pin the Rust port's behaviour. */
+/*
+ * chroot_realpath.c -- resolve pathname as if inside chroot
+ * Based on realpath.c Copyright (C) 1993 Rick Sladkey <jrs@world.std.com>
+ *
+ * This program is free software; you can redistribute it and/or
+ * modify it under the terms of the GNU Lesser General Public
+ * License as published by the Free Software Foundation; either
+ * version 2.1 of the License, or (at your option) any later version.
+ *
+ * This library is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
+ * Lesser General Public License for more details.
+ *
+ * You should have received a copy of the GNU Lesser General Public
+ * License along with this library; see the file COPYING.LIB.  If not,
+ * write to the Free Software Foundation, Inc., 59 Temple Place - Suite 330,
+ * Boston, MA 02111-1307, USA.
+ *
+ * 2005/09/12: Dan Howell (modified from realpath.c to emulate chroot)
+ * 2019/04/19: Giuseppe Scrivano (on ENOENT return the part that could be resolved)
+ * 2019/09/30: Giuseppe Scrivano (follow symlinks for the last component)
+ * 2020/02/02: Giuseppe Scrivano (don't lose terminal '/' if an absolute symlink is found)
+ */
+/* SPDX-License-Identifier: LGPL-2.1-or-later
+ *
+ * Differential-test oracle: a verbatim copy of bubblewrap's chroot_realpath()
+ * (containers/bubblewrap, chroot_realpath.c) plus a small main() that resolves
+ * argv[2] within argv[1] and prints the result. Used only by
+ * tests/chroot_realpath_oracle.rs to pin the Rust port's behaviour. The upstream
+ * copyright and licence notice above is retained unmodified; the original grant
+ * is LGPL-2.1-or-later (not 2.0). */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

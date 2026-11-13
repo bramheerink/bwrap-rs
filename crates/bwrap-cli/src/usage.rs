@@ -1,8 +1,11 @@
 //! The `--help` and `--version` text, byte-identical to bubblewrap 0.13.1.
 //!
 //! The first usage line contains `argv0` (bwrap's `usage()` prints
-//! `"usage: %s ..."` with `argv0`, or `"bwrap"` when null), so [`usage`]
-//! templates it. [`BODY`] is the fixed remainder. `usage("/usr/bin/bwrap")`
+//! `"usage: %s ..."` with `argv0`), so [`usage`] templates it verbatim. C
+//! substitutes `"bwrap"` only for a *NULL* argv0, which Linux >= 5.18 never
+//! delivers (an empty argv becomes `[""]`), so an empty argv0 is printed as
+//! empty, like C; the `"bwrap"` fallback for a truly missing argv is applied by
+//! the caller (`main`). [`BODY`] is the fixed remainder. `usage("/usr/bin/bwrap")`
 //! equals `tests/golden/help.txt`, which locks the text against drift.
 //!
 //! `--help` prints [`usage`] to stdout and exits 0; a usage error prints it to
@@ -86,7 +89,10 @@ pub const BODY: &str = r#"    --help                       Print this help
 "#;
 
 /// The full usage/help text for a given `argv0`, byte-identical to bubblewrap.
+///
+/// `argv0` is printed verbatim (C's `usage()` does not rewrite an empty argv0;
+/// only a NULL one, which the kernel never delivers). The `"bwrap"` fallback for
+/// a missing argv is the caller's job.
 pub fn usage(argv0: &str) -> String {
-    let name = if argv0.is_empty() { "bwrap" } else { argv0 };
-    format!("usage: {name} [OPTIONS...] [--] COMMAND [ARGS...]\n\n{BODY}")
+    format!("usage: {argv0} [OPTIONS...] [--] COMMAND [ARGS...]\n\n{BODY}")
 }

@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-2.0-or-later
+// Ported from bubblewrap, Copyright (C) 2016 Alexander Larsson and contributors.
 //! Bind mounts with `ro`/`nodev`/`nosuid` attributes, via `mount_setattr`
 //! (Linux 5.12+) or the `/proc/self/mountinfo` + `MS_REMOUNT` fallback.
 //!

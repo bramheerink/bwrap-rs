@@ -15,30 +15,28 @@ pub(crate) fn thread_count() -> io::Result<usize> {
     parse_thread_count(&status)
 }
 
-/// Thread count for the single-thread guard, resilient to `/proc` being gone
-/// after `pivot_root` (where the pid-1 fork happens).
+/// Thread count for the single-thread guard, independent of the sandbox's
+/// `/proc` once primed.
 ///
-/// Reads `/proc/self/status` and remembers the first success. Only when the
-/// failure means `/proc` itself is unreachable (`ENOENT`/`ENOTDIR`) does it
-/// fall back to that primed value — bwrap-rs never spawns threads after
-/// startup, so the earlier count is still valid. Any other error (`EMFILE`,
-/// `ENOMEM`, parse failure, …) is propagated rather than silently trusting a
-/// stale count.
+/// The first call runs in the parent, before any `pivot_root`, while
+/// `/proc/self/status` is still the real host procfs; it reads the count and
+/// remembers it in [`PRIMED_COUNT`]. Every later call — in particular the pid-1
+/// fork, which happens *after* the pivot (`--unshare-pid`, `--lock-file`,
+/// `--sync-fd`) — returns that primed value without touching the path again.
+///
+/// This is sound because bwrap-rs spawns no threads after startup, so the count
+/// cannot have changed; and it removes any dependency on the new root's
+/// `/proc/self/status`. A planted or stale `proc/self/status` inside the sandbox
+/// (rootfs tarballs, `--file … /proc/self/status`, test fixtures), or an
+/// unrelated read error such as `EMFILE` at the fd limit, must not be able to
+/// decide whether the fork is allowed. bubblewrap has no such dependency.
 pub(crate) fn guard_thread_count() -> io::Result<usize> {
-    match thread_count() {
-        Ok(n) => {
-            let _ = PRIMED_COUNT.set(n);
-            Ok(n)
-        }
-        Err(e) if proc_gone(&e) => PRIMED_COUNT.get().copied().ok_or(e),
-        Err(e) => Err(e),
+    if let Some(&n) = PRIMED_COUNT.get() {
+        return Ok(n);
     }
-}
-
-/// Whether the error means `/proc` is not mounted/reachable (not a transient
-/// resource error).
-fn proc_gone(e: &io::Error) -> bool {
-    matches!(e.kind(), io::ErrorKind::NotFound) || e.raw_os_error() == Some(nix::libc::ENOTDIR)
+    let n = thread_count()?;
+    let _ = PRIMED_COUNT.set(n);
+    Ok(n)
 }
 
 fn parse_thread_count(status: &str) -> io::Result<usize> {
@@ -80,14 +78,6 @@ mod tests {
     #[test]
     fn live_count_is_positive() {
         assert!(thread_count().is_ok_and(|n| n >= 1));
-    }
-
-    #[test]
-    fn proc_gone_only_for_missing_proc() {
-        assert!(proc_gone(&io::Error::from(io::ErrorKind::NotFound)));
-        assert!(proc_gone(&io::Error::from_raw_os_error(nix::libc::ENOTDIR)));
-        assert!(!proc_gone(&io::Error::from_raw_os_error(nix::libc::EMFILE)));
-        assert!(!proc_gone(&io::Error::from(io::ErrorKind::InvalidData)));
     }
 
     #[test]

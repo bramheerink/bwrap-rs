@@ -22,7 +22,12 @@ pub(crate) fn invocation(argv: &[OsString]) {
     let Some(path) = log_path() else {
         return;
     };
-    let mut line = format!("t={} pid={} argv:", now(), std::process::id());
+    let mut line = format!(
+        "t={} pid={} bwrap-rs {} argv:",
+        now(),
+        std::process::id(),
+        env!("CARGO_PKG_VERSION"),
+    );
     for a in argv {
         line.push(' ');
         line.push_str(&sh_quote(&a.to_string_lossy()));

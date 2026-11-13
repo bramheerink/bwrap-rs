@@ -13,11 +13,34 @@ use std::process::{Command, ExitCode, Output};
 
 /// Our freshly-built binary (Cargo exposes its path to this bin crate's tests).
 const OURS: &str = env!("CARGO_BIN_EXE_bwrap");
-/// The reference bwrap to compare against. `BWRAP_REAL` overrides the default,
-/// which matters when ours is installed as `/usr/bin/bwrap` (a soak-test setup):
-/// point it at the stock build, e.g. `BWRAP_REAL=/usr/bin/bwrap.backup`.
+/// The reference bwrap to compare against. `BWRAP_REAL` wins, then `REAL` (the
+/// name the CI oracle step and `tests/conformance.sh` already use), else the
+/// system `/usr/bin/bwrap`. Overriding matters when ours is installed as
+/// `/usr/bin/bwrap` (a soak-test setup): point it at the stock 0.13.1 build.
 fn real_bin() -> String {
-    std::env::var("BWRAP_REAL").unwrap_or_else(|_| "/usr/bin/bwrap".to_string())
+    std::env::var("BWRAP_REAL")
+        .or_else(|_| std::env::var("REAL"))
+        .unwrap_or_else(|_| "/usr/bin/bwrap".to_string())
+}
+
+/// Two paths that resolve to the same file (so a `REAL` pointing at `OURS` is
+/// rejected as a self-oracle).
+fn same_file(a: &str, b: &str) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(a), std::fs::metadata(b)) {
+        (Ok(ma), Ok(mb)) => ma.dev() == mb.dev() && ma.ino() == mb.ino(),
+        _ => false,
+    }
+}
+
+/// Whether `path` is a bwrap-rs build, identified by the embedded `bwrap-rs `
+/// marker that the C binary never carries (`--version` is identical, so it
+/// cannot tell them apart).
+fn is_bwrap_rs(path: &str) -> bool {
+    match std::fs::read(path) {
+        Ok(bytes) => bytes.windows(9).any(|w| w == b"bwrap-rs "),
+        Err(_) => false,
+    }
 }
 
 /// A minimal read-only sandbox that is the SAME on any usr-merged distribution:
@@ -67,12 +90,17 @@ fn base_with(extra: &[&str]) -> Vec<String> {
         .collect()
 }
 
-/// Is the system bwrap exactly the drop-in target (0.13.1)?
+/// Is the reference bwrap exactly the drop-in target (0.13.1) AND not the port
+/// itself? A bwrap-rs build reproduces `--version` byte-for-byte, so comparing
+/// against it (the same file as OURS, or any bwrap-rs binary) would prove
+/// nothing; such an oracle is rejected.
 fn real_is_target() -> bool {
-    match Command::new(real_bin()).arg("--version").output() {
+    let real = real_bin();
+    let is_013 = match Command::new(&real).arg("--version").output() {
         Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == "bubblewrap 0.13.1",
         Err(_) => false,
-    }
+    };
+    is_013 && !same_file(&real, OURS) && !is_bwrap_rs(&real)
 }
 
 type Check = (
@@ -97,11 +125,30 @@ fn main() -> ExitCode {
     // when its base `/bin/true` won't run.)
     if !probe.status.success() {
         let reason = stderr.lines().next().unwrap_or("base sandbox unavailable");
+        // CI sets BWRAP_RS_REQUIRE_USERNS so a run that cannot create a user
+        // namespace fails loudly instead of silently skipping the acceptance
+        // suite (the other host suites honour the same gate).
+        if std::env::var_os("BWRAP_RS_REQUIRE_USERNS").is_some() {
+            println!(
+                "test differential ... FAILED (BWRAP_RS_REQUIRE_USERNS set but base sandbox cannot start: {reason})"
+            );
+            return ExitCode::FAILURE;
+        }
         println!("test differential ... SKIP ({reason})");
         return ExitCode::SUCCESS;
     }
 
     let have_real = real_is_target();
+    // BWRAP_RS_REQUIRE_REAL makes a missing/invalid oracle fatal, so CI cannot
+    // silently degrade to ours-only expectations (it would never compare the
+    // security-regression checks against bubblewrap 0.13.1).
+    if !have_real && std::env::var_os("BWRAP_RS_REQUIRE_REAL").is_some() {
+        println!(
+            "test differential ... FAILED (BWRAP_RS_REQUIRE_REAL set but no bubblewrap 0.13.1 oracle at {})",
+            real_bin()
+        );
+        return ExitCode::FAILURE;
+    }
     let checks = build_checks();
 
     let mut failures = Vec::new();
@@ -114,9 +161,9 @@ fn main() -> ExitCode {
     let n = checks.len();
     if failures.is_empty() {
         let ab = if have_real {
-            "with A/B vs /usr/bin/bwrap 0.13.1"
+            format!("with A/B vs {} (0.13.1)", real_bin())
         } else {
-            "ours-only (no 0.13.1 present)"
+            "ours-only (no 0.13.1 oracle present)".to_string()
         };
         println!("test differential ... ok ({n} checks, {ab})");
         ExitCode::SUCCESS

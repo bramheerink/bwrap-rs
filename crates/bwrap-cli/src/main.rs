@@ -6,6 +6,23 @@
 
 mod trace;
 
+/// Build identity embedded in the binary so a deployed `/usr/bin/bwrap` (which,
+/// by design, prints the same `--version` as the C tool) can still be identified
+/// as the port and traced to a build: `strings -a bwrap | grep '^bwrap-rs '`.
+/// `#[used]` keeps it through dead-code elimination and `strip = true`; it never
+/// touches the CLI surface, so `--version` stays byte-identical.
+#[used]
+static BWRAP_RS_BUILD_ID: &str = concat!("\0bwrap-rs ", env!("CARGO_PKG_VERSION"), "\0");
+
+/// The git commit the binary was built from, when the release build sets
+/// `BWRAP_RS_GIT_SHA`; otherwise a stable placeholder. Kept greppable alongside
+/// [`BWRAP_RS_BUILD_ID`].
+#[used]
+static BWRAP_RS_GIT_SHA: &str = match option_env!("BWRAP_RS_GIT_SHA") {
+    Some(sha) => sha,
+    None => "bwrap-rs-git: unknown",
+};
+
 use std::os::fd::RawFd;
 use std::process::ExitCode;
 
@@ -72,6 +89,12 @@ impl ParseHost for Host {
 }
 
 fn main() -> ExitCode {
+    // Undo the Rust runtime's startup signal changes before anything else, so
+    // every exit path (including --help/--version/parse errors) and the sandbox
+    // run with bubblewrap's signal state: inherited SIGPIPE/SIGSEGV/SIGBUS and
+    // SIGCHLD reset to SIG_DFL. Must be first — the early-return paths below
+    // would otherwise still carry the runtime's SIGPIPE = SIG_IGN.
+    bwrap_sys::process::reset_runtime_signal_state();
     // Collect argv without panicking on non-UTF-8 (which `std::env::args()`
     // would). Full byte-faithful handling of non-UTF-8 paths needs a bytes-based
     // parser (a module-3 rework); until then, fail cleanly instead of aborting.

@@ -17,11 +17,14 @@
 
 use std::fmt;
 use std::io;
-use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 
+use nix::dir::Dir;
 use nix::errno::Errno;
-use nix::libc::{self, c_ulong, pid_t};
+use nix::fcntl::{OFlag, openat};
+use nix::libc::{self, c_int, c_ulong, pid_t};
 use nix::sched::CloneFlags;
+use nix::sys::stat::Mode;
 use nix::unistd::{ForkResult, Pid};
 
 use crate::thread::guard_thread_count;
@@ -154,61 +157,142 @@ pub fn exit_immediately(status: i32) -> ! {
     unsafe { libc::_exit(status) }
 }
 
-/// Replace the process environment with `env` (`clearenv` + `setenv` per entry).
+/// `waitpid(pid, &status, flags)` returning the RAW status integer rather than
+/// nix's `WaitStatus`.
 ///
-/// bwrap builds the sandbox environment on the real `environ` and then calls
-/// `execvp`, so the command's `PATH` search and the child's environment both
-/// come from it. The caller does the same: set the environment here, then
-/// `execvp`. (`std::env::set_var` is `unsafe` under edition 2024 and forbidden
-/// in the pure-safe crates, so this one wrapper owns the mutation.)
+/// nix decodes the status through `Signal::try_from(WTERMSIG(status))`, which
+/// has no enum variant for the real-time signals (32..=64) and so returns
+/// `Err(EINVAL)` *after the kernel has already reaped the child* — the status is
+/// lost and the caller hangs or dies. bubblewrap decodes the raw status with the
+/// `W*` macros (`propagate_exit_status`), so the caller must have the raw value.
 ///
-/// Sound because the sandbox child is single-threaded at exec time (see the
-/// module caveat): no other thread can race on `environ`.
-pub fn replace_environ(env: &[(std::ffi::CString, std::ffi::CString)]) {
-    // SAFETY: clears `environ`; single-threaded here, so nothing races.
-    unsafe { libc::clearenv() };
-    for (name, value) in env {
-        // SAFETY: both are valid NUL-terminated C strings owned by the caller
-        // for this call; setenv copies them. Single-threaded as above.
-        unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) };
+/// Returns `Ok(None)` when `WNOHANG` was requested and no child had changed
+/// state, otherwise `Ok(Some((pid, raw_status)))`.
+pub fn wait_raw(pid: pid_t, nohang: bool) -> nix::Result<Option<(Pid, c_int)>> {
+    let mut status: c_int = 0;
+    let flags = if nohang { libc::WNOHANG } else { 0 };
+    // SAFETY: `waitpid` writes the child's status into `status` (a valid local)
+    // and touches no other memory of ours; the returned pid/0/-1 is handled below.
+    let ret = unsafe { libc::waitpid(pid, &mut status, flags) };
+    match Errno::result(ret)? {
+        0 => Ok(None),
+        child => Ok(Some((Pid::from_raw(child), status))),
     }
 }
 
-/// The SIGPIPE disposition the process was started with, captured before the
-/// Rust runtime replaces it (see [`CAPTURE_INHERITED_SIGPIPE`]). Stored as the
+/// Edit the process environment in place, mirroring bwrap's handling of
+/// `--clearenv`/`--setenv`/`--unsetenv`: `clearenv`/`setenv`/`unsetenv` applied
+/// to the inherited `environ`, then `execvp`.
+///
+/// bwrap never rebuilds the environment from a snapshot (which would drop
+/// malformed entries and collapse duplicates); it mutates the real `environ`, so
+/// the command's `PATH` search and the child's environment both come from it.
+/// These four wrappers own that mutation (`std::env::set_var` is `unsafe` under
+/// edition 2024 and forbidden in the pure-safe crates).
+///
+/// Sound because the sandbox child is single-threaded at exec time (see the
+/// module caveat): no other thread can race on `environ`.
+pub fn env_clear() {
+    // SAFETY: clears `environ`; single-threaded here, so nothing races.
+    unsafe {
+        libc::clearenv();
+    }
+}
+
+/// Set `name=value` (`setenv` with overwrite), as `--setenv` does.
+pub fn env_set(name: &std::ffi::CStr, value: &std::ffi::CStr) {
+    // SAFETY: both are valid NUL-terminated C strings borrowed for this call;
+    // setenv copies them. Single-threaded as above.
+    unsafe {
+        libc::setenv(name.as_ptr(), value.as_ptr(), 1);
+    }
+}
+
+/// Remove `name` from the environment (`unsetenv`), as `--unsetenv` does.
+pub fn env_unset(name: &std::ffi::CStr) {
+    // SAFETY: a valid NUL-terminated C string; single-threaded as above.
+    unsafe {
+        libc::unsetenv(name.as_ptr());
+    }
+}
+
+/// Look up `name` in the environment (`getenv`), copying the value out.
+pub fn env_get(name: &std::ffi::CStr) -> Option<Vec<u8>> {
+    // SAFETY: `getenv` reads `environ` and returns a pointer to a NUL-terminated
+    // string owned by the environment (or null); single-threaded, so it stays
+    // valid while we copy it.
+    let p = unsafe { libc::getenv(name.as_ptr()) };
+    if p.is_null() {
+        return None;
+    }
+    // SAFETY: a non-null `getenv` result points to a NUL-terminated C string.
+    let bytes = unsafe { std::ffi::CStr::from_ptr(p) }.to_bytes().to_vec();
+    Some(bytes)
+}
+
+/// A signal disposition the process was started with, captured before the Rust
+/// runtime replaces it (see [`CAPTURE_INHERITED_DISPOSITIONS`]). Stored as the
 /// raw `sighandler_t` (`SIG_DFL` is 0, `SIG_IGN` is 1, else a handler address).
 /// Initialised to `SIG_DFL` so a missed capture degrades to C's usual case, not
-/// to the runtime's `SIG_IGN`.
+/// to the runtime's handler.
 static INHERITED_SIGPIPE: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
+static INHERITED_SIGSEGV: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
+static INHERITED_SIGBUS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(libc::SIG_DFL);
 
-/// Record the inherited SIGPIPE disposition during ELF startup, before `main`
-/// and before the Rust runtime overrides SIGPIPE with `SIG_IGN`.
+/// Query the current disposition of `signum` (`sigaction` with a null `act`),
+/// returning the raw `sa_sigaction` value, or `None` if the query failed.
+fn query_disposition(signum: c_int) -> Option<usize> {
+    // SAFETY: an all-zero `sigaction` is a valid value (SIG_DFL, no flags,
+    // empty mask); it is overwritten by the query below before being read.
+    let mut cur: libc::sigaction = unsafe { std::mem::zeroed() };
+    // SAFETY: runs single-threaded during ELF startup. A null `act` pointer only
+    // reads the current disposition into `cur`; nothing is installed.
+    let rc = unsafe { libc::sigaction(signum, std::ptr::null(), &mut cur) };
+    (rc == 0).then_some(cur.sa_sigaction)
+}
+
+/// Install `disp` (a raw `sighandler_t`) as the disposition of `signum`.
+fn set_disposition(signum: c_int, disp: usize) {
+    // SAFETY: called on the single-threaded startup path (first thing in `main`,
+    // and again before the clone). `disp` is a `sighandler_t` value — a captured
+    // real disposition or a `SIG_DFL`/`SIG_IGN` constant — valid to install.
+    // `signal` touches none of our memory.
+    unsafe {
+        libc::signal(signum, disp);
+    }
+}
+
+/// Record the dispositions of the signals the Rust runtime overrides at startup
+/// (SIGPIPE → `SIG_IGN`; SIGSEGV/SIGBUS → its stack-overflow handler), captured
+/// during ELF startup — before `main` and before the runtime runs — so that
+/// [`reset_runtime_signal_state`] can put back exactly what bubblewrap's child
+/// would inherit.
 ///
-/// bwrap (C) never touches SIGPIPE: the sandboxed command inherits whatever
-/// disposition bwrap itself was launched with — normally `SIG_DFL`, but a
-/// parent that ignores SIGPIPE (a CI runner, some daemons) passes `SIG_IGN`
-/// through. The Rust runtime unconditionally installs `SIG_IGN` at startup and
-/// that survives `exec`, so to stay a faithful drop-in we must restore the
-/// *inherited* disposition before the clone (see [`restore_inherited_sigpipe`]),
-/// not force `SIG_DFL`. The inherited value is only observable before the
-/// runtime runs, so this `.init_array` constructor records it then.
+/// bwrap (C) installs no handlers at all and never touches these signals: the
+/// sandboxed command inherits whatever disposition bwrap itself was launched
+/// with — normally `SIG_DFL`, but a parent that ignores a signal passes
+/// `SIG_IGN` through. The Rust runtime replaces all three, and that survives
+/// `exec`, so to stay a faithful drop-in we must restore the *inherited*
+/// disposition, not force a value. The inherited values are only observable
+/// before the runtime runs, so this `.init_array` constructor records them then.
 #[used]
 #[cfg_attr(
     any(target_os = "linux", target_os = "android"),
     unsafe(link_section = ".init_array")
 )]
-static CAPTURE_INHERITED_SIGPIPE: extern "C" fn() = {
+static CAPTURE_INHERITED_DISPOSITIONS: extern "C" fn() = {
     extern "C" fn capture() {
-        // SAFETY: an all-zero `sigaction` is a valid value (SIG_DFL, no flags,
-        // empty mask); it is overwritten by the query below before being read.
-        let mut cur: libc::sigaction = unsafe { std::mem::zeroed() };
-        // SAFETY: runs single-threaded during ELF startup, before main and
-        // before the Rust runtime touches signals. A null `act` pointer only
-        // queries the current disposition into `cur`; nothing is installed.
-        let rc = unsafe { libc::sigaction(libc::SIGPIPE, std::ptr::null(), &mut cur) };
-        if rc == 0 {
-            INHERITED_SIGPIPE.store(cur.sa_sigaction, std::sync::atomic::Ordering::Relaxed);
+        if let Some(d) = query_disposition(libc::SIGPIPE) {
+            INHERITED_SIGPIPE.store(d, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(d) = query_disposition(libc::SIGSEGV) {
+            INHERITED_SIGSEGV.store(d, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Some(d) = query_disposition(libc::SIGBUS) {
+            INHERITED_SIGBUS.store(d, std::sync::atomic::Ordering::Relaxed);
         }
     }
     capture
@@ -222,12 +306,38 @@ static CAPTURE_INHERITED_SIGPIPE: extern "C" fn() = {
 /// handler — essentially nonexistent for SIGPIPE — is reinstalled with default
 /// flags, still closer to C than forcing `SIG_DFL`.)
 pub fn restore_inherited_sigpipe() {
-    let disp = INHERITED_SIGPIPE.load(std::sync::atomic::Ordering::Relaxed);
-    // SAFETY: single-threaded startup path (before the clone). `disp` is a
-    // sighandler_t captured from a real SIGPIPE disposition, valid to reinstall.
-    unsafe {
-        libc::signal(libc::SIGPIPE, disp);
-    }
+    set_disposition(
+        libc::SIGPIPE,
+        INHERITED_SIGPIPE.load(std::sync::atomic::Ordering::Relaxed),
+    );
+}
+
+/// Undo every signal-disposition change the Rust runtime made at startup, so the
+/// launcher, the pid-1 reaper and the sandboxed command run with bubblewrap's
+/// signal state instead of Rust's. Call it as the very first thing in `main`.
+///
+/// - SIGPIPE, SIGSEGV and SIGBUS: put back the inherited disposition the
+///   `.init_array` constructor captured (normally `SIG_DFL`; an inherited
+///   `SIG_IGN` is preserved). C installs no handlers, so this leaves the
+///   launcher's `SigCgt` empty like bubblewrap's and lets a crash signal kill it
+///   as it kills C, instead of the std handler swallowing the first one.
+/// - SIGCHLD: reset to `SIG_DFL` unconditionally, as bubblewrap.c:2905 does
+///   ("Reset SIGCHILD to SIG_DFL allowing signalfd working properly if the
+///   parent process had set SIGCHLD to SIG_IGN"). A launcher started with
+///   SIGCHLD ignored would otherwise never see the child die (the kernel
+///   auto-reaps and queues no SIGCHLD), hanging or spinning the monitor, and the
+///   ignore would leak into the sandboxed command.
+pub fn reset_runtime_signal_state() {
+    restore_inherited_sigpipe();
+    set_disposition(
+        libc::SIGSEGV,
+        INHERITED_SIGSEGV.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    set_disposition(
+        libc::SIGBUS,
+        INHERITED_SIGBUS.load(std::sync::atomic::Ordering::Relaxed),
+    );
+    set_disposition(libc::SIGCHLD, libc::SIG_DFL);
 }
 
 /// Close every open file descriptor greater than 2 (stdio) that is not in
@@ -246,59 +356,38 @@ pub fn restore_inherited_sigpipe() {
 /// closed after the directory handle is closed; closing an already-closed or
 /// invalid number yields `EBADF`, which is ignored, exactly as bwrap does.
 pub fn close_extra_fds(proc: BorrowedFd<'_>, keep: &[RawFd]) -> io::Result<()> {
-    let mut candidates: Vec<RawFd> = Vec::new();
-    // SAFETY: `openat` with a valid directory fd and a static NUL-terminated
-    // path. On failure it returns -1 and sets errno, which we surface.
-    let dir_fd = unsafe {
-        libc::openat(
-            proc.as_raw_fd(),
-            c"self/fd".as_ptr(),
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
-        )
+    // Stage 1: opening self/fd is non-fatal — bwrap's fdwalk silently ignores a
+    // /proc/self/fd it cannot open (e.g. a root without /proc), rather than
+    // treating it as an error.
+    let dir_fd = match openat(
+        proc.as_fd(),
+        "self/fd",
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(_) => return Ok(()),
     };
-    if dir_fd < 0 {
-        // bwrap's fdwalk silently ignores a /proc/self/fd it cannot open
-        // rather than treating it as fatal; match that.
-        return Ok(());
-    }
-    // SAFETY: `fdopendir` takes ownership of the freshly opened `dir_fd`; the
-    // matching `closedir` below frees the stream and the fd. On failure we close
-    // `dir_fd` ourselves and surface errno.
-    let dirp = unsafe { libc::fdopendir(dir_fd) };
-    if dirp.is_null() {
-        let err = io::Error::last_os_error();
-        // SAFETY: `dir_fd` is still a valid, unclaimed fd here.
-        unsafe { libc::close(dir_fd) };
-        return Err(err);
-    }
-    loop {
-        // SAFETY: `dirp` is a valid `DIR*`; `readdir` returns a pointer valid
-        // until the next `readdir`/`closedir`, or NULL at end of stream.
-        let ent = unsafe { libc::readdir(dirp) };
-        if ent.is_null() {
-            break;
-        }
-        // SAFETY: `ent` is a valid `dirent` pointer (checked non-null above);
-        // `d_name` is an inline array within it.
-        let d_name = unsafe { (*ent).d_name.as_ptr() };
-        // SAFETY: `d_name` points at a NUL-terminated C string in that `dirent`.
-        let name = unsafe { std::ffi::CStr::from_ptr(d_name) };
-        if let Ok(n) = name.to_str().unwrap_or("").parse::<RawFd>()
+    // Stage 2: fdopendir failure IS surfaced, as the original did. `Dir` owns the
+    // fd and its `Drop` does closedir (+ closes the fd).
+    let mut dir = Dir::from_fd(dir_fd).map_err(io::Error::from)?;
+    let self_fd = dir.as_raw_fd();
+    let mut candidates: Vec<RawFd> = Vec::new();
+    for entry in dir.iter() {
+        let Ok(entry) = entry else { continue };
+        if let Ok(n) = entry.file_name().to_str().unwrap_or("").parse::<RawFd>()
             && n > 2
-            && n != dir_fd
+            && n != self_fd
             && !keep.contains(&n)
         {
             candidates.push(n);
         }
     }
-    // SAFETY: closes the `DIR*` stream and its underlying `dir_fd`.
-    unsafe { libc::closedir(dirp) };
+    // Close the directory handle before closing the collected numbers (the
+    // original closed the DIR* first too). A stale number is a harmless EBADF.
+    drop(dir);
     for fd in candidates {
-        // SAFETY: `close` takes an fd number and touches none of our memory. A
-        // stale number returns EBADF; we ignore it, as bwrap's fdwalk does.
-        unsafe {
-            libc::close(fd);
-        }
+        let _ = nix::unistd::close(fd);
     }
     Ok(())
 }
