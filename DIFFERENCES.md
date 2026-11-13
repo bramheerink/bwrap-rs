@@ -1,15 +1,26 @@
 # Differences from bubblewrap 0.13.1
 
-`bwrap-rs` aims to be a byte-exact, drop-in replacement for bubblewrap 0.13.1:
-the same command-line surface, the same behaviour, the same output and exit
-codes. Its behavioural conformance matrix (`tests/conformance.sh`) checks every
-documented option against the real `/usr/bin/bwrap` 0.13.1 and requires
-byte-identical exit code, stdout and stderr.
+`bwrap-rs` is **byte-exact by default**: the same command-line surface, the same
+behaviour, the same output and exit codes as bubblewrap 0.13.1. Its conformance
+matrix (`tests/conformance.sh`) dual-runs every documented option against a real
+bubblewrap 0.13.1 binary and requires byte-identical exit code, stdout and
+stderr.
 
-A small number of behaviours differ deliberately. They are listed here in full.
-Most of them make `bwrap-rs` fail *more* strictly (fail-closed) than the C
-original on malformed or degenerate input; none changes the result of a normal,
-well-formed invocation.
+Byte-exactness is the default and the test oracle, **not an unbreakable rule**.
+For a security tool, where the C's observable behaviour is itself unsafe the
+right choice is to diverge and fail closed. So this file is both the behavioural
+difference list and the **divergence register**: a full, versioned record of
+every deliberate deviation, in two categories —
+
+- **Strictly-safer deviations** (most entries): `bwrap-rs` fails *more* strictly
+  (fail-closed) than the C on malformed or degenerate input. None changes the
+  result of a normal, well-formed invocation.
+- **Deliberately-replicated C quirks**: where byte-exactness means reproducing a
+  harmless C oddity (e.g. an overlay error that prints `(null)` from a C
+  use-after-free), it is reproduced and noted as such.
+
+Anything not listed here is a bug. See [THREAT-MODEL.md](THREAT-MODEL.md) for the
+security framing and [ROADMAP.md](ROADMAP.md) for the north star.
 
 ## Deliberate deviations
 

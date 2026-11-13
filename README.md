@@ -6,8 +6,16 @@ It aims to be a byte-exact, drop-in replacement for bubblewrap 0.13.1 — the sa
 command-line surface and behaviour, reimplemented in safe Rust (`std` + the `nix`
 crate, with `unsafe` confined to a small syscall crate).
 
-The handful of deliberate behavioural differences are documented in
-[DIFFERENCES.md](DIFFERENCES.md).
+The north star is **byte-exact by default, with strictly-safer divergences
+allowed, documented, and fail-closed** — proven against a real bubblewrap 0.13.1
+binary used as an oracle. See:
+
+- [THREAT-MODEL.md](THREAT-MODEL.md) — what this does and does not protect, and
+  why memory safety does not prevent logic-level sandbox escapes.
+- [DIFFERENCES.md](DIFFERENCES.md) — the divergence register: every deliberate
+  deviation and every deliberately-replicated C quirk.
+- [ROADMAP.md](ROADMAP.md) — priorities (differential fuzzing next), with
+  now/later/skip verdicts.
 
 ## Build
 
