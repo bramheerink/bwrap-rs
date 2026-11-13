@@ -680,15 +680,14 @@ fn clone_error(unshare_user: bool, e: bwrap_sys::process::ForkError) -> Error {
 
 /// `ttyname(1)` when stdout is a tty, for `/dev/console` (bwrap's `host_tty_dev`).
 fn host_tty_dev() -> Option<Vec<u8>> {
+    use std::os::fd::AsFd;
     use std::os::unix::ffi::OsStrExt;
-    let stdout = unsafe_stdout();
-    nix::unistd::ttyname(stdout)
+    // Borrow the real stdout safely (Stdout: AsFd) instead of fabricating a
+    // BorrowedFd<'static> for fd 1 by hand.
+    let out = std::io::stdout();
+    nix::unistd::ttyname(out.as_fd())
         .ok()
         .map(|p| p.into_os_string().as_bytes().to_vec())
-}
-
-fn unsafe_stdout() -> BorrowedFd<'static> {
-    bwrap_sys::fd::borrow_raw(1)
 }
 
 /// Read the sandbox process's namespace inode ids (bwrap's `namespace_ids_read`):
