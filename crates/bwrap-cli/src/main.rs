@@ -34,33 +34,40 @@ use bwrap_core::types::Config;
 use bwrap_core::userns::SystemUsernsProbe;
 use nix::errno::Errno;
 
-/// Read an fd to EOF (bwrap's `load_file_data`), returning the raw errno on
-/// failure so each caller can attach its own message. Does not close the fd.
-fn read_fd_fully(fd: RawFd) -> Result<Vec<u8>, Errno> {
-    let bf = bwrap_sys::fd::borrow_raw(fd);
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    loop {
-        match nix::unistd::read(bf, &mut buf) {
-            Ok(0) => return Ok(out),
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(Errno::EINTR) => {}
-            Err(e) => return Err(e),
+/// The real parser host: reads `--args`/`--add-seccomp-fd` fds through the
+/// process fd table and prints warnings to stderr.
+struct Host<'a> {
+    fds: &'a mut bwrap_sys::fd::FdTable,
+}
+
+impl Host<'_> {
+    /// Claim, borrow and read a caller fd to EOF (bwrap's `load_file_data`),
+    /// returning the raw errno on failure. A bad or already-closed number is
+    /// `EBADF`, so a reused `--args N … --args N` fails on the second read
+    /// exactly as bubblewrap does.
+    fn read_caller_fd(&mut self, fd: RawFd) -> Result<Vec<u8>, Errno> {
+        self.fds.claim(fd).map_err(|_| Errno::EBADF)?;
+        let bf = self.fds.borrow(fd).ok_or(Errno::EBADF)?;
+        let mut out = Vec::new();
+        let mut buf = [0u8; 4096];
+        loop {
+            match nix::unistd::read(bf, &mut buf) {
+                Ok(0) => return Ok(out),
+                Ok(n) => out.extend_from_slice(&buf[..n]),
+                Err(Errno::EINTR) => {}
+                Err(e) => return Err(e),
+            }
         }
     }
 }
 
-/// The real parser host: reads `--args`/`--add-seccomp-fd` fds and prints
-/// warnings to stderr.
-struct Host;
-
-impl ParseHost for Host {
+impl ParseHost for Host<'_> {
     fn read_args(&mut self, fd: RawFd) -> Result<Vec<u8>, Error> {
         // bwrap closes the --args fd right after reading (bubblewrap.c:1815), so
         // it never leaks into the sandbox and a repeated `--args N N` re-read
         // fails with EBADF as in C. Close it regardless of the read result.
-        let r = read_fd_fully(fd);
-        bwrap_sys::fd::close_raw(fd);
+        let r = self.read_caller_fd(fd);
+        self.fds.close(fd);
         r.map_err(|e| Error::Sys {
             message: "Can't read --args data".into(),
             errno: e,
@@ -71,8 +78,8 @@ impl ParseHost for Host {
         // bwrap's seccomp_program_new reads the whole fd and closes it. Close it
         // regardless of the read result so the descriptor cannot leak into the
         // sandbox.
-        let r = read_fd_fully(fd);
-        bwrap_sys::fd::close_raw(fd);
+        let r = self.read_caller_fd(fd);
+        self.fds.close(fd);
         r.map_err(|e| Error::Sys {
             message: "Can't read seccomp data".into(),
             errno: e,
@@ -125,7 +132,10 @@ fn main() -> ExitCode {
         }
     };
 
-    let mut host = Host;
+    // The process's fd table; the Host claims the --args/--add-seccomp-fd
+    // descriptors through it (owns them for their read, closes them after).
+    let mut fds = bwrap_sys::fd::FdTable::new();
+    let mut host = Host { fds: &mut fds };
     let config = match parse(&args, &mut host) {
         Ok(Outcome::Run(cfg)) => *cfg,
         Ok(Outcome::Help) => {
