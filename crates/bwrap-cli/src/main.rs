@@ -6,6 +6,13 @@
 
 mod trace;
 
+/// On allocation failure, exit 1 with `Out of memory` like bubblewrap's
+/// `die_oom`, instead of Rust's default abort (SIGABRT / exit 134 / core dump).
+/// Declaring the allocator is safe; its `unsafe` `GlobalAlloc` impl lives in
+/// bwrap-sys, so this crate stays `#![forbid(unsafe_code)]`.
+#[global_allocator]
+static GLOBAL: bwrap_sys::alloc::OomExit = bwrap_sys::alloc::OomExit;
+
 /// Build identity embedded in the binary so a deployed `/usr/bin/bwrap` (which,
 /// by design, prints the same `--version` as the C tool) can still be identified
 /// as the port and traced to a build: `strings -a bwrap | grep '^bwrap-rs '`.

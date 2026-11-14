@@ -29,6 +29,7 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("bwrap-sys only supports Linux");
 
+pub mod alloc;
 pub mod caps;
 pub mod fd;
 pub mod mount_attr;
