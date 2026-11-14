@@ -273,6 +273,28 @@ ab  level-prefix     -- --level-prefix "${BASE[@]}" --bind /no/such /x /bin/true
 ab  unknown-opt      -- --this-is-not-an-option
 ab  no-command       -- "${BASE[@]}"
 
+# === resource limits ======================================================
+# OOM: under a tight address-space limit a failed allocation must print
+# "Out of memory" and exit 1 (bubblewrap's die_oom), not abort with SIGABRT
+# (exit 134 + core) as Rust's default allocator does. A 30 MB --args read under a
+# ~20 MB `ulimit -v` forces it. Guarded: the exact threshold depends on binary
+# size (the loader can fail first under the limit), so if this environment does
+# not reproduce a clean allocator OOM for ours, skip rather than false-fail.
+{ printf -- '--setenv\0A\0'; head -c 30000000 /dev/zero | tr '\0' x; printf '\0'; } > "$WORK/args_big" 2>/dev/null || :
+oom_rc() { ( ulimit -v 20000 2>/dev/null; "$1" --ro-bind / / --args 9 true 9<"$WORK/args_big" >/dev/null 2>"$2" ); echo $?; }
+if [ "$HAVE_REAL" = 1 ] && [ -s "$WORK/args_big" ]; then
+    ooc=$(oom_rc "$OURS" "$WORK/ooe"); ooe=$(norm <"$WORK/ooe")
+    if [ "$ooc" = 1 ] && [ "$ooe" = "Out of memory" ]; then
+        orc=$(oom_rc "$REAL" "$WORK/roe"); ore=$(norm <"$WORK/roe")
+        if [ "$orc" = "$ooc" ] && [ "$ore" = "$ooe" ]; then ok oom-exit1
+        else fail oom-exit1 "ours=[$ooc/$ooe] real=[$orc/$ore]"; fi
+    else
+        skip oom-exit1 "environment cannot reproduce a clean allocator OOM (ours=$ooc [$ooe])"
+    fi
+else
+    skip oom-exit1 "no oracle or could not build the large --args fixture"
+fi
+
 # === binds ================================================================
 ab  bind-missing     -- "${BASE[@]}" --bind /no/such /x /bin/true
 ab  bind-try         -- "${BASE[@]}" --bind-try /no/such /x /bin/true
