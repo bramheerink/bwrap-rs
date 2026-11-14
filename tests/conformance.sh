@@ -205,6 +205,8 @@ printf 'from-lower\n'  > "$WORK/ov/low/f"
 printf 'from-lower2\n' > "$WORK/ov/low2/g"
 : > "$WORK/lock"
 host_ipc=$(readlink /proc/self/ns/ipc 2>/dev/null)   # for the ipc-isolation observation
+host_net=$(readlink /proc/self/ns/net 2>/dev/null)   # for the net-isolation observation
+host_uts=$(readlink /proc/self/ns/uts 2>/dev/null)   # for the uts-isolation observation
 
 echo "Running conformance matrix (HAVE_REAL=$HAVE_REAL)..."
 
@@ -365,6 +367,10 @@ ab0 overlay          -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --overlay "$WO
 
 # === namespaces: deterministic observable A/B =============================
 ab  uts-hostname     -- "${BASE[@]}" --unshare-uts --hostname sandbox /bin/hostname
+# ...and it actually isolates: the uts namespace inode differs from the host's,
+# so --hostname in the sandbox cannot leak to the host. Catches a dropped
+# --unshare-uts (ours-only property, like ipc-isolated).
+inv uts-isolated 0 'isolated' -- "${BASE[@]}" --unshare-uts /bin/sh -c '[ "$(readlink /proc/self/ns/uts)" != "'"$host_uts"'" ] && echo isolated || echo shared'
 ab  hostname-no-uts  -- "${BASE[@]}" --hostname nope /bin/true
 # Each --hostname is an ordered op, as in bubblewrap: an invalid earlier value is
 # still attempted and fails (exit 1), not silently superseded by a valid later
@@ -372,6 +378,10 @@ ab  hostname-no-uts  -- "${BASE[@]}" --hostname nope /bin/true
 HN=$(printf 'a%.0s' $(seq 1 70))
 ab  hostname-order   -- "${BASE[@]}" --unshare-uts --hostname "$HN" --hostname ok /bin/hostname
 ab  net-only-lo      -- "${BASE[@]}" --unshare-net /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
+# ...and the net namespace inode differs from the host's — net-only-lo observes
+# the interface set, this observes the namespace identity itself. Catches a
+# dropped --unshare-net (ours-only property).
+inv net-isolated 0 'isolated' -- "${BASE[@]}" --unshare-net /bin/sh -c '[ "$(readlink /proc/self/ns/net)" != "'"$host_net"'" ] && echo isolated || echo shared'
 # loopback must be brought UP, not just given its address: net-only-lo checks the
 # interface name only, and bind(127.0.0.1) succeeds on a down link, so the UP flag
 # can regress unnoticed. Needs iproute2.
@@ -388,6 +398,12 @@ ab  ipc              -- "${BASE[@]}" --unshare-ipc /bin/true
 # (ours-only, since the oracle's inode differs too). Catches a dropped --unshare-ipc.
 inv ipc-isolated 0 'isolated' -- "${BASE[@]}" --unshare-ipc /bin/sh -c '[ "$(readlink /proc/self/ns/ipc)" != "'"$host_ipc"'" ] && echo isolated || echo shared'
 ab  user-try         -- "${BASE[@]}" --unshare-user-try /bin/true
+# setgroups must be denied in the new user namespace (bubblewrap writes "deny"
+# to /proc/self/setgroups before gid_map, so the sandbox cannot drop/retain
+# supplementary groups to reach files it should not). A regression that skips
+# that write — a real privilege bug the oracle's innocuous cases do not see —
+# leaves it "allow". Ours-only property, so it is caught even if C regressed too.
+inv setgroups-deny 0 'deny' -- "${BASE[@]}" /bin/sh -c 'cat /proc/self/setgroups'
 ab  uid-gid          -- "${BASE[@]}" --uid 0 --gid 0 /bin/sh -c 'id -u; id -g'
 # With --dev (the second-user-namespace path) --gid must still map the requested
 # gid, not gid 0. Observes id -u/-g so a mutant that maps gid 0 in the inner
