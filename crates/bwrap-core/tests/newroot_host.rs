@@ -10,7 +10,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::ExitCode;
 
-use bwrap_core::setup::{NewrootCtx, pivot_into_newroot};
+use bwrap_core::setup::{NewrootCtx, ResolvedOps, pivot_into_newroot};
 use bwrap_core::types::{BindKind, HostPath, Mode, OnMissing, SandboxPath, SetupOp};
 use bwrap_core::userns::IdMap;
 use bwrap_sys::process::{ForkError, clone_into_namespaces};
@@ -76,7 +76,14 @@ fn child(real_uid: u32, real_gid: u32) -> i32 {
 
     // No op in this test carries a caller fd, so a fresh empty table suffices.
     let mut fds = bwrap_sys::fd::FdTable::new();
-    if let Err(e) = pivot_into_newroot(&ops, &ctx, &mut fds) {
+    let resolved = match ResolvedOps::resolve(&ops) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("  resolve: {e}");
+            return 4;
+        }
+    };
+    if let Err(e) = pivot_into_newroot(&resolved, &ctx, &mut fds) {
         eprintln!("  pivot_into_newroot: {e}");
         return 4;
     }

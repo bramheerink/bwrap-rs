@@ -34,8 +34,7 @@ use crate::seccomp::SeccompPrograms;
 use crate::setup::{NewrootCtx, pivot_into_newroot};
 use crate::types::caps::CapOp;
 use crate::types::config::NsPolicy;
-use crate::types::op::{OnMissing, OverlayUpper};
-use crate::types::{CapSet, Config, HostPath, ResolvedConfig, SetupOp};
+use crate::types::{CapSet, Config, ResolvedConfig, SetupOp};
 use crate::userns::{IdMap, OverflowIds};
 
 /// Run the sandbox described by `config` (already resolved into `resolved`).
@@ -513,8 +512,9 @@ fn child(
         file_label: config.file_label.clone(),
     };
     // Resolve symlinks in the op sources against the real root before pivoting
-    // (and fail early on a missing source with the right message).
-    let resolved_ops = resolve_symlinks_in_ops(&config.ops)?;
+    // (and fail early on a missing source with the right message). The resulting
+    // ResolvedOps is the only thing the executor accepts.
+    let resolved_ops = crate::setup::ResolvedOps::resolve(&config.ops)?;
     let sp = crate::profile::span("child.setup_newroot");
     let old_cwd = pivot_into_newroot(&resolved_ops, &ctx, fds)?;
     drop(sp);
@@ -844,82 +844,6 @@ fn set_nonblocking(fd: BorrowedFd<'_>) -> Result<()> {
     use nix::fcntl::{FcntlArg, OFlag, fcntl};
     fcntl(fd, FcntlArg::F_SETFL(OFlag::O_NONBLOCK)).context("fcntl O_NONBLOCK")?;
     Ok(())
-}
-
-/// Canonicalize the source paths of bind/overlay ops against the real root,
-/// before the pivot (bwrap's `resolve_symlinks_in_ops`): symlinks in the source
-/// are resolved, and a missing source fails early with `Can't find source path
-/// X` unless the op is a `-try` variant. Non-source ops pass through unchanged.
-fn resolve_symlinks_in_ops(ops: &[SetupOp]) -> Result<Vec<SetupOp>> {
-    ops.iter()
-        .map(|op| match op {
-            SetupOp::Bind {
-                src,
-                dest,
-                kind,
-                missing,
-            } => Ok(SetupOp::Bind {
-                src: resolve_source(src, *missing == OnMissing::Skip)?,
-                dest: dest.clone(),
-                kind: *kind,
-                missing: *missing,
-            }),
-            SetupOp::Overlay { lower, upper, dest } => {
-                // bubblewrap creates the overlay ops as upper (SETUP_OVERLAY_MOUNT),
-                // then workdir, then the --overlay-src list, and resolves them in
-                // that order — so resolve upper/work BEFORE the lower layers, or
-                // the *first* "Can't find source path" names a different directory
-                // than bubblewrap when more than one source is missing (#34).
-                let upper = match upper {
-                    OverlayUpper::Persistent { upper, work } => OverlayUpper::Persistent {
-                        upper: resolve_source(upper, false)?,
-                        work: resolve_source(work, false)?,
-                    },
-                    OverlayUpper::Tmp => OverlayUpper::Tmp,
-                    OverlayUpper::ReadOnly => OverlayUpper::ReadOnly,
-                };
-                let lower = lower
-                    .iter()
-                    .map(|l| resolve_source(l, false))
-                    .collect::<Result<Vec<_>>>()?;
-                Ok(SetupOp::Overlay {
-                    lower,
-                    upper,
-                    dest: dest.clone(),
-                })
-            }
-            SetupOp::BindFd { fd, .. } => {
-                // bwrap stores a bind-fd source as the string "/proc/self/fd/N"
-                // and realpaths it here like any other bind source (bubblewrap.c
-                // op->source = "/proc/self/fd/%d"), so a bad fd must fail *here*
-                // with the same "Can't find source path" message — not later with
-                // a readlink-specific one. Validate the magic link now.
-                let proc = format!("/proc/self/fd/{fd}");
-                std::fs::canonicalize(&proc).map_err(|e| Error::Sys {
-                    message: format!("Can't find source path {proc}").into(),
-                    errno: Errno::from_raw(e.raw_os_error().unwrap_or(0)),
-                })?;
-                Ok(op.clone())
-            }
-            other => Ok(other.clone()),
-        })
-        .collect()
-}
-
-/// `realpath(src)`: resolve symlinks and return the canonical path. A missing
-/// path yields `Can't find source path <src>` (with the errno), unless
-/// `allow_notexist` (a `-try` variant), which keeps the original.
-fn resolve_source(src: &HostPath, allow_notexist: bool) -> Result<HostPath> {
-    use std::os::unix::ffi::OsStrExt;
-    let path = std::ffi::OsStr::from_bytes(src.as_c_str().to_bytes());
-    match std::fs::canonicalize(path) {
-        Ok(p) => HostPath::parse("--bind", &p.to_string_lossy()),
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_notexist => Ok(src.clone()),
-        Err(e) => Err(Error::Sys {
-            message: format!("Can't find source path {}", src.as_str()).into(),
-            errno: Errno::from_raw(e.raw_os_error().unwrap_or(0)),
-        }),
-    }
 }
 
 // --- `--pidns` support: pass the real sandbox pid across pid namespaces ---
