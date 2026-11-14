@@ -5,8 +5,8 @@
 //! [`Outcome`]. Its only side effects go through an injected [`ParseHost`]:
 //! reading an `--args` file, and emitting warnings. Warnings are emitted
 //! immediately (not collected), so — like bwrap — a warning is printed even
-//! when parsing then fails with an error. The real host lives with the binary
-//! (module 11); tests supply a fake. This keeps the crate `forbid(unsafe)` and
+//! when parsing then fails with an error. The real host lives with the binary;
+//! tests supply a fake. This keeps the crate `forbid(unsafe)` and
 //! fully testable.
 //!
 //! What this crate does *not* do: the `main()` validation/resolution (that is

@@ -282,7 +282,7 @@ fn parent(
     setup_r: Option<OwnedFd>,
     fds: &mut FdTable,
 ) -> Result<i32> {
-    let ns_ids = namespace_ids_read(child, &resolved.namespaces)?;
+    let ns_ids = namespace_ids_read(child, &resolved.namespaces);
     // Optionally join a second user namespace (bwrap's `--userns2`).
     if let Some(fd) = config.userns2_fd {
         fds.register(fd);
@@ -633,7 +633,7 @@ fn child(
                 drop_privs(None, cap_used, is_root)?;
                 // Release the setup-finished write end (owned) before the fd
                 // walk closes its number, or its later drop would double-close
-                // (see the module-10 close_extra_fds caveat). pid 2 keeps its
+                // (see the close_extra_fds caveat). pid 2 keeps its
                 // own copy for the exec-side write.
                 drop(setup_w);
                 let mut keep: Vec<std::os::fd::RawFd> = Vec::new();
@@ -790,10 +790,12 @@ fn host_tty_dev() -> Option<Vec<u8>> {
 /// `stat(/proc/<pid>/ns/<name>).st_ino`, but ONLY for namespaces that were
 /// actually unshared (bwrap's `do_unshare` gate). The mount namespace is always
 /// unshared; a shared namespace's id stays 0 and is omitted from the output.
-fn namespace_ids_read(
-    pid: Pid,
-    ns: &crate::types::config::NamespaceConfig,
-) -> Result<NamespaceIds> {
+///
+/// Infallible by construction: a namespace whose `/proc/<pid>/ns/<name>` cannot
+/// be opened or stat'd reads as id 0 (bubblewrap instead aborts with `open
+/// /proc/<pid>/ns failed` — a near-unreachable path, since the child's ns links
+/// exist right after the clone; recorded as DIFFERENCES.md entry 11).
+fn namespace_ids_read(pid: Pid, ns: &crate::types::config::NamespaceConfig) -> NamespaceIds {
     let one = |name: &str| -> u64 {
         let path = format!("/proc/{}/ns/{name}", pid.as_raw());
         match open(
@@ -806,14 +808,14 @@ fn namespace_ids_read(
         }
     };
     let gated = |unshared: bool, name: &str| if unshared { one(name) } else { 0 };
-    Ok(NamespaceIds {
+    NamespaceIds {
         cgroup: gated(ns.cgroup == NsPolicy::Unshare, "cgroup"),
         ipc: gated(ns.ipc == NsPolicy::Unshare, "ipc"),
         mnt: one("mnt"), // the mount namespace is always unshared
         net: gated(ns.net == NsPolicy::Unshare, "net"),
         pid: gated(ns.pid == NsPolicy::Unshare, "pid"),
         uts: gated(ns.uts == NsPolicy::Unshare, "uts"),
-    })
+    }
 }
 
 /// A close-on-exec pipe returned as `(read, write)` owned fds.

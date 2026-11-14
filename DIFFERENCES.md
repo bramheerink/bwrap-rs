@@ -137,6 +137,14 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
     fails earlier at `readlink`.) Matching the stale errno reliably is tracked as
     an open fidelity gap.
 
+11. **[known limitation] A namespace id that cannot be read is reported as 0,
+    not fatal.** For `--info-fd`/`--json-status-fd`, the launcher stats
+    `/proc/<child>/ns/<name>` to report each unshared namespace's inode id. If a
+    stat fails, `bwrap-rs` reports `0` for that namespace; bubblewrap instead
+    aborts with `open /proc/<pid>/ns failed`. The child's namespace links exist
+    the moment after the clone, so this is near-unreachable in practice; matching
+    bubblewrap's abort on it is an open fidelity gap.
+
 ## Everything else
 
 Outside this list, any divergence from bubblewrap 0.13.1 is a bug. Please report
