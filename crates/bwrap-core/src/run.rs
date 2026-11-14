@@ -36,7 +36,7 @@ use crate::types::caps::CapOp;
 use crate::types::config::NsPolicy;
 use crate::types::op::{OnMissing, OverlayUpper};
 use crate::types::{CapSet, Config, HostPath, ResolvedConfig, SetupOp};
-use crate::userns::{IdMap, MapTarget, OverflowIds};
+use crate::userns::{IdMap, OverflowIds};
 
 /// Run the sandbox described by `config` (already resolved into `resolved`).
 /// Returns the exit code to propagate. `real_uid`/`real_gid` are the launcher's.
@@ -464,18 +464,21 @@ fn child(
     // run in command-line order inside `setup_newroot` (bwrap's
     // `SETUP_SET_HOSTNAME`), so an invalid earlier value fails where bwrap fails.
 
-    // Open a single O_PATH handle to the host /proc and read the kernel
-    // overflow ids up front, before any pivot — exactly as bwrap does. Both are
-    // needed again after the pivot (to write the second-level uid/gid map and,
-    // with --disable-userns, to lock userns), but the sandbox root may not mount
-    // /proc at all: `--dev` without `--proc` (as GNOME's glycin image loaders
-    // do) leaves no /proc behind. Reading or reopening /proc late would then
-    // fail and abort the sandbox. The O_PATH fd keeps the host procfs reachable
-    // via openat() across the pivot; every tests had `--proc /proc`, which is
-    // why this path went unseen.
+    // Open a single O_PATH handle to the host /proc up front, before any pivot —
+    // exactly as bwrap does. It is needed again after the pivot (to write the
+    // second-level uid/gid map and, with --disable-userns, to lock userns), but
+    // the sandbox root may not mount /proc at all: `--dev` without `--proc` (as
+    // GNOME's glycin image loaders do) leaves no /proc behind. Reading or
+    // reopening /proc late would then fail and abort the sandbox. The O_PATH fd
+    // keeps the host procfs reachable via openat() across the pivot; every test
+    // had `--proc /proc`, which is why this path went unseen.
     let proc_fd = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, NixMode::empty())
         .context("Can't open /proc")?;
-    let overflow = OverflowIds::read()?;
+    // Read the kernel overflow ids up front only for parity with bwrap, which
+    // dies early with "Can't read/parse /proc/sys/kernel/overflow{uid,gid}" if
+    // they are missing or zero. The value itself is no longer threaded anywhere
+    // (the single-entry id maps do not use it).
+    OverflowIds::read()?;
 
     // `--dev` mounts devpts, which needs the mounter to be root in the user
     // namespace. In that case we first map the real id to 0, then (after the
@@ -495,11 +498,9 @@ fn child(
             parent_uid: real_uid,
             sandbox_gid: ns_gid,
             parent_gid: real_gid,
-            overflow,
-            map_root: false,
             deny_groups: true,
         };
-        idmap.write(proc_fd.as_fd(), MapTarget::SelfProc)?;
+        idmap.write(proc_fd.as_fd())?;
     }
 
     let old_umask = nix::sys::stat::umask(NixMode::empty());
@@ -566,11 +567,9 @@ fn child(
             parent_uid: ns_uid,
             sandbox_gid: resolved.sandbox_gid,
             parent_gid: ns_gid,
-            overflow,
-            map_root: false,
             deny_groups: false,
         }
-        .write(proc_fd.as_fd(), MapTarget::SelfProc)?;
+        .write(proc_fd.as_fd())?;
     }
 
     if config.disable_userns || config.assert_userns_disabled {

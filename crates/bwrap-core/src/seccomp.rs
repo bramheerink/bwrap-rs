@@ -46,12 +46,13 @@ impl SeccompPrograms {
         Ok(Self { programs })
     }
 
-    /// Whether there is anything to apply.
+    /// Whether there is anything to apply. The production path applies
+    /// unconditionally; this is for callers and tests that inspect the set.
     pub fn is_empty(&self) -> bool {
         self.programs.is_empty()
     }
 
-    /// Number of programs.
+    /// Number of programs (used by the seccomp host test to count installs).
     pub fn len(&self) -> usize {
         self.programs.len()
     }

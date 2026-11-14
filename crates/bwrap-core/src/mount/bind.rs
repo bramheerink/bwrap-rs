@@ -145,7 +145,9 @@ fn open_opath(path: &[u8]) -> std::result::Result<OwnedFd, BindError> {
 }
 
 /// Bind-mount `src` onto `dest` (both host paths), then apply the attributes
-/// in `opts`. Opens both with `O_PATH` first, like bwrap's `bind_mount`.
+/// in `opts`. Opens both with `O_PATH` first, like bwrap's `bind_mount`. Part of
+/// the library bind API (the `bwrap` binary opens its own fds and uses
+/// [`bind_mount_fd`]).
 pub fn bind_mount(src: &[u8], dest: &[u8], opts: BindOptions) -> BindResult {
     let dest_fd = open_opath(dest)?;
     let src_fd = open_opath(src)?;

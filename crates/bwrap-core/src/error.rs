@@ -12,7 +12,7 @@ use std::borrow::Cow;
 use std::fmt;
 use std::io;
 
-use bwrap_sys::{ForkError, strerror};
+use bwrap_sys::strerror;
 use nix::errno::Errno;
 
 /// Result alias for bwrap-rs.
@@ -43,13 +43,6 @@ pub enum Error {
         /// The underlying error.
         source: io::Error,
     },
-    /// Forking or cloning failed.
-    Fork {
-        /// What we were doing.
-        message: Cow<'static, str>,
-        /// The underlying error.
-        source: ForkError,
-    },
     /// Invalid command line or configuration: `"<message>"` with no errno,
     /// as bwrap's `die (fmt, ...)`.
     Invalid(Cow<'static, str>),
@@ -65,22 +58,12 @@ impl Error {
         Self::Invalid(message.into())
     }
 
-    /// The process exit status bwrap uses for this error. bwrap's `die()`
-    /// always exits with 1.
-    pub fn exit_code(&self) -> i32 {
-        1
-    }
-
     /// The errno behind this error, if there is one.
     pub fn errno(&self) -> Option<Errno> {
         match self {
             Self::Sys { errno, .. } | Self::Mount { errno, .. } => Some(*errno),
             Self::Io { source, .. } => source.raw_os_error().map(Errno::from_raw),
-            Self::Fork {
-                source: ForkError::Sys(errno),
-                ..
-            } => Some(*errno),
-            Self::Fork { .. } | Self::Invalid(_) | Self::Usage => None,
+            Self::Invalid(_) | Self::Usage => None,
         }
     }
 }
@@ -106,7 +89,6 @@ impl fmt::Display for Error {
                 Some(code) => write!(f, "{message}: {}", strerror(Errno::from_raw(code))),
                 None => write!(f, "{message}: {source}"),
             },
-            Self::Fork { message, source } => write!(f, "{message}: {source}"),
             Self::Invalid(message) => f.write_str(message),
             // Not normally printed; the binary renders the usage text instead.
             Self::Usage => f.write_str("usage error"),
@@ -119,7 +101,6 @@ impl std::error::Error for Error {
         match self {
             Self::Sys { errno, .. } | Self::Mount { errno, .. } => Some(errno),
             Self::Io { source, .. } => Some(source),
-            Self::Fork { source, .. } => Some(source),
             Self::Invalid(_) | Self::Usage => None,
         }
     }
@@ -163,21 +144,6 @@ impl<T> Context<T> for io::Result<T> {
     }
 }
 
-impl<T> Context<T> for std::result::Result<T, ForkError> {
-    fn context(self, message: &'static str) -> Result<T> {
-        self.map_err(|source| Error::Fork {
-            message: message.into(),
-            source,
-        })
-    }
-    fn with_context<F: FnOnce() -> String>(self, f: F) -> Result<T> {
-        self.map_err(|source| Error::Fork {
-            message: f().into(),
-            source,
-        })
-    }
-}
-
 /// Like [`Context`], for the result of a mount-family syscall
 /// (bwrap's `die_with_mount_error`).
 pub trait MountContext<T> {
@@ -213,7 +179,6 @@ mod tests {
             .unwrap_err();
         assert_eq!(e.to_string(), "Can't mkdir /x: Permission denied");
         assert_eq!(e.errno(), Some(Errno::EACCES));
-        assert_eq!(e.exit_code(), 1);
     }
 
     #[test]
@@ -256,46 +221,8 @@ mod tests {
         assert_eq!(e.errno(), None);
     }
 
-    #[test]
-    fn fork_error_wraps() {
-        let e = Err::<(), _>(ForkError::MultiThreaded { threads: 3 })
-            .context("Can't fork for pid 1")
-            .unwrap_err();
-        assert_eq!(
-            e.to_string(),
-            "Can't fork for pid 1: refusing to fork a multi-threaded process (3 threads)"
-        );
-    }
-
     fn libc_enoent() -> i32 {
         Errno::ENOENT as i32
-    }
-
-    #[test]
-    fn every_variant_has_exit_code_one() {
-        let all = [
-            Error::Sys {
-                message: "m".into(),
-                errno: Errno::EIO,
-            },
-            Error::Mount {
-                message: "m".into(),
-                errno: Errno::EIO,
-            },
-            Error::Io {
-                message: "m".into(),
-                source: io::Error::other("x"),
-            },
-            Error::Fork {
-                message: "m".into(),
-                source: ForkError::Sys(Errno::EAGAIN),
-            },
-            Error::invalid("m"),
-            Error::Usage,
-        ];
-        for e in &all {
-            assert_eq!(e.exit_code(), 1, "{e:?}");
-        }
     }
 
     #[test]
@@ -310,16 +237,6 @@ mod tests {
             source: io::Error::other("x"),
         };
         assert_eq!(io_plain.errno(), None);
-        let fork_sys = Error::Fork {
-            message: "m".into(),
-            source: ForkError::Sys(Errno::EAGAIN),
-        };
-        assert_eq!(fork_sys.errno(), Some(Errno::EAGAIN));
-        let fork_other = Error::Fork {
-            message: "m".into(),
-            source: ForkError::MultiThreaded { threads: 2 },
-        };
-        assert_eq!(fork_other.errno(), None);
         let mount = Error::Mount {
             message: "m".into(),
             errno: Errno::EBUSY,
@@ -354,14 +271,6 @@ mod tests {
             source: io::Error::other("inner"),
         };
         assert_eq!(io.source().unwrap().to_string(), "inner");
-        let fork = Error::Fork {
-            message: "m".into(),
-            source: ForkError::Sys(Errno::EPERM),
-        };
-        assert_eq!(
-            fork.source().unwrap().to_string(),
-            "Operation not permitted"
-        );
     }
 
     #[test]
@@ -388,12 +297,7 @@ mod tests {
     }
 
     #[test]
-    fn context_on_fork_result_and_closures() {
-        let e = Err::<(), _>(ForkError::Sys(Errno::ENOMEM))
-            .with_context(|| format!("fork #{}", 2))
-            .unwrap_err();
-        assert_eq!(e.to_string(), "fork #2: Cannot allocate memory");
-        assert_eq!(e.errno(), Some(Errno::ENOMEM));
+    fn context_on_result_and_closures() {
         let e = Err::<(), _>(io::Error::from_raw_os_error(Errno::EROFS as i32))
             .with_context(|| "Can't write /x".to_owned())
             .unwrap_err();
@@ -428,6 +332,5 @@ mod tests {
             Ok::<_, io::Error>(9).with_context(|| "u".into()).unwrap(),
             9
         );
-        assert_eq!(Ok::<_, ForkError>(1).context("u").unwrap(), 1);
     }
 }

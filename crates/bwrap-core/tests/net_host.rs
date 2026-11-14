@@ -10,7 +10,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use bwrap_core::net::loopback_setup;
-use bwrap_core::userns::{IdMap, MapTarget, OverflowIds};
+use bwrap_core::userns::IdMap;
 use bwrap_sys::process::{ForkError, clone_into_namespaces};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
@@ -21,9 +21,6 @@ use nix::unistd::{ForkResult, Pid};
 
 fn child(real_uid: u32, real_gid: u32) -> i32 {
     // Complete the user namespace (map to 0) so we hold CAP_NET_ADMIN cleanly.
-    let Ok(overflow) = OverflowIds::read() else {
-        return 1;
-    };
     let Ok(proc_fd) = open(
         Path::new("/proc"),
         OFlag::O_PATH | OFlag::O_CLOEXEC,
@@ -36,11 +33,9 @@ fn child(real_uid: u32, real_gid: u32) -> i32 {
         parent_uid: real_uid,
         sandbox_gid: 0,
         parent_gid: real_gid,
-        overflow,
-        map_root: false,
         deny_groups: true,
     };
-    if idmap.write(proc_fd.as_fd(), MapTarget::SelfProc).is_err() {
+    if idmap.write(proc_fd.as_fd()).is_err() {
         return 3;
     }
 

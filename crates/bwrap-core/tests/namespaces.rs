@@ -15,12 +15,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use bwrap_core::caps::{
-    cap_last_cap, drop_all_bounding_set, drop_all_caps, drop_bounding_set, has_caps,
-    initial_requested, set_ambient,
+    cap_last_cap, drop_all_caps, drop_bounding_set, has_caps, initial_requested, set_ambient,
 };
 use bwrap_core::fs::{NodeType, ensure_newroot_parents, ensure_node_at};
 use bwrap_core::types::{CapSet, Capability};
-use bwrap_core::userns::{IdMap, MapTarget, OverflowIds, disable_user_namespaces};
+use bwrap_core::userns::{IdMap, disable_user_namespaces};
 use bwrap_sys::ForkError;
 use bwrap_sys::caps::{bounding_set_contains, capget};
 use bwrap_sys::process::clone_into_namespaces;
@@ -70,10 +69,6 @@ fn proc_fd() -> std::os::fd::OwnedFd {
     open("/proc", OFlag::O_PATH | OFlag::O_DIRECTORY, Mode::empty()).unwrap()
 }
 
-fn overflow() -> OverflowIds {
-    OverflowIds::read().unwrap()
-}
-
 /// Fields of the single line of a `/proc/self/{uid,gid}_map` file.
 fn map_fields(name: &str) -> Vec<u64> {
     fs::read_to_string(format!("/proc/self/{name}"))
@@ -103,12 +98,9 @@ fn test_id_map_keeps_ids() -> Outcome {
             parent_uid: uid,
             sandbox_gid: gid,
             parent_gid: gid,
-            overflow: overflow(),
-            map_root: false,
             deny_groups: true,
         };
-        map.write(proc_fd().as_fd(), MapTarget::SelfProc)
-            .map_err(|e| e.to_string())?;
+        map.write(proc_fd().as_fd()).map_err(|e| e.to_string())?;
         let u = map_fields("uid_map");
         let g = map_fields("gid_map");
         ensure(u == [u64::from(uid), u64::from(uid), 1], || {
@@ -133,12 +125,9 @@ fn test_id_map_to_root() -> Outcome {
             parent_uid: uid,
             sandbox_gid: 0,
             parent_gid: gid,
-            overflow: overflow(),
-            map_root: true, // ignored: sandbox id is 0
             deny_groups: true,
         };
-        map.write(proc_fd().as_fd(), MapTarget::SelfProc)
-            .map_err(|e| e.to_string())?;
+        map.write(proc_fd().as_fd()).map_err(|e| e.to_string())?;
         ensure(
             getuid().is_root()
                 && geteuid().is_root()
@@ -161,11 +150,9 @@ fn test_id_map_requires_setgroups_deny() -> Outcome {
             parent_uid: uid,
             sandbox_gid: gid,
             parent_gid: gid,
-            overflow: overflow(),
-            map_root: false,
             deny_groups: false,
         };
-        let r = map.write(proc_fd().as_fd(), MapTarget::SelfProc);
+        let r = map.write(proc_fd().as_fd());
         match r {
             Err(e) if e.to_string() == "setting up gid map: Operation not permitted" => {
                 // The uid map, written first, did take effect.
@@ -177,53 +164,6 @@ fn test_id_map_requires_setgroups_deny() -> Outcome {
             other => Err(format!("expected gid_map EPERM, got {other:?}")),
         }
     })
-}
-
-fn test_id_map_by_pid_from_parent() -> Outcome {
-    // The parent writes the child's maps, as bwrap does for --unshare-user.
-    use nix::unistd::Pid;
-    let (uid, gid) = (getuid().as_raw(), getgid().as_raw());
-    let (rd, wr) = nix::unistd::pipe().unwrap();
-    match clone_into_namespaces(CloneFlags::CLONE_NEWUSER | CloneFlags::CLONE_NEWNS) {
-        Ok(ForkResult::Child) => {
-            drop(wr);
-            // Wait for the parent to finish the maps.
-            let mut b = [0u8; 1];
-            let _ = nix::unistd::read(&rd, &mut b);
-            let u = map_fields("uid_map");
-            let ok = u == [u64::from(uid) + 1, u64::from(uid), 1]
-                && fs::read_to_string("/proc/self/setgroups").unwrap() == "deny\n"
-                && getuid().as_raw() == uid + 1
-                && getgid().as_raw() == gid + 1;
-            std::process::exit(i32::from(!ok));
-        }
-        Ok(ForkResult::Parent { child }) => {
-            drop(rd);
-            let map = IdMap {
-                sandbox_uid: uid + 1,
-                parent_uid: uid,
-                sandbox_gid: gid + 1,
-                parent_gid: gid,
-                overflow: overflow(),
-                map_root: false,
-                deny_groups: true,
-            };
-            let res = map.write(
-                proc_fd().as_fd(),
-                MapTarget::Pid(Pid::from_raw(child.as_raw())),
-            );
-            let _ = nix::unistd::write(&wr, b"x");
-            let status = waitpid(child, None);
-            match (res, status) {
-                (Ok(()), Ok(WaitStatus::Exited(_, 0))) => Outcome::Pass,
-                (res, status) => Outcome::Fail(format!("write {res:?}, child {status:?}")),
-            }
-        }
-        Err(ForkError::Sys(Errno::EPERM | Errno::ENOSPC | Errno::EINVAL | Errno::EUSERS)) => {
-            Outcome::Skip("clone(CLONE_NEWUSER) not permitted here".into())
-        }
-        Err(e) => Outcome::Fail(format!("clone: {e}")),
-    }
 }
 
 fn test_disable_userns_is_per_namespace() -> Outcome {
@@ -331,7 +271,8 @@ fn test_caps_policy() -> Outcome {
 
 fn test_caps_drop_all() -> Outcome {
     in_userns(|| {
-        drop_all_bounding_set().map_err(|e| e.to_string())?;
+        // Dropping the whole bounding set is drop_bounding_set with an empty keep.
+        drop_bounding_set(CapSet::EMPTY).map_err(|e| e.to_string())?;
         for n in 0..=cap_last_cap() {
             ensure(bounding_set_contains(u32::from(n)) == Ok(false), || {
                 format!("cap {n} still bounded")
@@ -453,10 +394,6 @@ fn main() -> ExitCode {
         (
             "userns::IdMap::write needs setgroups=deny",
             test_id_map_requires_setgroups_deny,
-        ),
-        (
-            "userns::IdMap::write by pid from parent",
-            test_id_map_by_pid_from_parent,
         ),
         (
             "userns::disable_user_namespaces per-namespace",
