@@ -14,8 +14,8 @@ binary used as an oracle. See:
   why memory safety does not prevent logic-level sandbox escapes.
 - [DIFFERENCES.md](DIFFERENCES.md) — the divergence register: every deliberate
   deviation and every deliberately-replicated C quirk.
-- [ROADMAP.md](ROADMAP.md) — priorities (differential fuzzing next), with
-  now/later/skip verdicts.
+- [ROADMAP.md](ROADMAP.md) — priorities, with now/later/skip verdicts.
+- [CHANGELOG.md](CHANGELOG.md) — what changed in each release.
 
 ## Build
 

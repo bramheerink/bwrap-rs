@@ -163,6 +163,12 @@ our differential conformance oracle. Concrete items it yields:
 ## Release discipline
 
 No release ships until CI is fully green *and* the two untrusted-input paths are
-fuzzed. A new alpha (`v0.1.3-alpha`) follows the current merged work once those
-hold; tagging `v*` triggers the release job (version==tag check, build with the
-embedded git-sha marker, sha256 upload).
+fuzzed. Tagging `v*` triggers the release job (version==tag check, build with
+the embedded git-sha marker, sha256 upload).
+
+- `v0.1.3-alpha` — first tagged alpha (parser + sandbox core, oracle harness,
+  fuzz + mutation legs, supply-chain CI).
+- `v0.1.4-alpha` — the architecture-review + hardening milestone (ordered
+  op-spine, `ResolvedOps`, `--die-with-parent` race fix, non-UTF-8 arguments,
+  the differential fuzzer, and conformance that observes isolation properties).
+  See [CHANGELOG.md](CHANGELOG.md).
