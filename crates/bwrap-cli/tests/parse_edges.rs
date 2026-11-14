@@ -357,7 +357,10 @@ fn overlay_rules() {
                 "sources are consumed by each overlay"
             );
             assert_eq!(s(l3), ["/l5"]);
-            assert_eq!((&*d1.as_str(), &*d2.as_str(), &*d3.as_str()), ("/t", "/r", "/p"));
+            assert_eq!(
+                (&*d1.as_str(), &*d2.as_str(), &*d3.as_str()),
+                ("/t", "/r", "/p")
+            );
             assert_eq!((&*upper.as_str(), &*work.as_str()), ("/up", "/work"));
         }
         other => panic!("{other:?}"),

@@ -275,10 +275,7 @@ mod tests {
             "1000 1001 1\n"
         );
         // deny_groups == false: setgroups is left alone.
-        assert_eq!(
-            fs::read_to_string(me.join("setgroups")).unwrap(),
-            "allow\n"
-        );
+        assert_eq!(fs::read_to_string(me.join("setgroups")).unwrap(), "allow\n");
         let _ = fs::remove_dir_all(&proc);
     }
 
@@ -407,7 +404,6 @@ mod tests {
         );
         let _ = fs::remove_dir_all(&proc);
     }
-
 
     #[test]
     fn probe_unprivileged_disabled_matches_files() {

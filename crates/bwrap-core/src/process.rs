@@ -235,7 +235,10 @@ pub fn handle_die_with_parent(die_with_parent: bool, expected_parent: Pid) -> Re
 /// namespace is discarded), but exiting tears the namespace down and so kills the
 /// command; and this runs before `exec`, so for a non-init process the command
 /// simply never starts. The launcher is already gone, so the exit status is moot.
-pub fn handle_die_with_parent_fd(die_with_parent: bool, launcher: Option<BorrowedFd<'_>>) -> Result<()> {
+pub fn handle_die_with_parent_fd(
+    die_with_parent: bool,
+    launcher: Option<BorrowedFd<'_>>,
+) -> Result<()> {
     if die_with_parent {
         set_pdeathsig(Signal::SIGKILL).context("prctl")?;
         if let Some(launcher) = launcher {

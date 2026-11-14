@@ -403,9 +403,11 @@ impl Parser<'_> {
                 // the context is then inherited across the clone. A setfscreatecon
                 // failure is reported as C's `--file-label setup failed`.
                 bwrap_core::selinux::die_unless_label_valid(&rest[1])?;
-                bwrap_core::selinux::label_create_file(Some(rest[1].as_os_str())).map_err(|e| Error::Sys {
-                    message: "--file-label setup failed".into(),
-                    errno: e.errno().unwrap_or(nix::errno::Errno::EINVAL),
+                bwrap_core::selinux::label_create_file(Some(rest[1].as_os_str())).map_err(|e| {
+                    Error::Sys {
+                        message: "--file-label setup failed".into(),
+                        errno: e.errno().unwrap_or(nix::errno::Errno::EINVAL),
+                    }
                 })?;
                 self.cfg.file_label = Some(rest[1].clone());
                 Ok(1)
@@ -882,7 +884,9 @@ mod tests {
         );
         // One past u64::MAX is ERANGE, which bwrap reports as "non-zero".
         assert_eq!(
-            parse_size(OsStr::new("18446744073709551616")).unwrap_err().to_string(),
+            parse_size(OsStr::new("18446744073709551616"))
+                .unwrap_err()
+                .to_string(),
             "--size takes a non-zero number of bytes"
         );
     }
@@ -952,7 +956,12 @@ mod tests {
                 "parse_octal {:?}",
                 r.input
             );
-            assert_eq!(parse_size(OsStr::new(r.input)).ok(), r.size, "parse_size {:?}", r.input);
+            assert_eq!(
+                parse_size(OsStr::new(r.input)).ok(),
+                r.size,
+                "parse_size {:?}",
+                r.input
+            );
         }
     }
 }

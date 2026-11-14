@@ -27,8 +27,7 @@ use crate::error::{Context, Error, Result};
 use crate::privs::{acquire_privs, drop_privs, switch_to_user_with_privs};
 use crate::process::{
     NamespaceIds, block_sigchild, do_init, handle_die_with_parent, handle_die_with_parent_fd,
-    monitor_child, unblock_sigchild,
-    write_all,
+    monitor_child, unblock_sigchild, write_all,
 };
 use crate::seccomp::SeccompPrograms;
 use crate::setup::{NewrootCtx, pivot_into_newroot};

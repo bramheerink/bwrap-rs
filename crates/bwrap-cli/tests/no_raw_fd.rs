@@ -22,7 +22,12 @@ fn scan_dir(dir: &Path, hits: &mut Vec<String>) {
             for (lineno, line) in text.lines().enumerate() {
                 for tok in FORBIDDEN {
                     if line.contains(tok) {
-                        hits.push(format!("{}:{}: {}", path.display(), lineno + 1, line.trim()));
+                        hits.push(format!(
+                            "{}:{}: {}",
+                            path.display(),
+                            lineno + 1,
+                            line.trim()
+                        ));
                     }
                 }
             }

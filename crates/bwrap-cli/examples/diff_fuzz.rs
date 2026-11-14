@@ -63,14 +63,42 @@ impl Rng {
 // clean EBADF.
 const FD: &[&str] = &["3", "7", "9", "99", "2147483647", "-1", "abc", ""];
 const UINT: &[&str] = &[
-    "0", "1", "1000", "65534", "4294967295", "99999999999", "-1", "0x10", "abc", "",
-];
-const OCTAL: &[&str] = &["0", "700", "0755", "1777", "7777", "10000", "8", "0x20", "zzz", ""];
-const CAP: &[&str] = &[
-    "CAP_SYS_ADMIN", "cap_net_raw", "CAP_CHECKPOINT_RESTORE", "CAP_BOGUS", "21", "0", "999", "ALL",
+    "0",
+    "1",
+    "1000",
+    "65534",
+    "4294967295",
+    "99999999999",
+    "-1",
+    "0x10",
+    "abc",
     "",
 ];
-const PATH: &[&str] = &["/", "/usr", "/etc", "/nonexistent", "/tmp", "x", "..", "/a/b", ""];
+const OCTAL: &[&str] = &[
+    "0", "700", "0755", "1777", "7777", "10000", "8", "0x20", "zzz", "",
+];
+const CAP: &[&str] = &[
+    "CAP_SYS_ADMIN",
+    "cap_net_raw",
+    "CAP_CHECKPOINT_RESTORE",
+    "CAP_BOGUS",
+    "21",
+    "0",
+    "999",
+    "ALL",
+    "",
+];
+const PATH: &[&str] = &[
+    "/",
+    "/usr",
+    "/etc",
+    "/nonexistent",
+    "/tmp",
+    "x",
+    "..",
+    "/a/b",
+    "",
+];
 const STR: &[&str] = &["x", "", "a b", "ZZZ", "sandbox", "box.example"];
 
 /// The argument "shape" of an option: how many values of which pool it takes.
@@ -207,7 +235,9 @@ fn run(bin: &str, argv: &[String], outp: &Path, errp: &Path) -> Run {
     match status {
         Ok(s) => {
             let code = s.code().unwrap_or(-1);
-            let read = |p: &Path| String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned();
+            let read = |p: &Path| {
+                String::from_utf8_lossy(&std::fs::read(p).unwrap_or_default()).into_owned()
+            };
             Run {
                 code,
                 out: read(outp),
@@ -230,7 +260,10 @@ fn main() -> std::process::ExitCode {
     };
     let mut args = std::env::args().skip(1);
     let iters: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(20_000);
-    let seed: u64 = args.next().and_then(|s| s.parse().ok()).unwrap_or(0x1234_5678);
+    let seed: u64 = args
+        .next()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0x1234_5678);
 
     // Normalise the two binary paths (which appear in usage lines) to one token
     // so only genuine differences remain.
@@ -273,7 +306,9 @@ fn main() -> std::process::ExitCode {
             }
         }
     }
-    eprintln!("\ndiff_fuzz: {ran} compared, {skipped} skipped (timeout/spawn), {diffs} divergences");
+    eprintln!(
+        "\ndiff_fuzz: {ran} compared, {skipped} skipped (timeout/spawn), {diffs} divergences"
+    );
     if diffs > 0 {
         std::process::ExitCode::from(1)
     } else {
