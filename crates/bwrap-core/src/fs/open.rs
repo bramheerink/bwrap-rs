@@ -20,7 +20,9 @@ use nix::unistd::dup;
 
 use super::resolve::chroot_realpath;
 
-fn cstr(bytes: &[u8]) -> nix::Result<CString> {
+/// Bytes to `CString`, mapping an embedded NUL to `EINVAL`. Shared across the
+/// `fs` submodules (one definition instead of a copy per file).
+pub(crate) fn cstr(bytes: &[u8]) -> nix::Result<CString> {
     CString::new(bytes).map_err(|_| Errno::EINVAL)
 }
 
@@ -116,8 +118,7 @@ fn check_fd_under_path(fd: BorrowedFd<'_>, rootfs: &[u8]) -> nix::Result<()> {
 }
 
 fn readlink_fd(fd: BorrowedFd<'_>) -> nix::Result<std::ffi::OsString> {
-    let proc_path = format!("/proc/self/fd/{}", fd.as_raw_fd());
-    readlink(proc_path.as_str())
+    readlink(proc_self_fd(fd).as_str())
 }
 
 /// Pre-5.6 fallback (bwrap's `safe_openat_fallback`): resolve with
