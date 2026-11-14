@@ -494,6 +494,39 @@ ab  new-session-setsid -- "${BASE[@]}" --new-session /bin/sh -c 'read -r a b c d
 abx umask-preserved  "( umask 027; %B $B /bin/sh -c umask )"
 ab  die-with-parent  -- "${BASE[@]}" --die-with-parent /bin/true
 ab  not-a-boundary   -- "${BASE[@]}" --not-a-security-boundary /bin/true
+# --die-with-parent must leave no sandbox behind when the launcher is killed
+# during setup, even with --unshare-pid (where getppid() is 0 and the old pid
+# guard was vacuous — #32). Ours-only: this closes a race bubblewrap has, so it
+# is not an A/B case. Kill the launcher at a random 0-5ms into setup and require
+# that no process carrying a per-trial marker survives 0.4s later. A regression
+# that reopens the race leaves pid-1/command survivors. Needs user namespaces.
+dwp_survivors() {   # echoes how many of N launches left a survivor
+    local n=0 i p pp surv tag
+    for i in $(seq 1 10); do
+        tag="DWPREG_$$_$i"
+        env "$tag=1" "$OURS" --ro-bind / / --unshare-pid --die-with-parent sleep 30 \
+            </dev/null >/dev/null 2>&1 &
+        p=$!
+        sleep "0.00$((RANDOM % 6))"
+        kill -9 "$p" 2>/dev/null; wait "$p" 2>/dev/null
+        sleep 0.4
+        surv=0
+        for pp in $(ls /proc 2>/dev/null | grep -E '^[0-9]+$'); do
+            if grep -qz "$tag=1" "/proc/$pp/environ" 2>/dev/null; then
+                surv=1; kill -9 "$pp" 2>/dev/null
+            fi
+        done
+        n=$((n + surv))
+    done
+    echo "$n"
+}
+if [ "$REQUIRE_USERNS" = 1 ] || "$OURS" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
+    dwp_left=$(dwp_survivors)
+    if [ "$dwp_left" = 0 ]; then ok die-with-parent-kills
+    else fail die-with-parent-kills "$dwp_left/10 launches left a sandbox after launcher SIGKILL"; fi
+else
+    skip die-with-parent-kills "user namespaces unavailable"
+fi
 
 # === overlayfs (oracle decides; both fail identically if kernel lacks it) =
 ab0 ro-overlay       -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --overlay-src "$WORK/ov/low2" --ro-overlay /ov /bin/sh -c 'cat /ov/f /ov/g; touch /ov/x 2>&1; echo e=$?'

@@ -43,16 +43,22 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
    clear error (`Invalid seccomp data, must not be empty` /
    `… instructions is too many`). A valid filter behaves identically in both.
 
-2. **[safer divergence — limited] `--die-with-parent` also guards the "parent
-   already exited" race, but only without a new pid namespace.** Both set
-   `PR_SET_PDEATHSIG`. In addition, without `--unshare-pid`, if the parent has
-   already changed by the time the signal is armed (the race in bubblewrap issue
-   #700), `bwrap-rs` terminates itself rather than continue reparented. **Known
-   gap:** with `--unshare-pid` (pid 1 of a new pid namespace always sees
-   `getppid() == 0`) this extra guard does not currently fire, so there the
-   behaviour is the same as bubblewrap's; `PR_SET_PDEATHSIG` still applies as in
-   C. Making the guard work under a pid namespace (via the handshake fd) is
-   tracked in issue #32.
+2. **[safer divergence] `--die-with-parent` also guards the "parent already
+   exited" race, inside a new pid namespace too.** Both set `PR_SET_PDEATHSIG`,
+   which only fires on a *future* parent death. In addition, `bwrap-rs` closes the
+   race where the launcher dies between the clone and the signal being armed (the
+   hole in bubblewrap issue #700): without a new pid namespace it compares
+   `getppid()`; with `--unshare-pid` — where pid 1 always sees `getppid() == 0`,
+   so a pid check is useless — it instead peeks the launcher handshake socket for
+   EOF, which the kernel reports exactly when the launcher dies. On detection the
+   sandbox terminates (pid 1 `_exit`s, tearing the namespace down, since a
+   namespace's pid 1 cannot SIGKILL itself) rather than continue unmonitored. In
+   normal operation this is a no-op. **Footprint:** under `--die-with-parent` the
+   launcher's handshake socket is held open through setup — one fd more than
+   bubblewrap — which can shift the numbers of setup-opened fds that appear in an
+   error message (e.g. overlapping `--overlay-src` paths shown as
+   `/proc/self/fd/N`). Without `--die-with-parent` no such fd is held and the
+   numbering is byte-identical.
 
 3. **[equivalent by design] `CAP_LAST_CAP` is probed at runtime.** `bwrap-rs`
    asks the running kernel for its highest capability via `PR_CAPBSET_READ`,

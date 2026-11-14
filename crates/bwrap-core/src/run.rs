@@ -26,7 +26,8 @@ use crate::caps::{drop_bounding_set, set_ambient};
 use crate::error::{Context, Error, Result};
 use crate::privs::{acquire_privs, drop_privs, switch_to_user_with_privs};
 use crate::process::{
-    NamespaceIds, block_sigchild, do_init, handle_die_with_parent, monitor_child, unblock_sigchild,
+    NamespaceIds, block_sigchild, do_init, handle_die_with_parent, handle_die_with_parent_fd,
+    monitor_child, unblock_sigchild,
     write_all,
 };
 use crate::seccomp::SeccompPrograms;
@@ -343,7 +344,16 @@ fn parent(
         &1u64.to_ne_bytes(),
         nix::sys::socket::MsgFlags::MSG_NOSIGNAL,
     );
-    drop(cw_w);
+    // Under --die-with-parent, keep `cw_w` open for the launcher's whole life so
+    // the sandbox sees EOF on its end the instant the launcher dies during setup
+    // (#32); otherwise drop it now, exactly as before — holding it would occupy an
+    // fd slot C does not and shift the sandbox's observable fd numbering.
+    let die_fd = if config.die_with_parent {
+        Some(cw_w.as_fd())
+    } else {
+        drop(cw_w);
+        None
+    };
 
     let json = if let Some(fd) = config.json_status_fd {
         fds.register(fd);
@@ -356,6 +366,7 @@ fn parent(
         child,
         setup_r.as_ref().map(AsFd::as_fd),
         json,
+        die_fd,
     )
 }
 
@@ -420,10 +431,18 @@ fn child(
     if !launcher_ready {
         bwrap_sys::process::exit_immediately(1);
     }
-    drop(cw_r);
-    // The launcher is alive here (it just signalled us), so this is the valid
-    // parent for die-with-parent.
-    let mut exec_parent = nix::unistd::getppid();
+    // Under --die-with-parent keep `cw_r` (the launcher handshake socket) open so
+    // the guard can peek it for EOF — detecting a launcher that dies during setup,
+    // where getppid() is 0 inside a new pid namespace and the old pid check was
+    // vacuous (#32). Otherwise drop it now, exactly as before: holding it would
+    // occupy an fd slot C does not and shift the sandbox's observable fd numbering.
+    // It is CLOEXEC, so it never reaches the exec'd command either way.
+    let cw_r = if config.die_with_parent {
+        Some(cw_r)
+    } else {
+        drop(cw_r);
+        None
+    };
 
     let sp = crate::profile::span("child.switch_user");
     switch_to_user_with_privs(
@@ -628,6 +647,12 @@ fn child(
                 // after: bwrap closes proc_fd in pid 1 too, so the sandbox keeps
                 // no descriptor pointing at the host /proc.
                 keep.push(proc_fd.as_raw_fd());
+                // Keep the launcher handshake socket (if held) out of the walk:
+                // do_init peeks it for the die-with-parent EOF check (pid 1's
+                // getppid() is 0, so a pid check there is vacuous).
+                if let Some(fd) = cw_r.as_ref() {
+                    keep.push(fd.as_raw_fd());
+                }
                 bwrap_sys::process::close_extra_fds(proc_fd.as_fd(), &keep).context("fdwalk")?;
                 drop(proc_fd);
                 return do_init(
@@ -636,11 +661,12 @@ fn child(
                     &config.lock_files,
                     &seccomp,
                     config.die_with_parent,
+                    cw_r.as_ref().map(AsFd::as_fd),
                 );
             }
             Ok(nix::unistd::ForkResult::Child) => {
-                // pid 2: our parent is now pid 1, not the launcher.
-                exec_parent = nix::unistd::getppid();
+                // pid 2: fall through to exec. die-with-parent is keyed on the
+                // launcher handshake socket (cw_r), not getppid().
             }
             Err(e) => return Err(Error::invalid(format!("Can't fork for pid 1: {e}"))),
         }
@@ -656,7 +682,10 @@ fn child(
     }
 
     unblock_sigchild()?;
-    handle_die_with_parent(config.die_with_parent, exec_parent)?;
+    handle_die_with_parent_fd(config.die_with_parent, cw_r.as_ref().map(AsFd::as_fd))?;
+    // The handshake socket's one-shot check is done; close it before exec so the
+    // command never inherits it (it is CLOEXEC too, but be explicit).
+    drop(cw_r);
     // Apply the SELinux exec context (bwrap's label_exec) before exec.
     if let Err(e) = crate::selinux::label_exec(config.exec_label.as_deref()) {
         let errno = e.errno().unwrap_or(Errno::EINVAL);
