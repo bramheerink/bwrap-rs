@@ -5,6 +5,7 @@
 //! variant that carries only its own data, so an impossible combination (a
 //! symlink with a `perms`, a tmpfs with a source fd) cannot be represented.
 
+use std::ffi::OsString;
 use std::os::fd::RawFd;
 
 use super::path::{HostPath, SandboxPath};
@@ -217,7 +218,7 @@ pub enum SetupOp {
     SetHostname {
         /// The requested hostname, stored verbatim (bwrap passes it to
         /// `sethostname` unchecked).
-        name: String,
+        name: OsString,
     },
 }
 

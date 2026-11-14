@@ -9,6 +9,7 @@
 //! Everything here is pure given its inputs (`real_uid`, `real_gid`, and a
 //! [`UsernsProbe`]), so it is fully testable without privileges.
 
+use std::ffi::OsString;
 use std::os::fd::RawFd;
 
 use super::caps::CapOp;
@@ -26,14 +27,14 @@ pub enum EnvOp {
     /// `--setenv NAME VALUE`.
     Set {
         /// Variable name.
-        name: String,
+        name: OsString,
         /// Value.
-        value: String,
+        value: OsString,
     },
     /// `--unsetenv NAME`.
     Unset {
         /// Variable name.
-        name: String,
+        name: OsString,
     },
 }
 
@@ -133,7 +134,7 @@ pub struct Config {
     // Identity. `None` is bwrap's (uid_t)-1 sentinel ("not given").
     pub sandbox_uid: Option<u32>,
     pub sandbox_gid: Option<u32>,
-    pub hostname: Option<String>,
+    pub hostname: Option<OsString>,
 
     // Process behaviour.
     pub as_pid_1: bool,
@@ -161,19 +162,19 @@ pub struct Config {
     /// `--clearenv`/`--setenv`/`--unsetenv`, in order.
     pub env_ops: Vec<EnvOp>,
     /// `--chdir` target (a path inside the sandbox).
-    pub chdir: Option<String>,
+    pub chdir: Option<OsString>,
     /// `--argv0` override.
-    pub argv0: Option<String>,
+    pub argv0: Option<OsString>,
     /// `--exec-label` (SELinux exec context).
-    pub exec_label: Option<String>,
+    pub exec_label: Option<OsString>,
     /// `--file-label` (SELinux file context).
-    pub file_label: Option<String>,
+    pub file_label: Option<OsString>,
     /// `--not-a-security-boundary`.
     pub not_a_security_boundary: bool,
     /// Seccomp source (`--seccomp` / `--add-seccomp-fd`).
     pub seccomp: SeccompSource,
     /// The command and its arguments (everything after the options).
-    pub command: Vec<String>,
+    pub command: Vec<OsString>,
 
     // Debug hooks (`--debug-opt=`), used by the upstream test suite.
     /// Force the `openat2` → manual-resolver fallback.
@@ -346,7 +347,7 @@ mod tests {
     /// the post-resolution checks are reached.
     fn base() -> Config {
         Config {
-            command: vec!["true".to_string()],
+            command: vec![OsString::from("true")],
             ..Config::default()
         }
     }

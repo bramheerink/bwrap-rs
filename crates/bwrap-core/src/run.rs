@@ -509,7 +509,14 @@ fn child(
         have_pidns_fd: config.pidns_fd.is_some(),
         not_a_security_boundary: config.not_a_security_boundary,
         host_tty_dev: host_tty.clone(),
-        file_label: config.file_label.clone(),
+        // A non-UTF-8 --file-label is unreachable here: die_unless_label_valid
+        // rejects it at parse time (SELinux on → context write fails; off →
+        // "labeling not supported"), so the lossy branch is dead and the
+        // mount-option rendering stays byte-exact for every value that reaches it.
+        file_label: config
+            .file_label
+            .as_ref()
+            .map(|s| s.to_string_lossy().into_owned()),
     };
     // Resolve symlinks in the op sources against the real root before pivoting
     // (and fail early on a missing source with the right message). The resulting
@@ -689,7 +696,7 @@ fn child(
     if let Err(e) = crate::selinux::label_exec(config.exec_label.as_deref()) {
         let errno = e.errno().unwrap_or(Errno::EINVAL);
         return Err(Error::Sys {
-            message: format!("label_exec {}", config.command[0]).into(),
+            message: format!("label_exec {}", config.command[0].to_string_lossy()).into(),
             errno,
         });
     }
@@ -961,6 +968,7 @@ fn read_all_fd(fd: std::os::fd::RawFd, fds: &mut FdTable) -> Result<Vec<u8>> {
 fn apply_env_ops(ops: &[crate::types::config::EnvOp]) -> Result<()> {
     use crate::types::config::EnvOp;
     use bwrap_sys::process::EnvOp as SysOp;
+    use std::os::unix::ffi::OsStrExt;
     let mut sys_ops: Vec<SysOp> = Vec::with_capacity(ops.len());
     for op in ops {
         match op {
@@ -998,7 +1006,8 @@ fn env_apply(ops: &[bwrap_sys::process::EnvOp]) -> Result<()> {
 fn compute_cwd(config: &Config, old_cwd: Option<&std::path::Path>) -> Result<Vec<u8>> {
     use std::os::unix::ffi::OsStrExt;
     if let Some(dir) = &config.chdir {
-        chdir(dir.as_str()).with_context(|| format!("Can't chdir to {dir}"))?;
+        chdir(dir.as_os_str())
+            .with_context(|| format!("Can't chdir to {}", dir.to_string_lossy()))?;
         return Ok(dir.as_bytes().to_vec());
     }
     // chdir to the old cwd if we captured one and it is reachable in the sandbox;
@@ -1034,11 +1043,12 @@ fn compute_cwd(config: &Config, old_cwd: Option<&std::path::Path>) -> Result<Vec
 fn exec_command(config: &Config) -> Result<i32> {
     let exec_path = CString::new(config.command[0].as_bytes())
         .map_err(|_| Error::invalid("command contains a NUL byte"))?;
+    use std::os::unix::ffi::OsStrExt;
     let mut argv: Vec<CString> = Vec::with_capacity(config.command.len());
     let argv0 = config
         .argv0
         .as_deref()
-        .unwrap_or(config.command[0].as_str());
+        .unwrap_or(config.command[0].as_os_str());
     argv.push(CString::new(argv0.as_bytes()).map_err(|_| Error::invalid("argv0 NUL"))?);
     for a in &config.command[1..] {
         argv.push(CString::new(a.as_bytes()).map_err(|_| Error::invalid("arg NUL"))?);
@@ -1049,7 +1059,7 @@ fn exec_command(config: &Config) -> Result<i32> {
     match execvp(&exec_path, &argv) {
         Ok(_) => unreachable!("execvp returns only on error"),
         Err(e) => Err(Error::Sys {
-            message: format!("execvp {}", config.command[0]).into(),
+            message: format!("execvp {}", config.command[0].to_string_lossy()).into(),
             errno: e,
         }),
     }

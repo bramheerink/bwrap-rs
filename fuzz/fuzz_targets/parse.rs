@@ -6,7 +6,9 @@
 
 use bwrap_cli::{ParseHost, parse};
 use libfuzzer_sys::fuzz_target;
+use std::ffi::OsString;
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 
 /// A host that never touches real descriptors: `--args`/`--add-seccomp-fd` reads
 /// fail (exercising the parser's error path without needing live fds) and
@@ -24,12 +26,12 @@ impl ParseHost for FuzzHost {
 }
 
 fuzz_target!(|data: &[u8]| {
-    // Split the raw input into NUL-separated arguments, each lossily decoded to a
-    // valid UTF-8 String — `main` rejects non-UTF-8 argv before `parse`, so the
-    // parser only ever sees valid UTF-8.
-    let args: Vec<String> = data
+    // Split the raw input into NUL-separated arguments, each kept as raw bytes.
+    // `main` now passes argv through as `OsString` (arbitrary bytes), so the
+    // parser must survive non-UTF-8 tokens too — this feeds them verbatim.
+    let args: Vec<OsString> = data
         .split(|&b| b == 0)
-        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .map(|s| std::ffi::OsStr::from_bytes(s).to_os_string())
         .collect();
     let mut host = FuzzHost;
     // We only care that this never panics; the Result itself is not asserted.

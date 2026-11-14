@@ -665,8 +665,12 @@ pub fn setup_newroot(ops: &ResolvedOps, ctx: &NewrootCtx, fds: &mut FdTable) -> 
                 // requirement). The name is passed to `sethostname` unchecked, so
                 // an over-long or otherwise invalid value fails here with the same
                 // `Can't set hostname to <name>: <errno>` bubblewrap prints.
-                nix::unistd::sethostname(name)
-                    .with_context(|| format!("Can't set hostname to {name}"))?;
+                nix::unistd::sethostname(name).with_context(|| {
+                    format!(
+                        "Can't set hostname to {}",
+                        disp(std::os::unix::ffi::OsStrExt::as_bytes(name.as_os_str()))
+                    )
+                })?;
             }
         }
     }
@@ -790,7 +794,9 @@ fn resolve_source(src: &HostPath, allow_notexist: bool) -> Result<HostPath> {
     use std::os::unix::ffi::OsStrExt;
     let path = std::ffi::OsStr::from_bytes(src.as_c_str().to_bytes());
     match std::fs::canonicalize(path) {
-        Ok(p) => HostPath::parse("--bind", &p.to_string_lossy()),
+        // Keep the canonical path's raw bytes; a lossy round-trip would corrupt
+        // a non-UTF-8 resolved source.
+        Ok(p) => HostPath::parse("--bind", p.as_os_str()),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_notexist => Ok(src.clone()),
         Err(e) => Err(Error::Sys {
             message: format!("Can't find source path {}", src.as_str()).into(),

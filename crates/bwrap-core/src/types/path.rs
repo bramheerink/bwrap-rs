@@ -5,8 +5,9 @@
 //! `/oldroot`, and a destination path inside the new root. Neither is
 //! canonicalised here; bwrap resolves symlinks later, inside the sandbox.
 
-use std::ffi::{CStr, CString};
+use std::ffi::{CStr, CString, OsStr};
 use std::fmt;
+use std::os::unix::ffi::OsStrExt;
 
 use crate::error::Error;
 
@@ -25,20 +26,27 @@ pub struct HostPath(CString);
 #[derive(Clone, PartialEq, Eq, Hash)]
 pub struct SandboxPath(CString);
 
-fn make_cstring(option: &str, value: &str) -> Result<CString, Error> {
+fn make_cstring(option: &str, value: &OsStr) -> Result<CString, Error> {
     if value.is_empty() {
         // Exact text of bwrap's path_argument().
         return Err(Error::invalid(format!(
             "{option} does not take an empty path argument"
         )));
     }
-    CString::new(value).map_err(|_| Error::invalid(format!("{option} path contains a NUL byte")))
+    // Build from the raw bytes, so a non-UTF-8 path (e.g. a Flatpak portal path)
+    // is preserved verbatim for the syscall, exactly as bubblewrap passes its
+    // `char *`. Only an interior NUL is rejected (CString::new), which real argv
+    // and `--args` tokens cannot contain.
+    CString::new(value.as_bytes())
+        .map_err(|_| Error::invalid(format!("{option} path contains a NUL byte")))
 }
 
 impl HostPath {
     /// Build from a `--option` name (for the error message) and the value.
-    pub fn parse(option: &str, value: &str) -> Result<Self, Error> {
-        Ok(Self(make_cstring(option, value)?))
+    /// The value is any OS string (so a non-UTF-8 path flows through verbatim);
+    /// a `&str` literal still works via `AsRef<OsStr>`.
+    pub fn parse(option: &str, value: impl AsRef<OsStr>) -> Result<Self, Error> {
+        Ok(Self(make_cstring(option, value.as_ref())?))
     }
 
     /// Borrow as a C string for syscalls.
@@ -46,16 +54,20 @@ impl HostPath {
         &self.0
     }
 
-    /// Borrow as a Rust string. Always valid UTF-8 because it was built from `&str`.
-    pub fn as_str(&self) -> &str {
-        self.0.to_str().unwrap_or_default()
+    /// Borrow as a Rust string, lossily. Used only for error-message display;
+    /// a non-UTF-8 path renders with U+FFFD (an open fidelity gap, DIFFERENCES
+    /// #6 — the syscall still uses the verbatim bytes via [`as_c_str`]).
+    pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
+        self.0.to_string_lossy()
     }
 }
 
 impl SandboxPath {
     /// Build from a `--option` name (for the error message) and the value.
-    pub fn parse(option: &str, value: &str) -> Result<Self, Error> {
-        Ok(Self(make_cstring(option, value)?))
+    /// Accepts any OS string so a non-UTF-8 destination is kept verbatim; a
+    /// `&str` literal still works via `AsRef<OsStr>`.
+    pub fn parse(option: &str, value: impl AsRef<OsStr>) -> Result<Self, Error> {
+        Ok(Self(make_cstring(option, value.as_ref())?))
     }
 
     /// Borrow as a C string for syscalls.
@@ -63,9 +75,9 @@ impl SandboxPath {
         &self.0
     }
 
-    /// Borrow as a Rust string. Always valid UTF-8 because it was built from `&str`.
-    pub fn as_str(&self) -> &str {
-        self.0.to_str().unwrap_or_default()
+    /// Borrow as a Rust string, lossily (see [`HostPath::as_str`]).
+    pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
+        self.0.to_string_lossy()
     }
 }
 
@@ -77,7 +89,7 @@ impl fmt::Debug for HostPath {
 
 impl fmt::Display for HostPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.as_str())
     }
 }
 
@@ -89,7 +101,7 @@ impl fmt::Debug for SandboxPath {
 
 impl fmt::Display for SandboxPath {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.as_str())
+        f.write_str(&self.as_str())
     }
 }
 

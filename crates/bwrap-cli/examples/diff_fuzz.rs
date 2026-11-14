@@ -18,9 +18,12 @@
 //!
 //! Each invocation is wrapped in `timeout` so a hang (e.g. an error path that
 //! leaks a child holding stdout) is skipped, not compared. argv are valid UTF-8
-//! and stdio stays open, so the two documented functional limitations (non-UTF-8
-//! arguments, closed-stdio reopen — DIFFERENCES.md #6 / #9) are out of scope and
-//! any reported divergence is a genuine finding or a new one to register.
+//! and stdio stays open. Non-UTF-8 values are now processed verbatim and are
+//! byte-identical on the success path (DIFFERENCES.md #6 is down to error-text
+//! rendering only); this campaign keeps to UTF-8 so a divergence it reports is
+//! not just that documented error-text gap. The closed-stdio reopen
+//! (DIFFERENCES.md #9) stays out of scope. Any reported divergence is a genuine
+//! finding or a new one to register.
 #![forbid(unsafe_code)]
 
 use std::fs::File;

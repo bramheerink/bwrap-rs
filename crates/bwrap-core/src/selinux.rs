@@ -9,7 +9,9 @@
 //! Note: inside a sandbox `/sys` and parts of `/proc` can be masked, so these
 //! run on the host before the pivot; the state they read is the real system's.
 
+use std::ffi::OsStr;
 use std::io::Write;
+use std::os::unix::ffi::OsStrExt;
 
 use nix::errno::Errno;
 
@@ -59,12 +61,12 @@ fn find_fstype(line: &[u8]) -> Option<&[u8]> {
 /// SELinux disabled, labelling is unsupported (bwrap's `die`, no errno); with it
 /// enabled, an invalid context errors with the errno (`die_with_error`, so the
 /// text gains `: <strerror>`). Returns bwrap's exact messages.
-fn label_error(enabled: bool, check: std::result::Result<(), Errno>, label: &str) -> Result<()> {
+fn label_error(enabled: bool, check: std::result::Result<(), Errno>, label: &OsStr) -> Result<()> {
     if !enabled {
         return Err(Error::invalid("labeling not supported on this system"));
     }
     check.map_err(|errno| Error::Sys {
-        message: format!("invalid label {label}").into(),
+        message: format!("invalid label {}", label.to_string_lossy()).into(),
         errno,
     })
 }
@@ -72,7 +74,7 @@ fn label_error(enabled: bool, check: std::result::Result<(), Errno>, label: &str
 /// Validate a label the way bwrap's `die_unless_label_valid` does: error if
 /// SELinux is off ("labeling not supported on this system") or the context is
 /// invalid ("invalid label <label>: <strerror>").
-pub fn die_unless_label_valid(label: &str) -> Result<()> {
+pub fn die_unless_label_valid(label: &OsStr) -> Result<()> {
     let enabled = is_selinux_enabled();
     let check = if enabled {
         check_context(label)
@@ -84,19 +86,19 @@ pub fn die_unless_label_valid(label: &str) -> Result<()> {
 
 /// libselinux's `security_check_context`: a context is valid iff it can be
 /// written to `/sys/fs/selinux/context`; the errno on failure is reported.
-fn check_context(label: &str) -> std::result::Result<(), Errno> {
+fn check_context(label: &OsStr) -> std::result::Result<(), Errno> {
     write_attr(&format!("{SELINUX_FS}/context"), label.as_bytes())
 }
 
 /// Set the exec context for the next `execve` (bwrap's `label_exec` /
 /// libselinux `setexeccon`): write the label to `/proc/self/attr/exec`. A no-op
 /// when `label` is `None` or SELinux is disabled.
-pub fn label_exec(label: Option<&str>) -> Result<()> {
+pub fn label_exec(label: Option<&OsStr>) -> Result<()> {
     if let Some(label) = label
         && is_selinux_enabled()
     {
         return write_attr("/proc/self/attr/exec", label.as_bytes()).map_err(|errno| Error::Sys {
-            message: format!("label_exec {label}").into(),
+            message: format!("label_exec {}", label.to_string_lossy()).into(),
             errno,
         });
     }
@@ -106,13 +108,13 @@ pub fn label_exec(label: Option<&str>) -> Result<()> {
 /// Set the file-creation context (bwrap's `label_create_file` / libselinux
 /// `setfscreatecon`): write the label to `/proc/self/attr/fscreate`. A no-op
 /// when `label` is `None` or SELinux is disabled.
-pub fn label_create_file(label: Option<&str>) -> Result<()> {
+pub fn label_create_file(label: Option<&OsStr>) -> Result<()> {
     if let Some(label) = label
         && is_selinux_enabled()
     {
         return write_attr("/proc/self/attr/fscreate", label.as_bytes()).map_err(|errno| {
             Error::Sys {
-                message: format!("label_create_file {label}").into(),
+                message: format!("label_create_file {}", label.to_string_lossy()).into(),
                 errno,
             }
         });
@@ -163,14 +165,16 @@ mod tests {
 
     #[test]
     fn label_error_texts_match_bwrap() {
-        assert!(label_error(true, Ok(()), "x").is_ok());
+        assert!(label_error(true, Ok(()), OsStr::new("x")).is_ok());
         assert_eq!(
-            label_error(false, Ok(()), "x").unwrap_err().to_string(),
+            label_error(false, Ok(()), OsStr::new("x"))
+                .unwrap_err()
+                .to_string(),
             "labeling not supported on this system"
         );
         // die_with_error appends ": <strerror>"; EINVAL is "Invalid argument".
         assert_eq!(
-            label_error(true, Err(Errno::EINVAL), "sys_u:obj_r:t:s0")
+            label_error(true, Err(Errno::EINVAL), OsStr::new("sys_u:obj_r:t:s0"))
                 .unwrap_err()
                 .to_string(),
             "invalid label sys_u:obj_r:t:s0: Invalid argument"

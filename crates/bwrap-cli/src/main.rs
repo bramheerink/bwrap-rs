@@ -100,35 +100,22 @@ fn main() -> ExitCode {
     // SIGCHLD reset to SIG_DFL. Must be first — the early-return paths below
     // would otherwise still carry the runtime's SIGPIPE = SIG_IGN.
     bwrap_sys::process::reset_runtime_signal_state();
-    // Collect argv without panicking on non-UTF-8 (which `std::env::args()`
-    // would). Full byte-faithful handling of non-UTF-8 paths needs a bytes-based
-    // parser (a module-3 rework); until then, fail cleanly instead of aborting.
+    // Collect argv as OS strings so arbitrary bytes (e.g. a non-UTF-8 bind path
+    // from a Flatpak portal) flow through verbatim to the syscalls, exactly as
+    // bubblewrap passes its `char *` argv. The parser matches option names as
+    // ASCII and carries path/command/env/argv0/hostname values as bytes.
     let argv_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
     // Optional, env-gated invocation log (`BWRAP_RS_LOG`). A no-op when the
     // variable is unset or empty, so the drop-in behaviour and output stay
-    // byte-identical to bwrap. Logged first, from the raw argv, so even
-    // invocations we then reject (e.g. non-UTF-8 argv) are still captured.
+    // byte-identical to bwrap. Logged first, from the raw argv.
     trace::invocation(&argv_os);
+    // argv[0] is still rendered lossily for the usage line (a non-UTF-8 argv0
+    // shows U+FFFD there — the one remaining fidelity gap, DIFFERENCES.md #6).
     let argv0 = argv_os
         .first()
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_else(|| "bwrap".to_string());
-    let args: Vec<String> = match argv_os
-        .iter()
-        .skip(1)
-        .cloned()
-        .map(std::ffi::OsString::into_string)
-        .collect()
-    {
-        Ok(v) => v,
-        Err(_) => {
-            trace::outcome("err=non-utf8-argv");
-            bwrap_core::log::emit_err(
-                "bwrap: non-UTF-8 arguments are not yet supported by this build",
-            );
-            return ExitCode::FAILURE;
-        }
-    };
+    let args: Vec<std::ffi::OsString> = argv_os.into_iter().skip(1).collect();
 
     // The process's fd table; the Host claims the --args/--add-seccomp-fd
     // descriptors through it (owns them for their read, closes them after).

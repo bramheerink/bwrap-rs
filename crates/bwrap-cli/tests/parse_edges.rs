@@ -32,8 +32,8 @@ impl ParseHost for TestHost {
     }
 }
 
-fn argv(s: &[&str]) -> Vec<String> {
-    s.iter().map(ToString::to_string).collect()
+fn argv(s: &[&str]) -> Vec<std::ffi::OsString> {
+    s.iter().map(std::ffi::OsString::from).collect()
 }
 
 /// Parse, returning the config and the warnings emitted.
@@ -63,7 +63,7 @@ fn only_last(name: &str) -> Vec<String> {
 #[test]
 fn repeated_single_value_options_warn_and_last_wins() {
     let (c, w) = ok(&["--chdir", "/a", "--chdir", "/b", "true"]);
-    assert_eq!(c.chdir.as_deref(), Some("/b"));
+    assert_eq!(c.chdir.as_deref(), Some(std::ffi::OsStr::new("/b")));
     assert_eq!(w, only_last("--chdir"));
 
     let (c, w) = ok(&["--uid", "1", "--uid", "2", "true"]);
@@ -75,7 +75,7 @@ fn repeated_single_value_options_warn_and_last_wins() {
     assert_eq!(w, only_last("--gid"));
 
     let (c, w) = ok(&["--hostname", "a", "--hostname", "b", "true"]);
-    assert_eq!(c.hostname.as_deref(), Some("b"));
+    assert_eq!(c.hostname.as_deref(), Some(std::ffi::OsStr::new("b")));
     assert_eq!(w, only_last("--hostname"));
 
     // `--exec-label`/`--file-label` last-wins is NOT asserted here: bwrap validates
@@ -357,8 +357,8 @@ fn overlay_rules() {
                 "sources are consumed by each overlay"
             );
             assert_eq!(s(l3), ["/l5"]);
-            assert_eq!((d1.as_str(), d2.as_str(), d3.as_str()), ("/t", "/r", "/p"));
-            assert_eq!((upper.as_str(), work.as_str()), ("/up", "/work"));
+            assert_eq!((&*d1.as_str(), &*d2.as_str(), &*d3.as_str()), ("/t", "/r", "/p"));
+            assert_eq!((&*upper.as_str(), &*work.as_str()), ("/up", "/work"));
         }
         other => panic!("{other:?}"),
     }
@@ -389,7 +389,7 @@ fn seccomp_exclusivity() {
 #[test]
 fn argument_count_limit() {
     // 9000 is allowed, 9001 is not.
-    let many = |n: usize| vec!["--unshare-pid".to_string(); n];
+    let many = |n: usize| vec![std::ffi::OsString::from("--unshare-pid"); n];
     let mut host = TestHost::default();
     assert!(parse(&many(9000), &mut host).is_ok());
     let e = parse(&many(9001), &mut host).unwrap_err();
@@ -414,7 +414,7 @@ fn args_file_handling() {
         panic!()
     };
     assert!(c.unshare_net && c.unshare_uts);
-    assert_eq!(c.hostname.as_deref(), Some("h"));
+    assert_eq!(c.hostname.as_deref(), Some(std::ffi::OsStr::new("h")));
     assert_eq!(c.command, ["true"]);
 
     // An empty file contributes no arguments (not one empty argument).

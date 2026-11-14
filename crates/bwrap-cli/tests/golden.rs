@@ -35,8 +35,8 @@ impl ParseHost for TestHost {
     }
 }
 
-fn words(s: &str) -> Vec<String> {
-    s.split_whitespace().map(str::to_string).collect()
+fn words(s: &str) -> Vec<std::ffi::OsString> {
+    s.split_whitespace().map(std::ffi::OsString::from).collect()
 }
 
 fn parse_ok(argv: &str) -> Outcome {
@@ -406,9 +406,9 @@ fn exercises_the_full_option_surface() {
     assert_eq!(cfg.pidns_fd, Some(5));
     assert!(cfg.disable_userns && cfg.assert_userns_disabled);
     assert_eq!(cfg.sandbox_uid, Some(1000));
-    assert_eq!(cfg.hostname.as_deref(), Some("box"));
-    assert_eq!(cfg.chdir.as_deref(), Some("/work"));
-    assert_eq!(cfg.argv0.as_deref(), Some("sh"));
+    assert_eq!(cfg.hostname.as_deref(), Some(std::ffi::OsStr::new("box")));
+    assert_eq!(cfg.chdir.as_deref(), Some(std::ffi::OsStr::new("/work")));
+    assert_eq!(cfg.argv0.as_deref(), Some(std::ffi::OsStr::new("sh")));
     // `--level-prefix` has no Config field (its only effect is on the logger's
     // global); that the full parse above accepts it is the coverage here, and
     // its byte-exact output is checked by the conformance `level-prefix` case.

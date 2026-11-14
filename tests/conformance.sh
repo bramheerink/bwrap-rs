@@ -589,6 +589,16 @@ fi
 ab  exec-label-bad   -- "${BASE[@]}" --exec-label not_a_valid_label_t /bin/true
 ab  file-label-bad   -- "${BASE[@]}" --file-label not_a_valid_label_t --dir /d /bin/true
 
+# === Non-UTF-8 values (DIFFERENCES.md #6) ===================================
+# Arbitrary bytes flow through verbatim; the success path is byte-identical. A
+# bind source whose name is not valid UTF-8 (0xff), and an --argv0 whose bytes
+# are not valid UTF-8 (0xfe) reaching the command's $0. (The error-text
+# rendering of such bytes is the one remaining documented gap, not exercised
+# here since conformance compares byte-for-byte.)
+NU8_SRC="$WORK/$(printf 'src\xff')"; mkdir -p "$NU8_SRC"; printf 'marker\n' >"$NU8_SRC/m"
+ab  nonutf8-bind-src -- "${BASE[@]}" --bind "$NU8_SRC" /mnt /bin/cat /mnt/m
+ab  nonutf8-argv0    -- "${BASE[@]}" --argv0 "$(printf 'a\xfe')" /bin/sh -c 'printf "%s\n" "$0"'
+
 # ---- report ---------------------------------------------------------------
 echo
 echo "conformance: $PASS passed, $FAIL failed, $SKIP skipped (of $((PASS+FAIL+SKIP)))"

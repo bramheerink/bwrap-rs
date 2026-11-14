@@ -78,13 +78,22 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
    arises for the mountinfo a kernel actually produces; it is defensive
    hardening.
 
-6. **[known limitation] Non-UTF-8 arguments are not yet supported.** Arguments
-   and paths that are not valid UTF-8 are rejected with
-   `non-UTF-8 arguments are not yet supported by this build`, whereas bubblewrap
-   processes arbitrary byte strings. This is a current limitation, not a design
-   choice, and is planned to be lifted. For the same reason, a non-UTF-8
-   `argv[0]` is shown in the usage line with U+FFFD replacement characters
-   rather than its raw bytes; an *empty* argv[0] is printed verbatim, as C does.
+6. **[known limitation] Non-UTF-8 values appear in *error text* with U+FFFD, not
+   their raw bytes.** Arbitrary byte strings are now accepted and processed
+   verbatim: a non-UTF-8 path, command, `argv[0]`, hostname or environment value
+   flows through the parser as raw bytes to the syscall exactly as bubblewrap
+   passes its `char *`, so a well-formed invocation using such values is
+   byte-identical (verified against the oracle: a non-UTF-8 bind source, and a
+   non-UTF-8 `--argv0` reaching the command's `$0`). The one remaining gap is
+   *rendering*: where an error message echoes a value that is not valid UTF-8
+   (e.g. `Can't find source path <path>`, `Invalid fd: <value>`), `bwrap-rs`
+   prints it with U+FFFD replacement characters whereas bubblewrap prints the
+   raw bytes. The **exit code is identical** and the message text is otherwise
+   identical — only the non-UTF-8 bytes within it differ. The same applies to a
+   non-UTF-8 `argv[0]` in the usage line (shown with U+FFFD; an *empty* argv[0]
+   is still printed verbatim, as C does). Closing this needs the error type and
+   its stderr path to carry raw bytes rather than a Rust `str`; tracked as an
+   open fidelity gap. No normal, well-formed invocation is affected.
 
 7. **[safer divergence] A launcher that dies before releasing the child aborts
    the child instead of leaking it.** bubblewrap signals the child to proceed

@@ -1,6 +1,8 @@
 //! The argument parser, mirroring `parse_args_recurse` in `bubblewrap.c`.
 
+use std::ffi::{OsStr, OsString};
 use std::os::fd::RawFd;
+use std::os::unix::ffi::OsStrExt;
 
 use bwrap_core::cnum::c_strtou64;
 use bwrap_core::types::{
@@ -22,7 +24,7 @@ use bwrap_core::mount::special::MAX_TMPFS_BYTES;
 ///
 /// `host` supplies the bytes of any `--args` file and receives warnings as
 /// they occur.
-pub fn parse(args: &[String], host: &mut dyn ParseHost) -> Result<Outcome> {
+pub fn parse(args: &[OsString], host: &mut dyn ParseHost) -> Result<Outcome> {
     let mut p = Parser {
         cfg: Config::default(),
         pending_overlay_src: Vec::new(),
@@ -50,7 +52,7 @@ struct Parser<'a> {
     cfg: Config,
     /// Raw `--overlay-src` operand strings, validated only when an overlay op
     /// consumes them (as bwrap does in `make_setup_overlay_src_ops`).
-    pending_overlay_src: Vec<String>,
+    pending_overlay_src: Vec<OsString>,
     next_perms: Option<Mode>,
     next_size: Option<u64>,
     total_parsed: usize,
@@ -67,7 +69,7 @@ impl Parser<'_> {
 
     /// Process one argument list. `in_file` is true inside an `--args` file.
     /// Returns `Ok(true)` if a `--` or command start ended the option list.
-    fn run(&mut self, args: &[String], in_file: bool) -> Result<bool> {
+    fn run(&mut self, args: &[OsString], in_file: bool) -> Result<bool> {
         if self.total_parsed > MAX_ARGS {
             return Err(Error::invalid(format!(
                 "Exceeded maximum number of arguments {MAX_ARGS}"
@@ -78,26 +80,54 @@ impl Parser<'_> {
             if self.short_circuit.is_some() {
                 return Ok(true);
             }
-            let arg = args[i].as_str();
+            let token = args[i].as_os_str();
+            let bytes = token.as_bytes();
 
             // Command boundary. bwrap `break`s here *before* the bottom guards,
             // so a dangling --perms/--size right before the command is ignored.
             // The command is only taken from the top-level argv; a `--` or
             // non-option inside an --args file ends that frame and its
             // remainder is discarded (verified against bwrap).
-            if arg == "--" {
+            if bytes == b"--" {
                 if !in_file {
                     self.cfg.command = args[i + 1..].to_vec();
                 }
                 return Ok(true);
             }
-            if !arg.starts_with('-') {
+            if bytes.first() != Some(&b'-') {
                 // Includes the empty string, as in bwrap (`*arg != '-'`).
                 if !in_file {
                     self.cfg.command = args[i..].to_vec();
                 }
                 return Ok(true);
             }
+
+            // The token starts with `-`, so it is meant as an option. Option
+            // names are all ASCII, so decode the token as UTF-8 to match them.
+            // A non-UTF-8 token can never equal any option (bwrap's `strcmp` on
+            // raw bytes would not match it either) and falls through to the
+            // "Unknown option" path, exactly as in C.
+            let arg = match std::str::from_utf8(bytes) {
+                Ok(s) => s,
+                Err(_) => {
+                    // `--debug-opt=VALUE` is the only option whose value is
+                    // embedded with `=`; C matches its ASCII prefix on raw bytes
+                    // and then rejects the value. A non-UTF-8 VALUE can never be
+                    // a known debug-opt, so reproduce C's debug-opt-specific
+                    // message here (the value itself still renders lossily, #6)
+                    // rather than falling through to the generic "Unknown option".
+                    if let Some(val) = bytes.strip_prefix(b"--debug-opt=") {
+                        return Err(Error::invalid(format!(
+                            "Unknown --debug-opt value: {}",
+                            OsStr::from_bytes(val).to_string_lossy()
+                        )));
+                    }
+                    return Err(Error::invalid(format!(
+                        "Unknown option {}",
+                        token.to_string_lossy()
+                    )));
+                }
+            };
 
             // How many extra args this option consumed (beyond `arg` itself).
             let consumed = self.dispatch(arg, &args[i..], in_file)?;
@@ -125,7 +155,7 @@ impl Parser<'_> {
 
     /// Dispatch a single option. Returns the number of extra arguments
     /// consumed, or [`STOP`] if the option list ends here (command start).
-    fn dispatch(&mut self, arg: &str, rest: &[String], in_file: bool) -> Result<usize> {
+    fn dispatch(&mut self, arg: &str, rest: &[OsString], in_file: bool) -> Result<usize> {
         // `rest[0]` is `arg`; operands are rest[1], rest[2], ...
         let need = |n: usize, msg: &str| -> Result<()> {
             if rest.len() <= n {
@@ -244,7 +274,7 @@ impl Parser<'_> {
                 } else {
                     // Keep the pending marker so the final guard fires; nothing
                     // consumes it, so the raw (here empty) value is never used.
-                    self.pending_overlay_src.push(String::new());
+                    self.pending_overlay_src.push(OsString::new());
                     Ok(0)
                 }
             }
@@ -373,7 +403,7 @@ impl Parser<'_> {
                 // the context is then inherited across the clone. A setfscreatecon
                 // failure is reported as C's `--file-label setup failed`.
                 bwrap_core::selinux::die_unless_label_valid(&rest[1])?;
-                bwrap_core::selinux::label_create_file(Some(&rest[1])).map_err(|e| Error::Sys {
+                bwrap_core::selinux::label_create_file(Some(rest[1].as_os_str())).map_err(|e| Error::Sys {
                     message: "--file-label setup failed".into(),
                     errno: e.errno().unwrap_or(nix::errno::Errno::EINVAL),
                 })?;
@@ -534,7 +564,7 @@ impl Parser<'_> {
         }
     }
 
-    fn bind(&mut self, arg: &str, rest: &[String], kind: BindKind) -> Result<usize> {
+    fn bind(&mut self, arg: &str, rest: &[OsString], kind: BindKind) -> Result<usize> {
         if rest.len() <= 2 {
             return Err(Error::invalid(format!("{arg} takes two arguments")));
         }
@@ -552,7 +582,7 @@ impl Parser<'_> {
         Ok(2)
     }
 
-    fn bind_data(&mut self, arg: &str, rest: &[String], kind: BindKind) -> Result<usize> {
+    fn bind_data(&mut self, arg: &str, rest: &[OsString], kind: BindKind) -> Result<usize> {
         if rest.len() <= 2 {
             return Err(Error::invalid(format!("{arg} takes two arguments")));
         }
@@ -568,7 +598,7 @@ impl Parser<'_> {
         Ok(2)
     }
 
-    fn cap(&mut self, rest: &[String], drop: bool) -> Result<usize> {
+    fn cap(&mut self, rest: &[OsString], drop: bool) -> Result<usize> {
         if rest.len() <= 1 {
             return Err(Error::invalid(format!(
                 "--cap-{} takes an argument",
@@ -579,8 +609,10 @@ impl Parser<'_> {
         let op = if rest[1].eq_ignore_ascii_case("ALL") {
             if drop { CapOp::DropAll } else { CapOp::AddAll }
         } else {
-            // libcap's cap_from_name accepts a numeric capability too.
-            let cap = Capability::from_arg(&rest[1])?;
+            // Capability names are ASCII (libcap's cap_from_name, which also
+            // accepts a numeric capability); a non-UTF-8 value cannot name one
+            // and falls through to the "unknown cap" error, as in C.
+            let cap = Capability::from_arg(&rest[1].to_string_lossy())?;
             if drop {
                 CapOp::Drop(cap)
             } else {
@@ -593,7 +625,7 @@ impl Parser<'_> {
 
     fn single_fd(
         &mut self,
-        rest: &[String],
+        rest: &[OsString],
         name: &str,
         field: fn(&mut Config) -> &mut Option<RawFd>,
     ) -> Result<usize> {
@@ -658,24 +690,26 @@ fn is_modifier(arg: &str) -> bool {
     arg == "--perms" || arg == "--size"
 }
 
-/// A non-empty path argument (bwrap's `path_argument`).
-fn path_arg(option: &str, value: &str) -> Result<String> {
+/// A non-empty path argument (bwrap's `path_argument`). Kept as an [`OsString`]
+/// so a non-UTF-8 path flows through verbatim.
+fn path_arg(option: &str, value: &OsStr) -> Result<OsString> {
     if value.is_empty() {
         return Err(Error::invalid(format!(
             "{option} does not take an empty path argument"
         )));
     }
-    Ok(value.to_string())
+    Ok(value.to_os_string())
 }
 
-fn dest(option: &str, value: &str) -> Result<SandboxPath> {
+fn dest(option: &str, value: &OsStr) -> Result<SandboxPath> {
     SandboxPath::parse(option, value)
 }
 
 /// An environment variable name that `setenv`/`unsetenv` accept: non-empty and
-/// with no `=`.
-fn is_valid_env_name(name: &str) -> bool {
-    !name.is_empty() && !name.contains('=')
+/// with no `=`. Checked on the raw bytes (bwrap passes the `char *` straight to
+/// `setenv`), so a non-UTF-8 name is handled like any other.
+fn is_valid_env_name(name: &OsStr) -> bool {
+    !name.is_empty() && !name.as_bytes().contains(&b'=')
 }
 
 /// Parse an fd argument like bwrap: `int fd = strtol(.., 10)`, reject empty,
@@ -684,14 +718,18 @@ fn is_valid_env_name(name: &str) -> bool {
 /// The `strtol` result is a `long` that bwrap stores into an `int`, so the
 /// value is narrowed with a wrapping cast to `i32` before the `< 0` check
 /// (e.g. `4294967297` wraps to `1`, matching bwrap).
-fn parse_fd(value: &str) -> Result<RawFd> {
+fn parse_fd(value: &OsStr) -> Result<RawFd> {
+    // fd arguments are ASCII decimals; a non-UTF-8 value has no digits (or
+    // trailing junk) and is rejected exactly as C's strtol rejects it, only the
+    // echoed value in the error text renders lossily (DIFFERENCES.md #6).
+    let value = value.to_string_lossy();
     // The `as i32` truncation is the whole point: it reproduces C storing a
     // `long` into an `int`.
     #[expect(
         clippy::cast_possible_truncation,
         reason = "reproduces C storing a long fd into an int"
     )]
-    match strtol10(value) {
+    match strtol10(&value) {
         Some(n) if (n as i32) >= 0 => Ok(n as i32),
         _ => Err(Error::invalid(format!("Invalid fd: {value}"))),
     }
@@ -699,14 +737,15 @@ fn parse_fd(value: &str) -> Result<RawFd> {
 
 /// Parse `--uid`/`--gid`: `int id = strtol(..)`, reject negative (bwrap's
 /// `the_uid < 0`), same `int` narrowing as [`parse_fd`].
-fn parse_id(value: &str, which: &str) -> Result<u32> {
+fn parse_id(value: &OsStr, which: &str) -> Result<u32> {
+    let value = value.to_string_lossy();
     // Intentional C int-narrowing, as in parse_fd; the i32 is then known >= 0.
     #[expect(
         clippy::cast_possible_truncation,
         clippy::cast_sign_loss,
         reason = "intentional C int-narrowing; the i32 is then range-checked >= 0 before the u32 cast"
     )]
-    match strtol10(value) {
+    match strtol10(&value) {
         Some(n) if (n as i32) >= 0 => Ok((n as i32) as u32),
         _ => Err(Error::invalid(format!("Invalid {which}: {value}"))),
     }
@@ -740,14 +779,16 @@ fn strtol10(value: &str) -> Option<i64> {
 }
 
 /// Parse `--perms`/`--chmod`: octal, `<= 07777`. Error text names `option`.
-fn parse_perms(option: &str, value: &str) -> Result<Mode> {
-    Mode::parse_octal(option, value)
+fn parse_perms(option: &str, value: &OsStr) -> Result<Mode> {
+    Mode::parse_octal(option, &value.to_string_lossy())
 }
 
 /// Parse `--size`: `strtoull(.., 0)` with bwrap's guards. First char must be a
 /// digit (so no sign/whitespace), base auto-detected (`0x`→hex, `0`→octal),
 /// fully consumed, non-zero, `<= MAX_TMPFS_BYTES`.
-fn parse_size(value: &str) -> Result<u64> {
+fn parse_size(value: &OsStr) -> Result<u64> {
+    let value = value.to_string_lossy();
+    let value = value.as_ref();
     let non_zero = "--size takes a non-zero number of bytes";
     // C guards with `isdigit(argv[1][0])`: the first byte must be a digit, which
     // simultaneously rejects leading whitespace and any sign. Keep that guard —
@@ -773,7 +814,7 @@ fn parse_size(value: &str) -> Result<u64> {
 /// Split the bytes of an `--args` file into arguments, as bwrap does: NUL is
 /// the separator, and `load_file_data` appends a terminating NUL, so a
 /// trailing NUL does not create an extra empty argument.
-fn split_nul_args(bytes: &[u8]) -> Vec<String> {
+fn split_nul_args(bytes: &[u8]) -> Vec<OsString> {
     let mut parts: Vec<&[u8]> = bytes.split(|&c| c == 0).collect();
     // A terminating NUL (or the one load_file_data appends) leaves a trailing
     // empty element that is not a real argument.
@@ -785,12 +826,12 @@ fn split_nul_args(bytes: &[u8]) -> Vec<String> {
     if bytes.last() == Some(&0) {
         parts.pop();
     }
-    // Arguments are char*, so invalid UTF-8 would be lossy; for now this build
-    // assumes UTF-8 (true for all real callers, e.g. flatpak) and rejects a
-    // non-UTF-8 argv cleanly at the top of main (DIFFERENCES.md entry 6).
+    // Arguments are char*; each NUL-delimited chunk is kept as raw bytes, so a
+    // non-UTF-8 argument from an --args file flows through verbatim (matching
+    // bubblewrap), the same as a non-UTF-8 token on the real argv.
     parts
         .into_iter()
-        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .map(|p| OsStr::from_bytes(p).to_os_string())
         .collect()
 }
 
@@ -820,12 +861,12 @@ mod tests {
 
     #[test]
     fn parse_size_matches_c_strtoull_base0() {
-        assert_eq!(parse_size("0x10000").unwrap(), 0x10000);
-        assert_eq!(parse_size("010").unwrap(), 0o10);
-        assert_eq!(parse_size("1").unwrap(), 1);
+        assert_eq!(parse_size(OsStr::new("0x10000")).unwrap(), 0x10000);
+        assert_eq!(parse_size(OsStr::new("010")).unwrap(), 0o10);
+        assert_eq!(parse_size(OsStr::new("1")).unwrap(), 1);
         // Trailing junk, zero, leading space / sign: all the "non-zero" message.
         for bad in ["1e3", "00", "0x", " 5", "+5", "-5"] {
-            let e = parse_size(bad).unwrap_err();
+            let e = parse_size(OsStr::new(bad)).unwrap_err();
             assert_eq!(
                 e.to_string(),
                 "--size takes a non-zero number of bytes",
@@ -834,14 +875,14 @@ mod tests {
         }
         // u64::MAX fits strtoull (no ERANGE) but exceeds the tmpfs cap.
         assert!(
-            parse_size("18446744073709551615")
+            parse_size(OsStr::new("18446744073709551615"))
                 .unwrap_err()
                 .to_string()
                 .contains("limited to")
         );
         // One past u64::MAX is ERANGE, which bwrap reports as "non-zero".
         assert_eq!(
-            parse_size("18446744073709551616").unwrap_err().to_string(),
+            parse_size(OsStr::new("18446744073709551616")).unwrap_err().to_string(),
             "--size takes a non-zero number of bytes"
         );
     }
@@ -911,7 +952,7 @@ mod tests {
                 "parse_octal {:?}",
                 r.input
             );
-            assert_eq!(parse_size(r.input).ok(), r.size, "parse_size {:?}", r.input);
+            assert_eq!(parse_size(OsStr::new(r.input)).ok(), r.size, "parse_size {:?}", r.input);
         }
     }
 }
