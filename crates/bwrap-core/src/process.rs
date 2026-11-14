@@ -9,8 +9,9 @@
 //!
 //! `monitor_child`/`do_init` convert small kernel values (eventfd payloads that
 //! carry exit-code+1, SIGCHLD-derived wait statuses) between integer widths;
-//! those fit by construction, so the width/sign lints are allowed file-wide.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+//! those fit by construction. The two casts that need it carry their own
+//! line-scoped `#[expect]` rather than a file-wide `allow`, so a new truncating
+//! cast added here is reported instead of silently suppressed.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 
@@ -64,7 +65,10 @@ pub fn take_lock(path: &SandboxPath) -> Result<LockFile> {
     .with_context(|| format!("Unable to open lock file {path}"))?;
     // Whole-file shared lock. F_RDLCK and SEEK_SET are small kernel constants
     // that fit i16 by definition.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "F_RDLCK and SEEK_SET are small kernel constants that fit i16"
+    )]
     let flock = libc::flock {
         l_type: libc::F_RDLCK as i16,
         l_whence: libc::SEEK_SET as i16,
@@ -338,6 +342,10 @@ pub fn monitor_child(
             let mut val = [0u8; 8];
             match read(efd, &mut val) {
                 Ok(8) => {
+                    #[expect(
+                        clippy::cast_possible_truncation,
+                        reason = "the eventfd payload is exit-code+1 that our own pid 1 wrote (initial_exit_status as u32, +1), so its low 32 bits are the value"
+                    )]
                     let exitc = u64::from_ne_bytes(val) as i32 - 1;
                     report_child_exit_status(exitc, setup_finished_fd, json_status_fd)?;
                     return Ok(exitc);
@@ -424,7 +432,7 @@ pub fn do_init(
                 if pid == initial_pid {
                     initial_exit_status = propagate_exit_status(status);
                     if let Some(efd) = event_fd {
-                        let val = u64::from(initial_exit_status as u32).wrapping_add(1);
+                        let val = u64::from(initial_exit_status.cast_unsigned()).wrapping_add(1);
                         // Ignore errors: if the parent died and closed event_fd
                         // we must not fail here.
                         let _ = write_all(efd, &val.to_ne_bytes());

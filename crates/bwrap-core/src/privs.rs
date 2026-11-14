@@ -44,7 +44,7 @@ pub fn acquire_privs() -> Result<CapSet> {
 /// restored (keeping the requested caps), and, when joining an existing userns
 /// via `--userns`, switch to the target uid/gid (bwrap's
 /// `switch_to_user_with_privs`).
-#[allow(clippy::too_many_arguments)]
+// (7 parameters — exactly clippy's threshold, so no suppression is needed.)
 pub fn switch_to_user_with_privs(
     unshare_user: bool,
     have_userns_fd: bool,

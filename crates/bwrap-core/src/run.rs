@@ -265,7 +265,10 @@ pub fn run(
 
 /// The launcher side after the clone: read namespace ids, drop all privileges,
 /// emit `--info-fd`/`--json-status-fd`, release the child, and monitor it.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "launcher-side orchestration threads the config, resolved ids and several fds; a ChildCtx struct is a tracked post-1.0 cleanup"
+)]
 fn parent(
     config: &Config,
     resolved: &ResolvedConfig,
@@ -359,7 +362,10 @@ fn parent(
 /// The sandbox side after the clone: wait for the launcher, switch user, write
 /// maps, build the new root, drop privileges, set up the environment, optionally
 /// become pid-1's reaper, then `exec`.
-#[allow(clippy::too_many_arguments)]
+#[expect(
+    clippy::too_many_arguments,
+    reason = "sandbox-side orchestration threads the config, resolved ids and several fds; a ChildCtx struct is a tracked post-1.0 cleanup"
+)]
 fn child(
     config: &Config,
     resolved: &ResolvedConfig,

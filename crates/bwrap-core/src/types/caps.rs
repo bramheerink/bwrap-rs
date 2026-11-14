@@ -64,7 +64,10 @@ const CAP_NAMES: &[&str] = &[
 
 /// The highest capability number this table knows.
 // The table has 41 entries, so the index fits a u8; asserted at compile time.
-#[allow(clippy::cast_possible_truncation)]
+#[expect(
+    clippy::cast_possible_truncation,
+    reason = "41-entry table, so the index fits u8; asserted at compile time below"
+)]
 pub const CAP_LAST_KNOWN: u8 = {
     assert!(
         CAP_NAMES.len() <= 64,

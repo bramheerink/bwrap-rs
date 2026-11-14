@@ -11,8 +11,11 @@
 //! The many `as u16`/`as u8` casts convert kernel protocol constants
 //! (`RTM_*`, `NLM_F_*`, `AF_*`, `IFA_*`, `IFF_UP`, scopes) and small, bounded
 //! message lengths into their on-wire widths; the values definitionally fit, so
-//! the truncation/sign lints are allowed file-wide.
-#![allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+//! the truncation lint is expected file-wide (sign-loss does not arise here).
+#![expect(
+    clippy::cast_possible_truncation,
+    reason = "kernel netlink/protocol constants and computed message lengths narrowed to their fixed-width on-wire fields"
+)]
 
 use std::os::fd::AsRawFd;
 
