@@ -26,11 +26,15 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
 - **Fuzzing the two untrusted-input paths** — the argv/CLI grammar and the
   seccomp-BPF blob. **In place:** `cargo-fuzz` crash/panic targets (`fuzz/`,
   targets `parse` and `seccomp`) run in CI as a short regression smoke; both
-  survive millions of iterations without panicking. **Enhancement (later):** make
-  the `parse` target *differential* — reuse the byte-exact oracle so a divergence
-  (not just a crash) is a finding; this needs an out-of-process compare against
-  the C binary, so it belongs in a slower, scheduled campaign rather than the CI
-  smoke.
+  survive millions of iterations without panicking. **Differential fuzzing —
+  built** (`crates/bwrap-cli/examples/diff_fuzz.rs`): a generative campaign that
+  synthesises argv from the option grammar, runs *both* binaries out-of-process,
+  and flags any exit/stdout/stderr divergence — the class a rewrite introduces
+  that memory-safety cannot catch and byte-exactness catches only if the case was
+  written. A slow scheduled campaign (not CI). First runs confirmed the
+  seccomp-empty safer-divergence (DIFFERENCES #1) and surfaced one closed-fd
+  errno edge (now DIFFERENCES #12); no un-registered divergence. Next:
+  corpus/seed persistence and a scheduled build-box run.
 - **Threat model + divergence register** — [THREAT-MODEL.md](THREAT-MODEL.md)
   and [DIFFERENCES.md](DIFFERENCES.md) as the public, versioned record of every
   intentional deviation (fail-closed) vs. deliberately-replicated C quirk.

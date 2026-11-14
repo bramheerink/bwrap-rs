@@ -145,6 +145,23 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
     the moment after the clone, so this is near-unreachable in practice; matching
     bubblewrap's abort on it is an open fidelity gap.
 
+12. **[known limitation] A *closed* low-numbered fd passed to an fd-taking option
+    can be shadowed by one of the port's internal descriptors.** Both binaries
+    open their own descriptors during setup (an `O_PATH` handle to `/proc`, the
+    pid-translation socketpair, …), which fill a low fd number the caller left
+    *closed*. So an fd option naming that number — `--pidns`/`--userns`/`--userns2`
+    (→ `setns` on a socket: `Invalid argument` vs bubblewrap's `Bad file
+    descriptor`), or `--bind-fd N` (→ resolving `/proc/self/fd/N` reaches the
+    port's internal `/proc` handle and binds `/proc` instead of failing) — behaves
+    differently between the port and bubblewrap, because their internal fd layouts
+    differ. All still exit 1. A **valid** fd is unaffected: the caller's fd
+    occupies the number, so the port's internal fds land above it (verified with
+    `--bind-fd 3`), and passing a closed fd is a caller bug either way. Matching
+    bubblewrap on this closed-fd edge needs either reproducing its fd layout or
+    keeping the port's internal descriptors out of the low caller-fd range (an
+    fd-hygiene improvement worth doing); tracked as an open fidelity gap. Found by
+    the generative differential fuzzer (`crates/bwrap-cli/examples/diff_fuzz.rs`).
+
 ## Everything else
 
 Outside this list, any divergence from bubblewrap 0.13.1 is a bug. Please report
