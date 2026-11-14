@@ -133,7 +133,9 @@ ab() {
 }
 
 # abx NAME 'TEMPLATE' : TEMPLATE is a shell line with %B for the binary and may
-# contain fd redirections. Require ours == real after %B substitution.
+# contain fd redirections. Require ours == real after %B substitution. The
+# template must be a single command or a `( subshell )` whose exit is bwrap's — a
+# top-level `%B ... | foo` would record foo's exit (OC=$?), not bwrap's.
 abx() {
     local name="$1" tmpl="$2"
     eval "${tmpl//%B/$OURS}" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
@@ -257,7 +259,10 @@ abx rt-signal-pid     "%B --bind / / --unshare-pid /bin/sh -c 'kill -34 \$\$'"
 abx file-fd-reuse     "%B --ro-bind / / --tmpfs /tmp --file 3 /tmp/a --file 3 /tmp/b /bin/sh -c 'wc -c /tmp/a /tmp/b' 3<<<hi"
 # Logical cwd: $PWD reached through a symlink is kept (get_current_dir_name),
 # not canonicalised to the physical path.
-abx cwd-logical       'cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd'
+# Wrapped in a subshell so the `cd` cannot leak into the harness cwd: since the
+# _cmp helpers run abx templates in the current shell (not a $(...) subshell), a
+# bare `cd` here would change the working directory for every later case.
+abx cwd-logical       '( cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd )'
 # An empty SELinux label is rejected exactly as C (libselinux writes the NUL).
 ab  empty-exec-label -- "${BASE[@]}" --exec-label '' /bin/true
 ab  chdir            -- "${BASE[@]}" --chdir /usr /bin/sh -c 'pwd'
@@ -373,15 +378,15 @@ inv pid-small 0 "small" -- "${BASE[@]}" --unshare-pid /bin/sh -c 'test $$ -lt 50
 # Reaching the fd: drop --unshare-user so --userns actually looks at the bad
 # number and fails there (with --unshare-user it dies on the incompatibility check
 # first — kept as userns-incompat below — so the fd was never the subject). This
-# fails before the sandbox fork, so it exits cleanly even with stdout piped.
+# fails before the sandbox fork, so it exits cleanly.
 ab  userns-bad-fd    -- --userns 99 $UJOIN /bin/true
 ab  userns-incompat  -- "${BASE[@]}" --userns 99 /bin/true
-# --userns2's own bad fd cannot be an A/B case here: --userns2 is applied late, in
-# the forked sandbox child, and bubblewrap's (and the port's, faithfully) error
-# path there leaves a child holding the inherited stdout, so a piped `ab` capture
-# hangs. So this stays at the incompatibility guard (fails before any fork). The
-# late-userns2 bad-fd path, and that leaked-child teardown, belong in an in-process
-# host test (tracked with #36; the leaked child is an upstream robustness finding).
+# --userns2's own bad fd is left to a host test, not an A/B case here: --userns2 is
+# applied late, in the forked sandbox child, and the error path there (bubblewrap's,
+# faithfully reproduced) leaves a reparented child holding the inherited stdout.
+# Observing that leaked-child teardown — an upstream robustness finding — needs an
+# in-process test (harness=false) that controls fd lifetimes, not the matrix. So
+# this stays at the incompatibility guard (fails before any fork). Tracked with #36.
 ab  userns2-bad-fd   -- "${BASE[@]}" --userns 99 --userns2 98 /bin/true
 ab  pidns-bad-fd     -- "${BASE[@]}" --unshare-pid --pidns 99 /bin/true
 ab  disable-userns   -- "${BASE[@]}" --disable-userns /bin/sh -c 'cat /proc/sys/user/max_user_namespaces'
@@ -475,6 +480,10 @@ ab0 tmp-overlay      -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --tmp-overlay 
 # (it formats op->dest after advancing op onto an overlay-src entry); match it
 # byte-for-byte, including that quirk.
 ab  overlay-overlap  -- --unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --overlay-src /usr --overlay-src /usr --ro-overlay /mnt /bin/true
+# Source resolution order: with both an --overlay-src and the --overlay upper
+# missing, bubblewrap names the upper first (it resolves upper/workdir before the
+# overlay-src list). Catches the port resolving the lower layers first (#34).
+ab  overlay-src-order -- "${BASE[@]}" --overlay-src /nonexistent1 --overlay /nonexistent2 /nonexistent3 /mnt /bin/true
 
 # === security invariants (ours-only; module-11 review regressions) ========
 inv nnp-set       0 "NoNewPrivs:	1" -- "${BASE[@]}" /bin/sh -c 'grep NoNewPrivs /proc/self/status'
