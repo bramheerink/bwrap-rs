@@ -784,8 +784,9 @@ fn split_nul_args(bytes: &[u8]) -> Vec<String> {
     if bytes.last() == Some(&0) {
         parts.pop();
     }
-    // Arguments are char*, so invalid UTF-8 would be lossy; see the UTF-8 note
-    // in DESIGN.md open points. For now assume UTF-8 (true for all real callers).
+    // Arguments are char*, so invalid UTF-8 would be lossy; for now this build
+    // assumes UTF-8 (true for all real callers, e.g. flatpak) and rejects a
+    // non-UTF-8 argv cleanly at the top of main (DIFFERENCES.md entry 6).
     parts
         .into_iter()
         .map(|p| String::from_utf8_lossy(p).into_owned())

@@ -5,9 +5,10 @@
 //! prepared, consuming the resolved `SetupOp` list to build the sandbox
 //! filesystem under `/newroot`, reading sources from `/oldroot`.
 //!
-//! This file (slice 2) provides the executor-level helpers: the caller-prefixed
-//! bind wrappers (`setup_op_bind_mount`/`_fd`) and `reopen_in_newroot`. The full
-//! `setup_newroot` dispatch is assembled on top of these.
+//! This file holds both the executor-level helpers — the caller-prefixed bind
+//! wrappers (`setup_op_bind_mount`/`_fd`) and `reopen_in_newroot` — and the
+//! `setup_newroot` dispatch itself, which walks the resolved op list on top of
+//! them.
 
 use std::borrow::Cow;
 use std::ffi::{CStr, CString};

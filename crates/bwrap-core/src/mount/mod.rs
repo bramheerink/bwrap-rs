@@ -1,5 +1,5 @@
-//! The mount layer: bind mounts with attributes, and (coming next) the
-//! `setup_newroot` op executor plus tmpfs/proc/dev/overlay. Mirrors
+//! The mount layer: bind mounts with attributes (`bind`), and the tmpfs, proc,
+//! dev, mqueue and overlay mounts used by `setup_newroot` (`special`). Mirrors
 //! bubblewrap's `bind-mount.c` and the mounting half of `setup_newroot`.
 
 pub mod bind;

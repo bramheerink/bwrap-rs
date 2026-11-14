@@ -123,8 +123,9 @@ pub fn set_ambient(keep: CapSet) -> Result<()> {
 /// `keep` is `Some(requested)` to keep exactly those caps, or `None` to drop
 /// everything. Two bwrap quirks are preserved:
 /// - When keeping caps as root and no `--cap-add`/`--cap-drop` was used,
-///   `capset` is skipped entirely (systemd-nspawn denies it via seccomp;
-///   see UPSTREAM-FINDINGS F3).
+///   `capset` is skipped entirely: a container manager such as systemd-nspawn
+///   denies `capset` via seccomp, so issuing it there would fail spuriously;
+///   bubblewrap skips it for the same reason.
 /// - `EPERM` as root is ignored rather than fatal (same reason).
 pub fn drop_all_caps(
     keep: Option<CapSet>,
