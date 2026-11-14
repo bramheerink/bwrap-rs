@@ -7,7 +7,20 @@
 //! on a caller contract the compiler cannot check:
 //!
 //! - [`process::close_extra_fds`] — must not be called while any `OwnedFd`
-//!   outside its keep-set is still live, or the later drop double-closes.
+//!   outside its keep-set is still live, or that fd's later drop closes a number
+//!   this already closed (and perhaps reused): fd confusion, not UB.
+//!
+//! It is deliberately a safe `fn`, not `unsafe fn`, despite that uncheckable
+//! contract. The contract is *process-global* ("no stray live `OwnedFd`"), so no
+//! signature can express it; and its two callers (`monitor_child`, the pid-1
+//! reaper) live in the `#![forbid(unsafe_code)]` crates — making it `unsafe fn`
+//! would either force `unsafe` blocks there (defeating the quarantine that is the
+//! project's main assurance) or drag that orchestration down into this thin
+//! syscall crate. The keep-set is also legitimately bare `RawFd`s (caller
+//! `--sync-fd` numbers this process does not own). So it stays a safe `fn` with
+//! this explicit caller contract — the single accepted exception — which the two
+//! call sites discharge by releasing (dropping / `into_raw_fd`) every other owned
+//! fd before the walk. See each call site's `# Caution`/keep-list comment.
 //!
 //! The inherited command-line fds (`--bind-fd`, `--info-fd`, …) no longer use a
 //! free `borrow_raw`: [`fd::FdTable`] owns their numbers and hands out borrows
