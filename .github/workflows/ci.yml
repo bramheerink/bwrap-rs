@@ -32,6 +32,9 @@ jobs:
       - name: Clippy (warnings are errors)
         run: cargo clippy --workspace --all-targets -- -D warnings
 
+      - name: Clippy with the profile feature (warnings are errors)
+        run: cargo clippy --workspace --all-targets --features bwrap-cli/profile -- -D warnings
+
       - name: Build
         run: cargo build --workspace --release
 
@@ -130,6 +133,7 @@ jobs:
         with:
           toolchain: "1.88.0"
       - run: cargo check --workspace --all-targets
+      - run: cargo check --workspace --features bwrap-cli/profile
 
   release:
     name: Release artifact (tag push)

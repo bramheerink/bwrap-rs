@@ -686,7 +686,10 @@ fn is_valid_env_name(name: &str) -> bool {
 fn parse_fd(value: &str) -> Result<RawFd> {
     // The `as i32` truncation is the whole point: it reproduces C storing a
     // `long` into an `int`.
-    #[allow(clippy::cast_possible_truncation)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "reproduces C storing a long fd into an int"
+    )]
     match strtol10(value) {
         Some(n) if (n as i32) >= 0 => Ok(n as i32),
         _ => Err(Error::invalid(format!("Invalid fd: {value}"))),
@@ -697,7 +700,11 @@ fn parse_fd(value: &str) -> Result<RawFd> {
 /// `the_uid < 0`), same `int` narrowing as [`parse_fd`].
 fn parse_id(value: &str, which: &str) -> Result<u32> {
     // Intentional C int-narrowing, as in parse_fd; the i32 is then known >= 0.
-    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "intentional C int-narrowing; the i32 is then range-checked >= 0 before the u32 cast"
+    )]
     match strtol10(value) {
         Some(n) if (n as i32) >= 0 => Ok((n as i32) as u32),
         _ => Err(Error::invalid(format!("Invalid {which}: {value}"))),
