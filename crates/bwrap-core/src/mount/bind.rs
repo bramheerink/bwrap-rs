@@ -12,7 +12,7 @@
 
 use std::ffi::CString;
 use std::fmt;
-use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::ffi::OsStrExt;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -127,8 +127,8 @@ impl std::error::Error for BindError {}
 pub type BindResult = std::result::Result<(), BindError>;
 
 fn proc_fd_path(fd: BorrowedFd<'_>) -> CString {
-    // Always valid (ASCII), never contains NUL.
-    CString::new(format!("/proc/self/fd/{}", fd.as_raw_fd())).expect("fd path is NUL-free")
+    // /proc/self/fd/N — ASCII, never contains NUL. One shared string builder.
+    CString::new(crate::fs::proc_self_fd(fd)).expect("fd path is NUL-free")
 }
 
 /// Open `path` with `O_PATH | O_CLOEXEC`, mapping failure (incl. a NUL byte,

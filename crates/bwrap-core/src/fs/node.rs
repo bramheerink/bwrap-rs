@@ -1,14 +1,13 @@
 //! Creating directory and file nodes in the new root (bwrap's `ensure_node_at`
 //! and `ensure_newroot_parents_at`).
 
-use std::ffi::CString;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::{Mode, mkdirat};
 
-use super::open::open_in_root;
+use super::open::{cstr, open_in_root};
 
 /// The kind of node to ensure exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,10 +16,6 @@ pub enum NodeType {
     Dir,
     /// A regular file.
     File,
-}
-
-fn cstr(bytes: &[u8]) -> nix::Result<CString> {
-    CString::new(bytes).map_err(|_| Errno::EINVAL)
 }
 
 /// Ensure a node named `name` exists under `parent_fd`, returning an
