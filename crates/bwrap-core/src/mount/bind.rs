@@ -6,9 +6,9 @@
 //! Faithful port of bubblewrap's `bind_mount` / `bind_mount_fd` /
 //! `mount_setattr_setup` / `mount_setattr_fallback` (`bind-mount.c`), including
 //! the `bind_mount_result` error strings. The failing operation, path and
-//! errno are preserved in [`BindError`]; the `setup_newroot` executor
-//! (module 11) prepends the caller's `Can't bind mount X on Y:` prefix, exactly
-//! as bwrap's `die_with_bind_result` does.
+//! errno are preserved in [`BindError`]; the `setup_newroot` executor prepends
+//! the caller's `Can't bind mount X on Y:` prefix, exactly as bwrap's
+//! `die_with_bind_result` does.
 
 use std::ffi::CString;
 use std::fmt;

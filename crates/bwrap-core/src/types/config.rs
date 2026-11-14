@@ -1,6 +1,6 @@
 //! The parsed sandbox configuration and its validation/resolution.
 //!
-//! [`Config`] mirrors bwrap's option globals as the CLI parser (module 3)
+//! [`Config`] mirrors bwrap's option globals as the CLI parser
 //! fills them: raw, before any defaulting. [`Config::resolve`] reproduces the
 //! sequence in bwrap's `main()` exactly — the option-compatibility `die()`
 //! checks, the forcing of `--unshare-user`, the uid/gid defaulting, and the
@@ -69,7 +69,7 @@ pub enum NsPolicy {
 /// The resolved per-namespace decisions.
 ///
 /// This captures only what can be decided from the options alone. Two things
-/// are finished at orchestration time (module 11), not here:
+/// are finished at orchestration time (in `run`), not here:
 /// - `--pidns FD` (`pidns_fd`): a joined pid namespace suppresses `CLONE_NEWPID`
 ///   even though `pid` is `Unshare`.
 /// - `--unshare-cgroup-try` and the `--unshare-cgroup` kernel-support check are
@@ -93,7 +93,7 @@ pub struct NamespaceConfig {
 /// Probes bwrap performs on the running system while resolving namespaces.
 ///
 /// Abstracted so resolution can be tested with a fake. The real implementation
-/// reads `/proc` and `/sys`; see module 11.
+/// reads `/proc` and `/sys` (`SystemUsernsProbe`).
 pub trait UsernsProbe {
     /// `stat("/proc/self/ns/user") == 0`: the kernel supports user namespaces.
     fn user_ns_supported(&self) -> bool;

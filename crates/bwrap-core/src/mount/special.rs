@@ -2,7 +2,7 @@
 //! remount-read-only. Mirror bubblewrap's `setup_op_tmpfs_mount`, the
 //! `SETUP_MOUNT_MQUEUE` case and `SETUP_REMOUNT_RO_NO_RECURSIVE`.
 //!
-//! `--proc` and `--dev` live with the `setup_newroot` executor (module 11),
+//! `--proc` and `--dev` live with the `setup_newroot` executor,
 //! because they bind their sources from `/oldroot` and reopen the destination
 //! from `/newroot` — state that only exists after the pivot.
 
