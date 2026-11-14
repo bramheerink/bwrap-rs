@@ -104,7 +104,8 @@ fn launcher(rd: OwnedFd, wr: OwnedFd, seccomp: &SeccompPrograms) -> i32 {
                 Ok(ForkResult::Parent { child }) => child,
                 Err(_) => std::process::exit(31),
             };
-            match do_init(Some(wr.as_fd()), app_pid, &[], seccomp, false) {
+            // die_with_parent is false here, so there is no launcher handshake fd.
+            match do_init(Some(wr.as_fd()), app_pid, &[], seccomp, false, None) {
                 // do_init returns the app's status; exiting with it is a second,
                 // independent signal, but the launcher reads the event fd.
                 Ok(_) => std::process::exit(0),
@@ -118,7 +119,8 @@ fn launcher(rd: OwnedFd, wr: OwnedFd, seccomp: &SeccompPrograms) -> i32 {
             // Close the write end before monitor_child's fd-walk, so it is not
             // closed out from under its OwnedFd (real bwrap uses raw ints).
             drop(wr);
-            match monitor_child(Some(rd.as_fd()), pid1, None, None) {
+            // No die_with_parent handshake fd in this synthetic launcher.
+            match monitor_child(Some(rd.as_fd()), pid1, None, None, None) {
                 Ok(code) => code,
                 Err(e) => {
                     eprintln!("monitor_child: {e}");

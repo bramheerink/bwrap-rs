@@ -218,6 +218,40 @@ pub fn handle_die_with_parent(die_with_parent: bool, expected_parent: Pid) -> Re
     Ok(())
 }
 
+/// The sandbox-side `--die-with-parent` guard. Like [`handle_die_with_parent`]
+/// but keyed on the launcher's handshake socket instead of a pid, because inside
+/// a new pid namespace `getppid()` is always 0 and a pid comparison is vacuous
+/// (the reason the old pid guard did nothing under `--unshare-pid`).
+///
+/// `launcher` is the child's end of the launcher->child handshake socket; the
+/// launcher holds its end open for its whole life, so the kernel reports EOF on
+/// this end exactly when the launcher dies. After arming `PR_SET_PDEATHSIG`
+/// (which covers a launcher death from here on), one non-blocking `MSG_PEEK`
+/// closes the startup race: if it returns EOF (0), the launcher already died in
+/// the window before the signal was armed, so terminate now.
+///
+/// Terminate with `_exit`, not `raise(SIGKILL)`: a new pid namespace's pid 1
+/// cannot SIGKILL itself from within (an unhandled SIGKILL from inside the
+/// namespace is discarded), but exiting tears the namespace down and so kills the
+/// command; and this runs before `exec`, so for a non-init process the command
+/// simply never starts. The launcher is already gone, so the exit status is moot.
+pub fn handle_die_with_parent_fd(die_with_parent: bool, launcher: Option<BorrowedFd<'_>>) -> Result<()> {
+    if die_with_parent {
+        set_pdeathsig(Signal::SIGKILL).context("prctl")?;
+        if let Some(launcher) = launcher {
+            let mut b = [0u8; 1];
+            if let Ok(0) = nix::sys::socket::recv(
+                launcher.as_raw_fd(),
+                &mut b,
+                nix::sys::socket::MsgFlags::MSG_PEEK | nix::sys::socket::MsgFlags::MSG_DONTWAIT,
+            ) {
+                bwrap_sys::process::exit_immediately(1);
+            }
+        }
+    }
+    Ok(())
+}
+
 /// When `--json-status-fd` is set, emit `{ "exit-code": N }` once the sandbox
 /// has finished setup (`report_child_exit_status`).
 ///
@@ -278,13 +312,20 @@ pub fn monitor_child(
     child_pid: Pid,
     setup_finished_fd: Option<BorrowedFd<'_>>,
     json_status_fd: Option<BorrowedFd<'_>>,
+    die_with_parent_fd: Option<BorrowedFd<'_>>,
 ) -> Result<i32> {
     // Local, so the eventfd can be dropped from the poll set if it reaches EOF
     // (a dead pid 1 that wrote nothing) instead of spinning the loop.
     let mut event_fd = event_fd;
     // Close all extra fds in the monitoring process; the child already has the
-    // ones it needs. Keep the fds we still use here.
+    // ones it needs. Keep the fds we still use here, and (under --die-with-parent)
+    // the launcher's end of the handshake socket: it must stay open for the
+    // launcher's whole life so the sandbox sees EOF on it exactly when the
+    // launcher dies. Closing it in this walk would signal a false death.
     let mut keep: Vec<RawFd> = Vec::new();
+    if let Some(fd) = die_with_parent_fd {
+        keep.push(fd.as_raw_fd());
+    }
     for fd in [event_fd, json_status_fd, setup_finished_fd]
         .into_iter()
         .flatten()
@@ -397,16 +438,15 @@ pub fn do_init(
     lock_files: &[SandboxPath],
     seccomp: &SeccompPrograms,
     die_with_parent: bool,
+    launcher: Option<BorrowedFd<'_>>,
 ) -> Result<i32> {
-    // Capture our parent (the launcher) before any work, for the die-with-parent
-    // reparent check.
-    let parent = nix::unistd::getppid();
-
     // Hold the locks for our whole lifetime; dropping at return closes the fds,
     // as C does at the end of do_init.
     let _locks = take_locks(lock_files)?;
 
-    handle_die_with_parent(die_with_parent, parent)?;
+    // Bind our lifetime to the launcher via the handshake socket, not getppid()
+    // (which is 0 here — we are pid 1 of the new pid namespace).
+    handle_die_with_parent_fd(die_with_parent, launcher)?;
     seccomp.apply()?;
 
     let mut initial_exit_status = 1;
