@@ -83,6 +83,11 @@ if ! "$OURS" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
     exit 0
 fi
 B="${BASE[*]}"   # space-joined base for template cases
+# A base WITHOUT --unshare-user, for cases that pass a caller namespace fd:
+# --userns/--userns2 are about *joining* a namespace, and --userns is mutually
+# exclusive with --unshare-user, so a bad-fd guardrail must drop --unshare-user
+# or it dies on the incompatibility check before the fd is ever looked at.
+UJOIN="--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc"
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 PASS=0 FAIL=0 SKIP=0; FAILED=()
@@ -348,7 +353,18 @@ ab  as-pid-1         -- "${BASE[@]}" --unshare-pid --as-pid-1 /bin/sh -c 'echo $
 inv pid-small 0 "small" -- "${BASE[@]}" --unshare-pid /bin/sh -c 'test $$ -lt 50 && echo small'
 
 # === userns / pidns handoff (positive needs live fds; here: guardrails) ===
-ab  userns-bad-fd    -- "${BASE[@]}" --userns 99 /bin/true
+# Reaching the fd: drop --unshare-user so --userns actually looks at the bad
+# number and fails there (with --unshare-user it dies on the incompatibility check
+# first — kept as userns-incompat below — so the fd was never the subject). This
+# fails before the sandbox fork, so it exits cleanly even with stdout piped.
+ab  userns-bad-fd    -- --userns 99 $UJOIN /bin/true
+ab  userns-incompat  -- "${BASE[@]}" --userns 99 /bin/true
+# --userns2's own bad fd cannot be an A/B case here: --userns2 is applied late, in
+# the forked sandbox child, and bubblewrap's (and the port's, faithfully) error
+# path there leaves a child holding the inherited stdout, so a piped `ab` capture
+# hangs. So this stays at the incompatibility guard (fails before any fork). The
+# late-userns2 bad-fd path, and that leaked-child teardown, belong in an in-process
+# host test (tracked with #36; the leaked child is an upstream robustness finding).
 ab  userns2-bad-fd   -- "${BASE[@]}" --userns 99 --userns2 98 /bin/true
 ab  pidns-bad-fd     -- "${BASE[@]}" --unshare-pid --pidns 99 /bin/true
 ab  disable-userns   -- "${BASE[@]}" --disable-userns /bin/sh -c 'cat /proc/sys/user/max_user_namespaces'
@@ -370,7 +386,6 @@ if command -v unshare >/dev/null 2>&1; then
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         [ -s "/proc/$uns_pid/uid_map" ] && break; sleep 0.05
     done
-    UJOIN="--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc"
     if [ -r "/proc/$uns_pid/ns/user" ] \
        && exec 9<"/proc/$uns_pid/ns/user" 2>/dev/null \
        && "$OURS" --userns 9 $UJOIN /bin/true >/dev/null 2>&1; then
@@ -403,6 +418,14 @@ abx sync-fd          '%B --sync-fd 8 '"$B"' /bin/true 8<>/dev/null'
 ab  userns-block-bad -- "${BASE[@]}" --userns-block-fd 99 /bin/true
 invx info-fd 0 '"child-pid"' '%B --info-fd 8 '"$B"' /bin/true 8>"'"$WORK"'/info.json"; cat "'"$WORK"'/info.json"'
 invx json-status 0 '"exit-code"' '%B --json-status-fd 8 '"$B"' /bin/true 8>"'"$WORK"'/st.json"; cat "'"$WORK"'/st.json"'
+# NOTE: the *blocking* behaviour of --block-fd / --sync-fd / --userns-block-fd
+# (the supervisor hand-off: "don't start until I write", "hold the fd for my
+# lifetime", "wait for my maps") is deliberately NOT tested here. Proving it needs
+# a concurrent writer and a FIFO/EOF rendezvous, and the shell `N<fifo` open
+# itself synchronises — which can mask the very read under test or hang the
+# deterministic matrix if a reader never appears. It belongs in an in-process host
+# test (harness=false, like process_host.rs) where fd and EOF lifetimes are
+# controlled precisely. Tracked with #36; see also the --die-with-parent race (#32).
 
 # === caps =================================================================
 ab  cap-drop-all     -- "${BASE[@]}" --cap-drop ALL /bin/sh -c 'grep CapEff /proc/self/status'
