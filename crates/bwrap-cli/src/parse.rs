@@ -14,8 +14,9 @@ use crate::{Outcome, ParseHost};
 /// bwrap's `MAX_ARGS`: the NUL-byte hardening cap on total parsed arguments.
 const MAX_ARGS: usize = 9000;
 
-/// `MAX_TMPFS_BYTES`: `SIZE_MAX >> 1`. We target 64-bit, matching the host.
-const MAX_TMPFS_BYTES: u64 = u64::MAX >> 1;
+/// The tmpfs `--size` cap, shared with the mount layer so the parser and the
+/// mount code cannot disagree on the limit.
+use bwrap_core::mount::special::MAX_TMPFS_BYTES;
 
 /// Parse `args` (the arguments after the program name) into an [`Outcome`].
 ///

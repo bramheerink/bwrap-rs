@@ -980,21 +980,10 @@ fn read_pid(sock: BorrowedFd<'_>) -> Result<Pid> {
 fn read_all_fd(fd: std::os::fd::RawFd, fds: &mut FdTable) -> Result<Vec<u8>> {
     fds.register(fd);
     let bf = fds.borrow(fd).expect("seccomp fd just registered");
-    let mut out = Vec::new();
-    let mut buf = [0u8; 4096];
-    let result = loop {
-        match read(bf, &mut buf) {
-            Ok(0) => break Ok(out),
-            Ok(n) => out.extend_from_slice(&buf[..n]),
-            Err(Errno::EINTR) => {}
-            Err(e) => {
-                break Err(Error::Sys {
-                    message: "Can't read seccomp data".into(),
-                    errno: e,
-                });
-            }
-        }
-    };
+    let result = crate::fs::io::read_to_end(bf).map_err(|errno| Error::Sys {
+        message: "Can't read seccomp data".into(),
+        errno,
+    });
     // bwrap's `seccomp_program_new` reads the fd and closes it (before the pid-1
     // fork), so `--seccomp FD` cannot leak into the sandboxed process.
     fds.close(fd);
