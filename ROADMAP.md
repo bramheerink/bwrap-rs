@@ -45,9 +45,16 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   subtly-wrong implementation (oracle = is the behaviour right; fuzzer = does the
   code survive weird input; mutants = would the tests notice if it broke). A
   scoped run on the number parser (`cnum.rs`) already found and closed one real
-  gap — an unguarded base-0 `0x` autodetect case. A full run across all modules
-  needs the complete test environment (user namespaces, the real oracle) and
-  belongs on the build box rather than CI.
+  gap — an unguarded base-0 `0x` autodetect case. A scoped run on the logic
+  modules (`cnum`, `parse`, `types/op`, `caps`, `seccomp`, `usage`) plus the new
+  fd-ownership table — run with the full test environment (user namespaces + the
+  real oracle) — came back **348 mutants, 0 missed**. Important scope note: that
+  leg exercises the *unit/integration* tests, **not** `conformance.sh`'s
+  observability. A separate hand-mutation pass against the conformance matrix
+  found that several isolation properties can be removed without a case noticing
+  (tracked as the test-observability work below); those gaps are real and still
+  open. A full run across all modules still belongs on the build box rather than
+  CI.
 
 ## Later
 
@@ -58,10 +65,16 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   crate to *reduce net unsafe lines* is a net win. The genuinely irreducible
   unsafe (raw stackless `clone`, `_exit`, raw seccomp install, environ mutation)
   stays quarantined regardless.
-- **The fd-ownership table** — replace the unsound `fd::borrow_raw` with a table
-  that owns inherited descriptors and hands out table-scoped borrows, consumed by
-  `close_extra_fds` so the borrow checker enforces the invariant. Removes the two
-  remaining documented exceptions in `bwrap-sys/src/lib.rs`.
+- **The fd-ownership table** — **done (PR #47).** `fd::borrow_raw` and
+  `close_raw` are gone; a single `fd::FdTable` owns the inherited descriptor
+  numbers and hands out borrows tied to its own lifetime, closing each at most
+  once, so a use-after-close is no longer representable in the safe crates (a
+  guardrail test fails the build if either escape hatch reappears). `apply_env`
+  (formerly `replace_environ`) was already honest — it checks single-threadedness
+  itself. The one remaining `bwrap-sys` exception, `close_extra_fds`, is an
+  irreducible case: its precondition is a process-global invariant no signature
+  can express, so it is slated to be expressed as `unsafe` + a documented caller
+  invariant rather than refactored (closes most of issue #33).
 - **Fuzz-target upstreaming to OSS-Fuzz** — after the fuzz harnesses exist and
   there is adoption traction (being the sandbox behind Flatpak is the "critical
   infrastructure" argument).
@@ -69,17 +82,30 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   `// nix-upstream-kandidaat` in the source (`_exit`, the caps prctls,
   `mount_setattr`) could become genuinely-safe `nix` APIs and delete an unsafe
   block each.
-- **Architecture / structure review** — a deliberate, read-only design pass (not
-  a rewrite): re-examine the module boundaries and type seams through the lens of
-  the threat model, because *structure is itself a safety mechanism*. The
-  strongest fixes so far were structural — the unsafe quarantine, the planned
-  fd-ownership table, types that make illegal states unrepresentable — not point
-  patches. Questions to ask: is `parse → Config → setup` the cleanest
-  untrusted-input seam? Can the privilege roles (userns / real-root /
-  setuid-refused) be kept apart by type rather than by branch? Which remaining
-  invariants can move from discipline into the type system so the compiler
-  enforces them? Findings first; small structural improvements only where they
-  clearly pay off.
+- **Architecture / structure review** — *underway.* The read-only design pass
+  (structure is itself a safety mechanism) has produced its first findings: the
+  fd-ownership table was its concrete #1 output, and the 13 open issues #29–#41
+  have been grouped by root cause rather than treated as 13 unrelated bugs. The
+  grouping and the safe-path pattern for each class live in the internal design
+  notes; the prioritised next items it yields are:
+  1. **Test-observability (#35–#37)** — the conformance matrix proves "the
+     command ran and printed the same", not "the option delivered its isolation
+     property". Make each option's case observe the property itself, and compare
+     files rather than command-substitution captures. Highest security value.
+  2. **The ordered op-spine (#29, #34, #31)** — settings bubblewrap runs as
+     ordered `SETUP_*` ops must be ops here, not hoisted `Config` scalars or
+     deferred transforms. `--hostname` is done; overlay source order and the
+     cwd/`PWD` env-timing are the rest of the class.
+  3. **#32 `--die-with-parent`** — tie the liveness check to the handshake fd
+     (which closes on launcher death) instead of a pid that reads as 0 inside a
+     new pid namespace.
+  4. **#30 OOM**, then the docs/dead-code/dedup/CI hygiene (#38–#41, with the
+     real `EIO`→`ENOSPC` fix folded into the dedup).
+  Open structural questions still carried: can the privilege roles (userns /
+  real-root / setuid-refused) be kept apart by type rather than by branch (#39 is
+  the negative case — a removed role's code paths linger)? Which remaining
+  invariants can move from discipline into the type system? Small structural
+  improvements only where they clearly pay off.
 
 ## Skip (for now)
 

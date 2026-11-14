@@ -210,6 +210,15 @@ pub enum SetupOp {
         /// Destination.
         dest: SandboxPath,
     },
+    /// `--hostname NAME`: set the UTS-namespace hostname (bwrap's
+    /// `SETUP_SET_HOSTNAME`). One op per `--hostname`, run in command-line order
+    /// inside `setup_newroot` — not hoisted or de-duplicated — so an invalid
+    /// earlier value fails exactly where bubblewrap fails.
+    SetHostname {
+        /// The requested hostname, stored verbatim (bwrap passes it to
+        /// `sethostname` unchecked).
+        name: String,
+    },
 }
 
 #[cfg(test)]

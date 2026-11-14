@@ -325,6 +325,11 @@ ab0 overlay          -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --overlay "$WO
 # === namespaces: deterministic observable A/B =============================
 ab  uts-hostname     -- "${BASE[@]}" --unshare-uts --hostname sandbox /bin/hostname
 ab  hostname-no-uts  -- "${BASE[@]}" --hostname nope /bin/true
+# Each --hostname is an ordered op, as in bubblewrap: an invalid earlier value is
+# still attempted and fails (exit 1), not silently superseded by a valid later
+# one. HN is 70 chars, over HOST_NAME_MAX, so sethostname() returns EINVAL.
+HN=$(printf 'a%.0s' $(seq 1 70))
+ab  hostname-order   -- "${BASE[@]}" --unshare-uts --hostname "$HN" --hostname ok /bin/hostname
 ab  net-only-lo      -- "${BASE[@]}" --unshare-net /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
 ab  share-net-ifs    -- "${BASE[@]}" --unshare-all --share-net --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
 ab  cgroup-root      -- "${BASE[@]}" --unshare-cgroup /bin/sh -c 'cat /proc/self/cgroup'

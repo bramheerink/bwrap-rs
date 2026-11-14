@@ -435,13 +435,9 @@ fn child(
         crate::net::loopback_setup()?;
     }
 
-    // Set the sandbox hostname in our new UTS namespace (bwrap's
-    // SETUP_SET_HOSTNAME). `--hostname` requires --unshare-uts (enforced by
-    // resolve), so we are in a private UTS namespace here.
-    if let Some(hostname) = &config.hostname {
-        nix::unistd::sethostname(hostname)
-            .with_context(|| format!("Can't set hostname to {hostname}"))?;
-    }
+    // `--hostname` is no longer set here: each occurrence is a `SetupOp::SetHostname`
+    // run in command-line order inside `setup_newroot` (bwrap's
+    // `SETUP_SET_HOSTNAME`), so an invalid earlier value fails where bwrap fails.
 
     // Open a single O_PATH handle to the host /proc and read the kernel
     // overflow ids up front, before any pivot — exactly as bwrap does. Both are

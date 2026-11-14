@@ -307,9 +307,6 @@ fn make_dest(
     Ok((parent_fd, name, dest_fd))
 }
 
-/// Execute the resolved setup ops against the prepared `/newroot` (bwrap's
-/// `setup_newroot`). Sources are read from `/oldroot`. Must run after the root
-/// tmpfs and `pivot_root` are in place.
 /// A stable `'static` profiler label per setup-op kind.
 fn op_label(op: &SetupOp) -> &'static str {
     match op {
@@ -326,9 +323,13 @@ fn op_label(op: &SetupOp) -> &'static str {
         SetupOp::Symlink { .. } => "op.symlink",
         SetupOp::RemountRo { .. } => "op.remount_ro",
         SetupOp::Chmod { .. } => "op.chmod",
+        SetupOp::SetHostname { .. } => "op.set_hostname",
     }
 }
 
+/// Execute the resolved setup ops against the prepared `/newroot` (bwrap's
+/// `setup_newroot`). Sources are read from `/oldroot`. Must run after the root
+/// tmpfs and `pivot_root` are in place.
 pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx, fds: &mut FdTable) -> Result<()> {
     let mut tmp_overlay_idx = 0usize;
 
@@ -655,6 +656,15 @@ pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx, fds: &mut FdTable) -> Re
                 .with_context(|| {
                     format!("Can't chmod {} {}", c_alt_octal(perms.bits()), disp(dest_b))
                 })?;
+            }
+            SetupOp::SetHostname { name } => {
+                // bwrap's `case SETUP_SET_HOSTNAME`: run in op order, inside the
+                // sandbox's own UTS namespace (guaranteed by the `--unshare-uts`
+                // requirement). The name is passed to `sethostname` unchecked, so
+                // an over-long or otherwise invalid value fails here with the same
+                // `Can't set hostname to <name>: <errno>` bubblewrap prints.
+                nix::unistd::sethostname(name)
+                    .with_context(|| format!("Can't set hostname to {name}"))?;
             }
         }
     }
