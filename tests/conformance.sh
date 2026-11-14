@@ -83,6 +83,11 @@ if ! "$OURS" "${BASE[@]}" /bin/true >/dev/null 2>&1; then
     exit 0
 fi
 B="${BASE[*]}"   # space-joined base for template cases
+# A base WITHOUT --unshare-user, for cases that pass a caller namespace fd:
+# --userns/--userns2 are about *joining* a namespace, and --userns is mutually
+# exclusive with --unshare-user, so a bad-fd guardrail must drop --unshare-user
+# or it dies on the incompatibility check before the fd is ever looked at.
+UJOIN="--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc"
 
 WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
 PASS=0 FAIL=0 SKIP=0; FAILED=()
@@ -91,40 +96,49 @@ fail() { FAIL=$((FAIL+1)); FAILED+=("  [$1] $2"); }
 skip() { SKIP=$((SKIP+1)); echo "  SKIP [$1] $2"; }
 norm() { sed -e "s#$OURS#BWRAP#g" -e "s#$REAL#BWRAP#g"; }
 
-# ab NAME -- ARGS... : require ours == real (exit+stdout+stderr byte-identical).
-ab() {
-    local name="$1"; shift 2
-    local oo oe oc ro re rc
-    oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
+# Byte-exact A/B comparison. ours and real are run with stdout and stderr each to
+# their own file; the files are compared with `cmp`, NOT `$(...)` captures —
+# command substitution strips trailing newlines and NUL bytes, so a divergence
+# confined to trailing bytes (e.g. extra newlines on --version/--help) would pass
+# a capture compare. `norm` maps the binary path to BWRAP; GNU sed preserves a
+# missing final newline, so the comparison stays byte-faithful. OC/RC are the
+# captured exit codes (globals, set by the callers below).
+_cmp() {   # $1=name  $2=mode (any | zero)
+    local name="$1" mode="$2"
     if [ "$HAVE_REAL" != 1 ]; then
         # No oracle: we ran ours (a smoke check) but cannot prove byte-identity,
         # so report SKIP rather than a dishonest pass. REQUIRE_REAL would already
         # have aborted the run above.
-        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
+        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $OC)"
         return
     fi
-    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    norm <"$WORK/o.ours" >"$WORK/o.ours.n"; norm <"$WORK/o.real" >"$WORK/o.real.n"
+    norm <"$WORK/e.ours" >"$WORK/e.ours.n"; norm <"$WORK/e.real" >"$WORK/e.real.n"
+    [ "$OC" = "$RC" ] || { fail "$name" "exit ours=$OC real=$RC"; return; }
+    cmp -s "$WORK/o.ours.n" "$WORK/o.real.n" \
+        || { fail "$name" "stdout: ours=[$(cat "$WORK/o.ours.n")] real=[$(cat "$WORK/o.real.n")]"; return; }
+    cmp -s "$WORK/e.ours.n" "$WORK/e.real.n" \
+        || { fail "$name" "stderr: ours=[$(cat "$WORK/e.ours.n")] real=[$(cat "$WORK/e.real.n")]"; return; }
+    [ "$mode" != zero ] || [ "$RC" = 0 ] \
+        || { fail "$name" "yes-form must succeed but exit=$RC (err=$(cat "$WORK/e.ours.n"))"; return; }
     ok "$name"
+}
+
+# ab NAME -- ARGS... : require ours == real (exit+stdout+stderr byte-identical).
+ab() {
+    local name="$1"; shift 2
+    "$OURS" "$@" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { "$REAL" "$@" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" any
 }
 
 # abx NAME 'TEMPLATE' : TEMPLATE is a shell line with %B for the binary and may
 # contain fd redirections. Require ours == real after %B substitution.
 abx() {
     local name="$1" tmpl="$2"
-    local oo oe oc ro re rc
-    oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" != 1 ]; then
-        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
-        return
-    fi
-    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
-    ok "$name"
+    eval "${tmpl//%B/$OURS}" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { eval "${tmpl//%B/$REAL}" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" any
 }
 
 # inv NAME WANTEXIT SUBSTR -- ARGS... : ours-only invariant.
@@ -154,27 +168,15 @@ invx() {
 # and keep ab/abx/inv for guardrails that expect a specific non-zero exit.
 ab0() {
     local name="$1"; shift 2
-    local oo oe oc ro re rc
-    oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" != 1 ]; then skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"; return; fi
-    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
-    [ "$rc" = 0 ] || { fail "$name" "yes-form must succeed but exit=$rc (err=$re)"; return; }
-    ok "$name"
+    "$OURS" "$@" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { "$REAL" "$@" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" zero
 }
 abx0() {
     local name="$1" tmpl="$2"
-    local oo oe oc ro re rc
-    oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" != 1 ]; then skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"; return; fi
-    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
-    [ "$rc" = 0 ] || { fail "$name" "yes-form must succeed but exit=$rc (err=$re)"; return; }
-    ok "$name"
+    eval "${tmpl//%B/$OURS}" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { eval "${tmpl//%B/$REAL}" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" zero
 }
 
 # ---- fixtures -------------------------------------------------------------
@@ -302,7 +304,19 @@ ab  dir              -- "${BASE[@]}" --dir /made /bin/sh -c 'test -d /made && ec
 ab  tmpfs            -- "${BASE[@]}" --tmpfs /t /bin/sh -c 'test -d /t && echo yes'
 ab  perms-dir        -- "${BASE[@]}" --perms 0750 --dir /d /bin/sh -c 'stat -c %a /d'
 ab  size-no-tmpfs    -- "${BASE[@]}" --size 4096 /bin/true
+# --size must actually cap the tmpfs (callers rely on it to bound memory); the
+# size-no-tmpfs case above only checks the *error* for --size without --tmpfs.
+ab  tmpfs-size       -- "${BASE[@]}" --size 65536 --tmpfs /t /bin/sh -c "grep ' /t ' /proc/self/mountinfo | grep -o 'size=[0-9a-z]*' || echo no-size"
+# --perms must apply to a --tmpfs too, not just --dir (perms-dir only covers --dir),
+# or e.g. --perms 0700 --tmpfs /private is world-readable.
+ab  perms-tmpfs      -- "${BASE[@]}" --perms 0700 --tmpfs /t /bin/sh -c 'stat -c %a /t'
 ab  chmod            -- "${BASE[@]}" --dir /d --chmod 0700 /d /bin/sh -c 'stat -c %a /d'
+# --chmod must keep the sticky/setuid/setgid bits (chmod above only tests 0700),
+# or --chmod 1777 /tmp silently becomes 0777.
+ab  chmod-sticky     -- "${BASE[@]}" --dir /d --chmod 1777 /d /bin/sh -c 'stat -c %a /d'
+# --dev must create the full node set, not just /dev/null (dev-has-null checks
+# only null); a program opening /dev/random must find it.
+ab  dev-nodes        -- "${BASE[@]}" --dev /dev /bin/sh -c 'ls /dev | tr "\n" " "'
 # A failing --chmod prints the mode with C's %#o formatting (0700, 0), not Rust's
 # {:#o} (0o700, 0o0).
 ab  chmod-ro-msg     -- --ro-bind / / --chmod 700 /etc true
@@ -331,6 +345,14 @@ ab  hostname-no-uts  -- "${BASE[@]}" --hostname nope /bin/true
 HN=$(printf 'a%.0s' $(seq 1 70))
 ab  hostname-order   -- "${BASE[@]}" --unshare-uts --hostname "$HN" --hostname ok /bin/hostname
 ab  net-only-lo      -- "${BASE[@]}" --unshare-net /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
+# loopback must be brought UP, not just given its address: net-only-lo checks the
+# interface name only, and bind(127.0.0.1) succeeds on a down link, so the UP flag
+# can regress unnoticed. Needs iproute2.
+if command -v ip >/dev/null 2>&1; then
+    ab net-lo-up     -- "${BASE[@]}" --unshare-net /bin/sh -c "ip -o link show lo | grep -o '<.*>'"
+else
+    skip net-lo-up "iproute2 (ip) unavailable"
+fi
 ab  share-net-ifs    -- "${BASE[@]}" --unshare-all --share-net --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
 ab  cgroup-root      -- "${BASE[@]}" --unshare-cgroup /bin/sh -c 'cat /proc/self/cgroup'
 ab  cgroup-try       -- "${BASE[@]}" --unshare-cgroup-try /bin/true
@@ -340,11 +362,26 @@ ab  ipc              -- "${BASE[@]}" --unshare-ipc /bin/true
 inv ipc-isolated 0 'isolated' -- "${BASE[@]}" --unshare-ipc /bin/sh -c '[ "$(readlink /proc/self/ns/ipc)" != "'"$host_ipc"'" ] && echo isolated || echo shared'
 ab  user-try         -- "${BASE[@]}" --unshare-user-try /bin/true
 ab  uid-gid          -- "${BASE[@]}" --uid 0 --gid 0 /bin/sh -c 'id -u; id -g'
+# With --dev (the second-user-namespace path) --gid must still map the requested
+# gid, not gid 0. Observes id -u/-g so a mutant that maps gid 0 in the inner
+# userns is caught (the uid-gid case above uses 0/0 and no --dev).
+ab  dev-uid-gid      -- "${BASE[@]}" --dev /dev --uid 5 --gid 7 /bin/sh -c 'id -u; id -g'
 ab  as-pid-1         -- "${BASE[@]}" --unshare-pid --as-pid-1 /bin/sh -c 'echo $$'
 inv pid-small 0 "small" -- "${BASE[@]}" --unshare-pid /bin/sh -c 'test $$ -lt 50 && echo small'
 
 # === userns / pidns handoff (positive needs live fds; here: guardrails) ===
-ab  userns-bad-fd    -- "${BASE[@]}" --userns 99 /bin/true
+# Reaching the fd: drop --unshare-user so --userns actually looks at the bad
+# number and fails there (with --unshare-user it dies on the incompatibility check
+# first — kept as userns-incompat below — so the fd was never the subject). This
+# fails before the sandbox fork, so it exits cleanly even with stdout piped.
+ab  userns-bad-fd    -- --userns 99 $UJOIN /bin/true
+ab  userns-incompat  -- "${BASE[@]}" --userns 99 /bin/true
+# --userns2's own bad fd cannot be an A/B case here: --userns2 is applied late, in
+# the forked sandbox child, and bubblewrap's (and the port's, faithfully) error
+# path there leaves a child holding the inherited stdout, so a piped `ab` capture
+# hangs. So this stays at the incompatibility guard (fails before any fork). The
+# late-userns2 bad-fd path, and that leaked-child teardown, belong in an in-process
+# host test (tracked with #36; the leaked child is an upstream robustness finding).
 ab  userns2-bad-fd   -- "${BASE[@]}" --userns 99 --userns2 98 /bin/true
 ab  pidns-bad-fd     -- "${BASE[@]}" --unshare-pid --pidns 99 /bin/true
 ab  disable-userns   -- "${BASE[@]}" --disable-userns /bin/sh -c 'cat /proc/sys/user/max_user_namespaces'
@@ -366,7 +403,6 @@ if command -v unshare >/dev/null 2>&1; then
     for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 19 20; do
         [ -s "/proc/$uns_pid/uid_map" ] && break; sleep 0.05
     done
-    UJOIN="--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc"
     if [ -r "/proc/$uns_pid/ns/user" ] \
        && exec 9<"/proc/$uns_pid/ns/user" 2>/dev/null \
        && "$OURS" --userns 9 $UJOIN /bin/true >/dev/null 2>&1; then
@@ -387,6 +423,11 @@ abx seccomp-allow    '%B --seccomp 9 '"$B"' /bin/true 9<"'"$WORK"'/allow.bpf"'
 abx seccomp-deny     '%B --seccomp 9 '"$B"' --tmpfs /w /bin/sh -c "mkdir /w/x 2>&1; echo e=\$?" 9<"'"$WORK"'/deny.bpf"'
 abx add-seccomp-fd   '%B --add-seccomp-fd 9 '"$B"' /bin/true 9<"'"$WORK"'/allow.bpf"'
 ab  seccomp-bad-fd   -- "${BASE[@]}" --seccomp 99 /bin/true
+# Every --add-seccomp-fd must be installed, not just the first (flatpak passes
+# several). With an allow-all filter (8) and a mkdir-denying filter (9), mkdir
+# must still be blocked and Seccomp_filters must read 2; a mutant that installs
+# only the first makes mkdir succeed and the count drop to 1.
+abx add-seccomp-fd-two '%B '"$B"' --tmpfs /w --add-seccomp-fd 8 --add-seccomp-fd 9 /bin/sh -c "mkdir /w/x 2>&1; echo e=\$?; grep Seccomp_filters /proc/self/status" 8<"'"$WORK"'/allow.bpf" 9<"'"$WORK"'/deny.bpf"'
 
 # === fds / blocking =======================================================
 abx block-fd         '%B --block-fd 8 '"$B"' /bin/true 8<"'"$WORK"'/data.txt"'
@@ -394,14 +435,36 @@ abx sync-fd          '%B --sync-fd 8 '"$B"' /bin/true 8<>/dev/null'
 ab  userns-block-bad -- "${BASE[@]}" --userns-block-fd 99 /bin/true
 invx info-fd 0 '"child-pid"' '%B --info-fd 8 '"$B"' /bin/true 8>"'"$WORK"'/info.json"; cat "'"$WORK"'/info.json"'
 invx json-status 0 '"exit-code"' '%B --json-status-fd 8 '"$B"' /bin/true 8>"'"$WORK"'/st.json"; cat "'"$WORK"'/st.json"'
+# NOTE: the *blocking* behaviour of --block-fd / --sync-fd / --userns-block-fd
+# (the supervisor hand-off: "don't start until I write", "hold the fd for my
+# lifetime", "wait for my maps") is deliberately NOT tested here. Proving it needs
+# a concurrent writer and a FIFO/EOF rendezvous, and the shell `N<fifo` open
+# itself synchronises — which can mask the very read under test or hang the
+# deterministic matrix if a reader never appears. It belongs in an in-process host
+# test (harness=false, like process_host.rs) where fd and EOF lifetimes are
+# controlled precisely. Tracked with #36; see also the --die-with-parent race (#32).
 
 # === caps =================================================================
 ab  cap-drop-all     -- "${BASE[@]}" --cap-drop ALL /bin/sh -c 'grep CapEff /proc/self/status'
 ab  cap-add-one      -- "${BASE[@]}" --cap-drop ALL --cap-add CAP_SYS_ADMIN /bin/sh -c 'grep CapEff /proc/self/status'
 ab  cap-bad-name     -- "${BASE[@]}" --cap-add NOT_A_CAP /bin/true
+# The bounding set must stay empty after the second unshare(CLONE_NEWUSER) that
+# --dev and --disable-userns trigger (that unshare restores CapBnd, so it must be
+# re-dropped). cap-drop-all above only greps CapEff, which the re-restore does
+# not change. Both paths must show CapBnd all-zero.
+ab  capbnd-dev       -- "${BASE[@]}" --dev /dev /bin/sh -c 'grep CapBnd /proc/self/status'
+ab  capbnd-disable-userns -- "${BASE[@]}" --disable-userns /bin/sh -c 'grep CapBnd /proc/self/status'
 
 # === session / misc =======================================================
 ab  new-session      -- "${BASE[@]}" --new-session /bin/sh -c 'echo ok'
+# --new-session must actually setsid (its reason to exist: TIOCSTI protection),
+# so the sandboxed process is a session leader (its session id equals its pid).
+# The plain new-session case above runs echo and cannot tell setsid apart.
+ab  new-session-setsid -- "${BASE[@]}" --new-session /bin/sh -c 'read -r a b c d e f g </proc/self/stat; [ "$f" = "$a" ] && echo session-leader || echo NOT-session-leader'
+# The sandboxed command must run with the launcher's umask restored, not the 0
+# bwrap uses during setup. Run under umask 027 so a mutant that skips the restore
+# (child umask 0000) is caught; a hard-coded 0022 would not prove the restore.
+abx umask-preserved  "( umask 027; %B $B /bin/sh -c umask )"
 ab  die-with-parent  -- "${BASE[@]}" --die-with-parent /bin/true
 ab  not-a-boundary   -- "${BASE[@]}" --not-a-security-boundary /bin/true
 
@@ -418,6 +481,10 @@ inv nnp-set       0 "NoNewPrivs:	1" -- "${BASE[@]}" /bin/sh -c 'grep NoNewPrivs 
 inv dev-has-null  0 "yes"            -- "${BASE[@]}" --dev /dev /bin/sh -c 'test -c /dev/null && echo yes'
 invx info-fd-leak 2 "No such file" '%B --info-fd 7 '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7>/dev/null'
 invx sync-fd-leak 2 "No such file" '%B --sync-fd 8 '"$B"' /bin/sh -c "ls /proc/self/fd/8" 8<>/dev/null'
+# The --json-status-fd must be closed in the child too, or the sandboxed command
+# inherits it and can forge {"exit-code": …} to the supervisor. The info-fd/
+# sync-fd leak guards above did not cover this fd.
+invx json-status-fd-leak 2 "No such file" '%B --json-status-fd 7 '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7>/dev/null'
 # bwrap's close_ops_fd: the source fd of --file / --bind-data / --bind-fd must
 # NOT leak into the sandbox (regression guard for the op-fd-leak fix).
 invx file-fd-leak      2 "No such file" '%B --file 7 /f '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7<"'"$WORK"'/data.txt"'

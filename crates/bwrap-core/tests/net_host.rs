@@ -5,7 +5,7 @@
 //! when the kernel refuses the namespaces.
 #![allow(clippy::unwrap_used)]
 
-use std::os::fd::{AsFd, AsRawFd};
+use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::ExitCode;
 
@@ -15,7 +15,6 @@ use bwrap_sys::process::{ForkError, clone_into_namespaces};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
 use nix::sched::CloneFlags;
-use nix::sys::socket::{AddressFamily, SockFlag, SockType, SockaddrIn, bind as sock_bind, socket};
 use nix::sys::stat::Mode;
 use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::{ForkResult, Pid};
@@ -62,15 +61,27 @@ fn child(real_uid: u32, real_gid: u32) -> i32 {
     }
 }
 
-fn bind_loopback() -> nix::Result<()> {
-    let s = socket(
-        AddressFamily::Inet,
-        SockType::Datagram,
-        SockFlag::empty(),
-        None,
-    )?;
-    let addr = SockaddrIn::new(127, 0, 0, 1, 0);
-    sock_bind(s.as_raw_fd(), &addr)
+/// Prove loopback is actually UP, not merely that 127.0.0.1 is bindable: `bind`
+/// succeeds as soon as the address exists, link up or not, so a bind alone does
+/// not catch a regression that assigns the address but never sets `IFF_UP`. Send
+/// a datagram to our own bound address and receive it back — that round-trip
+/// needs the link up (a down `lo` fails with ENETUNREACH, or the receive would
+/// block, so cap it with a short timeout).
+fn bind_loopback() -> std::io::Result<()> {
+    use std::net::UdpSocket;
+    use std::time::Duration;
+
+    let s = UdpSocket::bind("127.0.0.1:0")?;
+    let addr = s.local_addr()?;
+    s.set_read_timeout(Some(Duration::from_millis(200)))?;
+    s.send_to(b"x", addr)?;
+    let mut buf = [0u8; 1];
+    let (n, _from) = s.recv_from(&mut buf)?;
+    if n == 1 && buf[0] == b'x' {
+        Ok(())
+    } else {
+        Err(std::io::Error::other("loopback datagram not echoed"))
+    }
 }
 
 fn wait(child: Pid) -> i32 {
