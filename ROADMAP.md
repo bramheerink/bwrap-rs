@@ -127,7 +127,13 @@ our differential conformance oracle. Concrete items it yields:
 - **`ResolvedPath` / parse-don't-validate.** sudo-rs's worst audit finding
   (CLN-001, a path-traversal) was a validate-not-parse failure; for a sandbox that
   resolves bind-mount sources/dests, a typed resolved path is the highest-leverage
-  type move. (This is the architecture review's open question (b).)
+  type move. (This is the architecture review's open question (b).) *First step
+  done:* `setup::ResolvedOps` — the new-root executor
+  (`pivot_into_newroot`/`setup_newroot`) now accepts only ops whose sources were
+  symlink-resolved against the real root (`ResolvedOps::resolve` is the only
+  constructor), so running un-resolved ops is a compile error. Remaining: push the
+  same "resolved" typing down to individual `HostPath`/`SandboxPath` resolution
+  where it still happens by convention.
 - **Privilege roles apart by type — yes; typestate for syscall ordering — no.**
   sudo-rs uses thin id newtypes and a scoped-closure (not typestate) for its
   *dynamic* euid transitions, and still shipped privilege bugs — so typestate buys

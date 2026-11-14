@@ -31,6 +31,7 @@ use crate::fs::{
 use crate::mount::BindOptions;
 use crate::mount::bind::{BindError, bind_mount_fd};
 use crate::mount::special::{mount_mqueue, mount_tmpfs, remount_ro};
+use crate::types::HostPath;
 use crate::types::op::{BindKind, Mode, OnMissing, OverlayUpper, SetupOp};
 
 /// Lossy display of a path for an error message (bwrap prints the raw bytes;
@@ -331,10 +332,10 @@ fn op_label(op: &SetupOp) -> &'static str {
 /// Execute the resolved setup ops against the prepared `/newroot` (bwrap's
 /// `setup_newroot`). Sources are read from `/oldroot`. Must run after the root
 /// tmpfs and `pivot_root` are in place.
-pub fn setup_newroot(ops: &[SetupOp], ctx: &NewrootCtx, fds: &mut FdTable) -> Result<()> {
+pub fn setup_newroot(ops: &ResolvedOps, ctx: &NewrootCtx, fds: &mut FdTable) -> Result<()> {
     let mut tmp_overlay_idx = 0usize;
 
-    for op in ops {
+    for op in ops.as_ops() {
         // Per-op timing for the profiler (BWRAP_RS_PROFILE); no-op when off.
         let _sp = crate::profile::span(op_label(op));
         match op {
@@ -701,6 +702,103 @@ fn get_current_dir_name() -> nix::Result<std::path::PathBuf> {
     nix::unistd::getcwd()
 }
 
+/// A list of [`SetupOp`]s whose bind/overlay source paths have been resolved
+/// against the real root (symlinks canonicalised, a missing non-`-try` source
+/// rejected). The only constructor is [`ResolvedOps::resolve`], and the new-root
+/// executor ([`pivot_into_newroot`] / [`setup_newroot`]) accepts only this type —
+/// so running the setup against ops that were never symlink-resolved (a
+/// symlink-in-source escape class) is a compile error, not a discipline the
+/// reviewer has to enforce.
+#[derive(Debug)]
+pub struct ResolvedOps(Vec<SetupOp>);
+
+impl ResolvedOps {
+    /// Canonicalize the source paths of bind/overlay ops against the real root,
+    /// before the pivot (bwrap's `resolve_symlinks_in_ops`): symlinks in the
+    /// source are resolved, and a missing source fails early with `Can't find
+    /// source path X` unless the op is a `-try` variant. Non-source ops pass
+    /// through unchanged.
+    pub fn resolve(ops: &[SetupOp]) -> Result<Self> {
+        let resolved = ops
+            .iter()
+            .map(|op| match op {
+                SetupOp::Bind {
+                    src,
+                    dest,
+                    kind,
+                    missing,
+                } => Ok(SetupOp::Bind {
+                    src: resolve_source(src, *missing == OnMissing::Skip)?,
+                    dest: dest.clone(),
+                    kind: *kind,
+                    missing: *missing,
+                }),
+                SetupOp::Overlay { lower, upper, dest } => {
+                    // bubblewrap creates the overlay ops as upper
+                    // (SETUP_OVERLAY_MOUNT), then workdir, then the --overlay-src
+                    // list, and resolves them in that order — so resolve
+                    // upper/work BEFORE the lower layers, or the *first* "Can't
+                    // find source path" names a different directory than
+                    // bubblewrap when more than one source is missing (#34).
+                    let upper = match upper {
+                        OverlayUpper::Persistent { upper, work } => OverlayUpper::Persistent {
+                            upper: resolve_source(upper, false)?,
+                            work: resolve_source(work, false)?,
+                        },
+                        OverlayUpper::Tmp => OverlayUpper::Tmp,
+                        OverlayUpper::ReadOnly => OverlayUpper::ReadOnly,
+                    };
+                    let lower = lower
+                        .iter()
+                        .map(|l| resolve_source(l, false))
+                        .collect::<Result<Vec<_>>>()?;
+                    Ok(SetupOp::Overlay {
+                        lower,
+                        upper,
+                        dest: dest.clone(),
+                    })
+                }
+                SetupOp::BindFd { fd, .. } => {
+                    // bwrap stores a bind-fd source as the string "/proc/self/fd/N"
+                    // and realpaths it here like any other bind source
+                    // (bubblewrap.c op->source = "/proc/self/fd/%d"), so a bad fd
+                    // must fail *here* with the same "Can't find source path"
+                    // message — not later with a readlink-specific one. Validate
+                    // the magic link now.
+                    let proc = format!("/proc/self/fd/{fd}");
+                    std::fs::canonicalize(&proc).map_err(|e| Error::Sys {
+                        message: format!("Can't find source path {proc}").into(),
+                        errno: Errno::from_raw(e.raw_os_error().unwrap_or(0)),
+                    })?;
+                    Ok(op.clone())
+                }
+                other => Ok(other.clone()),
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self(resolved))
+    }
+
+    fn as_ops(&self) -> &[SetupOp] {
+        &self.0
+    }
+}
+
+/// `realpath(src)`: resolve symlinks and return the canonical path. A missing
+/// path yields `Can't find source path <src>` (with the errno), unless
+/// `allow_notexist` (a `-try` variant), which keeps the original.
+fn resolve_source(src: &HostPath, allow_notexist: bool) -> Result<HostPath> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::OsStr::from_bytes(src.as_c_str().to_bytes());
+    match std::fs::canonicalize(path) {
+        Ok(p) => HostPath::parse("--bind", &p.to_string_lossy()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && allow_notexist => Ok(src.clone()),
+        Err(e) => Err(Error::Sys {
+            message: format!("Can't find source path {}", src.as_str()).into(),
+            errno: Errno::from_raw(e.raw_os_error().unwrap_or(0)),
+        }),
+    }
+}
+
 /// Build the sandbox root and run the setup (the `pivot_root` dance in bwrap's
 /// `main`): mount a tmpfs at `/tmp`, carve `newroot`/`oldroot` and any
 /// `--tmp-overlay` dirs, `pivot_root` into it, bind `/proc` so `/proc/self/fd`
@@ -712,7 +810,7 @@ fn get_current_dir_name() -> nix::Result<std::path::PathBuf> {
 /// bwrap treats that as a NULL `old_cwd` and falls back to `$HOME` then `/`.
 /// Must run in the sandbox's own mount namespace.
 pub fn pivot_into_newroot(
-    ops: &[SetupOp],
+    ops: &ResolvedOps,
     ctx: &NewrootCtx,
     fds: &mut FdTable,
 ) -> Result<Option<std::path::PathBuf>> {
@@ -762,6 +860,7 @@ pub fn pivot_into_newroot(
     mkdir("oldroot", dir_mode).context("Creating oldroot failed")?;
 
     let tmp_overlays = ops
+        .as_ops()
         .iter()
         .filter(|o| {
             matches!(
