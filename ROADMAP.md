@@ -107,6 +107,42 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   invariants can move from discipline into the type system? Small structural
   improvements only where they clearly pay off.
 
+## Informed by sudo-rs (peer rewrite)
+
+A comparison pass against **sudo-rs** (the Rust rewrite of sudo). Its *philosophy*
+is largely the inverse of ours — it deliberately drops features and diverges for
+safety, where we are byte-exact by mandate — so that part does not transfer. Its
+*engineering process* does, and it validates our bets: our `unsafe` quarantine (a
+dedicated `bwrap-sys` crate) is stronger than its per-module attributes; our
+standing fuzz + mutation legs go beyond its CI; and its hardest-won lesson
+(CVE-2025-64517, a pure logic bug the rewrite introduced) is exactly the case for
+our differential conformance oracle. Concrete items it yields:
+
+- **CI-gate the divergence register.** Bind every DIFFERENCES.md entry to an
+  expected-divergence / xfail conformance case, and add a CI check that (a) no
+  un-registered divergence passes silently and (b) no xfail has started matching
+  the oracle again without being promoted. sudo-rs enforces exactly this ("all
+  ignored tests linked to an issue" / "didn't forget to gate a passing test"); it
+  fits a byte-exact port even better than it fits sudo. Highest-value new item.
+- **`ResolvedPath` / parse-don't-validate.** sudo-rs's worst audit finding
+  (CLN-001, a path-traversal) was a validate-not-parse failure; for a sandbox that
+  resolves bind-mount sources/dests, a typed resolved path is the highest-leverage
+  type move. (This is the architecture review's open question (b).)
+- **Privilege roles apart by type — yes; typestate for syscall ordering — no.**
+  sudo-rs uses thin id newtypes and a scoped-closure (not typestate) for its
+  *dynamic* euid transitions, and still shipped privilege bugs — so typestate buys
+  less than it costs (matches our "ceremony" call, enforce order by statement
+  order). But our roles are *static and discrete* (unprivileged-userns / real-root
+  / setuid-refused), so type-separating them is cheap and sound where sudo-rs's
+  dynamic model could not support it. (#39 is the negative case: a removed role's
+  code paths linger.)
+- **Two cheap `bwrap-sys` practices to adopt:** a two-reviewer rule on every
+  `SAFETY:` comment, and **Miri in CI** over the `bwrap-sys` unit tests.
+- **Scope the `rustix` spike on its own merits.** sudo-rs kept raw `libc` because
+  it is setuid-root (minimise trusted code); that argument is weaker for an
+  *unprivileged* tool, so a safe wrapper that shrinks `bwrap-sys`'s unsafe surface
+  is more defensible for us — evaluate it, keep the one-dependency discipline.
+
 ## Skip (for now)
 
 - **Reproducible builds** — valuable once a distro ships this, but low marginal
