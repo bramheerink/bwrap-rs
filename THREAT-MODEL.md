@@ -34,6 +34,19 @@ The code processes untrusted or semi-trusted input on the privilege boundary:
 4. **Two privilege roles** the parser feeds into: unprivileged user namespaces
    (the Flatpak path) and real root (rpm-ostree/container builders), plus the
    installed-setuid mode, which must be *refused*.
+5. **The kernel surface the namespaces themselves expose.** Creating an
+   *unprivileged* user namespace is the enabler for a whole class of kernel
+   privilege-escalation bugs (overlayfs copy-up, `fs_context`, and friends) —
+   which is why several distributions now gate unprivileged userns behind a
+   sysctl or AppArmor. bwrap-rs cannot fix the kernel, and this surface is the
+   dominant real-world blast radius for *any* userns sandbox, not the setup code.
+   Its job is to not *widen* that surface and to faithfully implement the two
+   caller-supplied mitigations that bound it: a **seccomp filter** (restricting
+   the syscalls the sandboxed process can reach) and **`--disable-userns`**
+   (stopping the sandboxed process from nesting a further user namespace). Both
+   are load-bearing for a hardened deployment — Flatpak uses both — so a filter
+   that is absent or incomplete, or a missing `--disable-userns`, leaves this
+   surface open regardless of how correct bwrap-rs's own setup code is.
 
 ## What the Rust rewrite does and does not change
 
