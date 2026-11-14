@@ -384,7 +384,15 @@ impl Parser<'_> {
                 if self.cfg.hostname.is_some() {
                     self.warn_only_last("--hostname");
                 }
+                // Keep the last value for the `--unshare-uts` requirement check
+                // in `Config::resolve` (bwrap's `opt_sandbox_hostname`), and also
+                // append an ordered op for every occurrence (bwrap's
+                // `SETUP_SET_HOSTNAME`), so each is applied in command-line order
+                // and an invalid earlier one still fails.
                 self.cfg.hostname = Some(rest[1].clone());
+                self.push(SetupOp::SetHostname {
+                    name: rest[1].clone(),
+                });
                 Ok(1)
             }
             "--clearenv" => {
