@@ -17,8 +17,10 @@ use super::flags::BindOptions;
 use crate::error::{Error, MountContext, Result};
 use crate::fs::open::proc_self_fd;
 
-/// `MAX_TMPFS_BYTES`: `SIZE_MAX >> 1` on the 64-bit targets we support.
-const MAX_TMPFS_BYTES: u64 = u64::MAX >> 1;
+/// `MAX_TMPFS_BYTES`: `SIZE_MAX >> 1` on the 64-bit targets we support. Public so
+/// the CLI parser rejects an over-large `--size` with the same limit this mount
+/// layer enforces (one source of truth; they must not drift).
+pub const MAX_TMPFS_BYTES: u64 = u64::MAX >> 1;
 
 fn dest_path(dest: BorrowedFd<'_>) -> CString {
     // /proc/self/fd/N — ASCII, never contains NUL.

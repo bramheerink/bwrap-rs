@@ -184,7 +184,8 @@ fn do_request(fd: std::os::fd::RawFd, pid: u32, msg: &mut NlMsg) -> std::result:
     let mut off = 0;
     while off < wire.len() {
         match sendto(fd, &wire[off..], &kernel, MsgFlags::empty()) {
-            Ok(0) => return Err(Errno::EIO),
+            // Short write -> ENOSPC, matching bubblewrap's write_to_fd (not EIO).
+            Ok(0) => return Err(Errno::ENOSPC),
             Ok(n) => off += n,
             Err(Errno::EINTR) => {}
             Err(e) => return Err(e),

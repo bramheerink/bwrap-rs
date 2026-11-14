@@ -3,6 +3,7 @@
 //! and the `ensure_*` helpers.
 
 pub mod file;
+pub mod io;
 pub mod node;
 pub mod open;
 pub mod resolve;

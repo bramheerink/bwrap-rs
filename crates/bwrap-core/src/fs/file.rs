@@ -6,7 +6,7 @@ use std::os::fd::BorrowedFd;
 
 use nix::errno::Errno;
 use nix::sys::stat::{SFlag, fstat};
-use nix::unistd::{read, write};
+use nix::unistd::read;
 
 /// The file-type bits (`st_mode & S_IFMT`) of an open fd — bwrap's
 /// `get_file_mode`. The executor uses this to choose a bind-mount destination's
@@ -30,15 +30,7 @@ pub fn copy_file_data(src: BorrowedFd<'_>, dst: BorrowedFd<'_>) -> nix::Result<(
             Err(Errno::EINTR) => continue,
             Err(e) => return Err(e),
         };
-        let mut off = 0;
-        while off < n {
-            match write(dst, &buf[off..n]) {
-                Ok(0) => return Err(Errno::EIO),
-                Ok(w) => off += w,
-                Err(Errno::EINTR) => continue,
-                Err(e) => return Err(e),
-            }
-        }
+        crate::fs::io::write_all(dst, &buf[..n])?;
     }
 }
 

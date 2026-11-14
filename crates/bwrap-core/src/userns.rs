@@ -12,7 +12,7 @@ use std::os::fd::{AsFd, BorrowedFd};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat};
 use nix::sys::stat::Mode;
-use nix::unistd::{Pid, write};
+use nix::unistd::Pid;
 
 use crate::error::{Context, Error, Result};
 use crate::types::UsernsProbe;
@@ -161,16 +161,7 @@ fn write_proc_file(dir_fd: BorrowedFd<'_>, name: &str, data: &[u8]) -> nix::Resu
         OFlag::O_RDWR | OFlag::O_CLOEXEC,
         Mode::empty(),
     )?;
-    let mut off = 0;
-    while off < data.len() {
-        match write(&fd, &data[off..]) {
-            Ok(0) => return Err(Errno::EIO),
-            Ok(n) => off += n,
-            Err(Errno::EINTR) => {}
-            Err(e) => return Err(e),
-        }
-    }
-    Ok(())
+    crate::fs::io::write_all(fd.as_fd(), data)
 }
 
 /// Disable the creation of further user namespaces by writing `1` to
@@ -186,27 +177,10 @@ pub fn disable_user_namespaces(proc_fd: BorrowedFd<'_>) -> Result<()> {
         Mode::empty(),
     )
     .context("cannot open /proc/sys/user/max_user_namespaces")?;
-    let mut off = 0;
-    let data = b"1";
-    while off < data.len() {
-        match write(&fd, &data[off..]) {
-            Ok(0) => {
-                return Err(Error::Sys {
-                    message: "sysctl user.max_user_namespaces = 1".into(),
-                    errno: Errno::EIO,
-                });
-            }
-            Ok(n) => off += n,
-            Err(Errno::EINTR) => {}
-            Err(e) => {
-                return Err(Error::Sys {
-                    message: "sysctl user.max_user_namespaces = 1".into(),
-                    errno: e,
-                });
-            }
-        }
-    }
-    Ok(())
+    crate::fs::io::write_all(fd.as_fd(), b"1").map_err(|errno| Error::Sys {
+        message: "sysctl user.max_user_namespaces = 1".into(),
+        errno,
+    })
 }
 
 /// Reads `/proc` and `/sys` to answer the `--unshare-user-try` probe

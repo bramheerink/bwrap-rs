@@ -55,16 +55,7 @@ impl Host<'_> {
     fn read_caller_fd(&mut self, fd: RawFd) -> Result<Vec<u8>, Errno> {
         self.fds.claim(fd).map_err(|_| Errno::EBADF)?;
         let bf = self.fds.borrow(fd).ok_or(Errno::EBADF)?;
-        let mut out = Vec::new();
-        let mut buf = [0u8; 4096];
-        loop {
-            match nix::unistd::read(bf, &mut buf) {
-                Ok(0) => return Ok(out),
-                Ok(n) => out.extend_from_slice(&buf[..n]),
-                Err(Errno::EINTR) => {}
-                Err(e) => return Err(e),
-            }
-        }
+        bwrap_core::fs::io::read_to_end(bf)
     }
 }
 

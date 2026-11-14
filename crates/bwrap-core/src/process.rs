@@ -164,26 +164,10 @@ pub fn sandbox_info_json(format: InfoFormat, child_pid: i32, ns: &NamespaceIds) 
 /// Write `data` to `fd` fully (bwrap's `dump_info` / `write_to_fd`). Takes a
 /// borrowed fd so the caller keeps ownership.
 pub fn write_all(fd: std::os::fd::BorrowedFd<'_>, data: &[u8]) -> Result<()> {
-    let mut off = 0;
-    while off < data.len() {
-        match nix::unistd::write(fd, &data[off..]) {
-            Ok(0) => {
-                return Err(Error::Sys {
-                    message: "write".into(),
-                    errno: Errno::EIO,
-                });
-            }
-            Ok(n) => off += n,
-            Err(Errno::EINTR) => {}
-            Err(e) => {
-                return Err(Error::Sys {
-                    message: "write".into(),
-                    errno: e,
-                });
-            }
-        }
-    }
-    Ok(())
+    crate::fs::io::write_all(fd, data).map_err(|errno| Error::Sys {
+        message: "write".into(),
+        errno,
+    })
 }
 
 /// Write an info/status document, mapping a write failure to bwrap's `dump_info`
