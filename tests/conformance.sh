@@ -340,6 +340,10 @@ ab  ipc              -- "${BASE[@]}" --unshare-ipc /bin/true
 inv ipc-isolated 0 'isolated' -- "${BASE[@]}" --unshare-ipc /bin/sh -c '[ "$(readlink /proc/self/ns/ipc)" != "'"$host_ipc"'" ] && echo isolated || echo shared'
 ab  user-try         -- "${BASE[@]}" --unshare-user-try /bin/true
 ab  uid-gid          -- "${BASE[@]}" --uid 0 --gid 0 /bin/sh -c 'id -u; id -g'
+# With --dev (the second-user-namespace path) --gid must still map the requested
+# gid, not gid 0. Observes id -u/-g so a mutant that maps gid 0 in the inner
+# userns is caught (the uid-gid case above uses 0/0 and no --dev).
+ab  dev-uid-gid      -- "${BASE[@]}" --dev /dev --uid 5 --gid 7 /bin/sh -c 'id -u; id -g'
 ab  as-pid-1         -- "${BASE[@]}" --unshare-pid --as-pid-1 /bin/sh -c 'echo $$'
 inv pid-small 0 "small" -- "${BASE[@]}" --unshare-pid /bin/sh -c 'test $$ -lt 50 && echo small'
 
@@ -387,6 +391,11 @@ abx seccomp-allow    '%B --seccomp 9 '"$B"' /bin/true 9<"'"$WORK"'/allow.bpf"'
 abx seccomp-deny     '%B --seccomp 9 '"$B"' --tmpfs /w /bin/sh -c "mkdir /w/x 2>&1; echo e=\$?" 9<"'"$WORK"'/deny.bpf"'
 abx add-seccomp-fd   '%B --add-seccomp-fd 9 '"$B"' /bin/true 9<"'"$WORK"'/allow.bpf"'
 ab  seccomp-bad-fd   -- "${BASE[@]}" --seccomp 99 /bin/true
+# Every --add-seccomp-fd must be installed, not just the first (flatpak passes
+# several). With an allow-all filter (8) and a mkdir-denying filter (9), mkdir
+# must still be blocked and Seccomp_filters must read 2; a mutant that installs
+# only the first makes mkdir succeed and the count drop to 1.
+abx add-seccomp-fd-two '%B '"$B"' --tmpfs /w --add-seccomp-fd 8 --add-seccomp-fd 9 /bin/sh -c "mkdir /w/x 2>&1; echo e=\$?; grep Seccomp_filters /proc/self/status" 8<"'"$WORK"'/allow.bpf" 9<"'"$WORK"'/deny.bpf"'
 
 # === fds / blocking =======================================================
 abx block-fd         '%B --block-fd 8 '"$B"' /bin/true 8<"'"$WORK"'/data.txt"'
@@ -399,9 +408,23 @@ invx json-status 0 '"exit-code"' '%B --json-status-fd 8 '"$B"' /bin/true 8>"'"$W
 ab  cap-drop-all     -- "${BASE[@]}" --cap-drop ALL /bin/sh -c 'grep CapEff /proc/self/status'
 ab  cap-add-one      -- "${BASE[@]}" --cap-drop ALL --cap-add CAP_SYS_ADMIN /bin/sh -c 'grep CapEff /proc/self/status'
 ab  cap-bad-name     -- "${BASE[@]}" --cap-add NOT_A_CAP /bin/true
+# The bounding set must stay empty after the second unshare(CLONE_NEWUSER) that
+# --dev and --disable-userns trigger (that unshare restores CapBnd, so it must be
+# re-dropped). cap-drop-all above only greps CapEff, which the re-restore does
+# not change. Both paths must show CapBnd all-zero.
+ab  capbnd-dev       -- "${BASE[@]}" --dev /dev /bin/sh -c 'grep CapBnd /proc/self/status'
+ab  capbnd-disable-userns -- "${BASE[@]}" --disable-userns /bin/sh -c 'grep CapBnd /proc/self/status'
 
 # === session / misc =======================================================
 ab  new-session      -- "${BASE[@]}" --new-session /bin/sh -c 'echo ok'
+# --new-session must actually setsid (its reason to exist: TIOCSTI protection),
+# so the sandboxed process is a session leader (its session id equals its pid).
+# The plain new-session case above runs echo and cannot tell setsid apart.
+ab  new-session-setsid -- "${BASE[@]}" --new-session /bin/sh -c 'read -r a b c d e f g </proc/self/stat; [ "$f" = "$a" ] && echo session-leader || echo NOT-session-leader'
+# The sandboxed command must run with the launcher's umask restored, not the 0
+# bwrap uses during setup. Run under umask 027 so a mutant that skips the restore
+# (child umask 0000) is caught; a hard-coded 0022 would not prove the restore.
+abx umask-preserved  "( umask 027; %B $B /bin/sh -c umask )"
 ab  die-with-parent  -- "${BASE[@]}" --die-with-parent /bin/true
 ab  not-a-boundary   -- "${BASE[@]}" --not-a-security-boundary /bin/true
 
@@ -418,6 +441,10 @@ inv nnp-set       0 "NoNewPrivs:	1" -- "${BASE[@]}" /bin/sh -c 'grep NoNewPrivs 
 inv dev-has-null  0 "yes"            -- "${BASE[@]}" --dev /dev /bin/sh -c 'test -c /dev/null && echo yes'
 invx info-fd-leak 2 "No such file" '%B --info-fd 7 '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7>/dev/null'
 invx sync-fd-leak 2 "No such file" '%B --sync-fd 8 '"$B"' /bin/sh -c "ls /proc/self/fd/8" 8<>/dev/null'
+# The --json-status-fd must be closed in the child too, or the sandboxed command
+# inherits it and can forge {"exit-code": …} to the supervisor. The info-fd/
+# sync-fd leak guards above did not cover this fd.
+invx json-status-fd-leak 2 "No such file" '%B --json-status-fd 7 '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7>/dev/null'
 # bwrap's close_ops_fd: the source fd of --file / --bind-data / --bind-fd must
 # NOT leak into the sandbox (regression guard for the op-fd-leak fix).
 invx file-fd-leak      2 "No such file" '%B --file 7 /f '"$B"' /bin/sh -c "ls /proc/self/fd/7" 7<"'"$WORK"'/data.txt"'
