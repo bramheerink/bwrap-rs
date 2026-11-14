@@ -96,40 +96,49 @@ fail() { FAIL=$((FAIL+1)); FAILED+=("  [$1] $2"); }
 skip() { SKIP=$((SKIP+1)); echo "  SKIP [$1] $2"; }
 norm() { sed -e "s#$OURS#BWRAP#g" -e "s#$REAL#BWRAP#g"; }
 
-# ab NAME -- ARGS... : require ours == real (exit+stdout+stderr byte-identical).
-ab() {
-    local name="$1"; shift 2
-    local oo oe oc ro re rc
-    oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
+# Byte-exact A/B comparison. ours and real are run with stdout and stderr each to
+# their own file; the files are compared with `cmp`, NOT `$(...)` captures —
+# command substitution strips trailing newlines and NUL bytes, so a divergence
+# confined to trailing bytes (e.g. extra newlines on --version/--help) would pass
+# a capture compare. `norm` maps the binary path to BWRAP; GNU sed preserves a
+# missing final newline, so the comparison stays byte-faithful. OC/RC are the
+# captured exit codes (globals, set by the callers below).
+_cmp() {   # $1=name  $2=mode (any | zero)
+    local name="$1" mode="$2"
     if [ "$HAVE_REAL" != 1 ]; then
         # No oracle: we ran ours (a smoke check) but cannot prove byte-identity,
         # so report SKIP rather than a dishonest pass. REQUIRE_REAL would already
         # have aborted the run above.
-        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
+        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $OC)"
         return
     fi
-    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
+    norm <"$WORK/o.ours" >"$WORK/o.ours.n"; norm <"$WORK/o.real" >"$WORK/o.real.n"
+    norm <"$WORK/e.ours" >"$WORK/e.ours.n"; norm <"$WORK/e.real" >"$WORK/e.real.n"
+    [ "$OC" = "$RC" ] || { fail "$name" "exit ours=$OC real=$RC"; return; }
+    cmp -s "$WORK/o.ours.n" "$WORK/o.real.n" \
+        || { fail "$name" "stdout: ours=[$(cat "$WORK/o.ours.n")] real=[$(cat "$WORK/o.real.n")]"; return; }
+    cmp -s "$WORK/e.ours.n" "$WORK/e.real.n" \
+        || { fail "$name" "stderr: ours=[$(cat "$WORK/e.ours.n")] real=[$(cat "$WORK/e.real.n")]"; return; }
+    [ "$mode" != zero ] || [ "$RC" = 0 ] \
+        || { fail "$name" "yes-form must succeed but exit=$RC (err=$(cat "$WORK/e.ours.n"))"; return; }
     ok "$name"
+}
+
+# ab NAME -- ARGS... : require ours == real (exit+stdout+stderr byte-identical).
+ab() {
+    local name="$1"; shift 2
+    "$OURS" "$@" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { "$REAL" "$@" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" any
 }
 
 # abx NAME 'TEMPLATE' : TEMPLATE is a shell line with %B for the binary and may
 # contain fd redirections. Require ours == real after %B substitution.
 abx() {
     local name="$1" tmpl="$2"
-    local oo oe oc ro re rc
-    oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" != 1 ]; then
-        skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"
-        return
-    fi
-    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
-    ok "$name"
+    eval "${tmpl//%B/$OURS}" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { eval "${tmpl//%B/$REAL}" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" any
 }
 
 # inv NAME WANTEXIT SUBSTR -- ARGS... : ours-only invariant.
@@ -159,27 +168,15 @@ invx() {
 # and keep ab/abx/inv for guardrails that expect a specific non-zero exit.
 ab0() {
     local name="$1"; shift 2
-    local oo oe oc ro re rc
-    oo=$("$OURS" "$@" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" != 1 ]; then skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"; return; fi
-    ro=$("$REAL" "$@" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
-    [ "$rc" = 0 ] || { fail "$name" "yes-form must succeed but exit=$rc (err=$re)"; return; }
-    ok "$name"
+    "$OURS" "$@" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { "$REAL" "$@" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" zero
 }
 abx0() {
     local name="$1" tmpl="$2"
-    local oo oe oc ro re rc
-    oo=$(eval "${tmpl//%B/$OURS}" 2>"$WORK/oe" | norm); oc=${PIPESTATUS[0]}; oe=$(norm <"$WORK/oe")
-    if [ "$HAVE_REAL" != 1 ]; then skip "$name" "no bubblewrap 0.13.1 oracle (ours exit $oc)"; return; fi
-    ro=$(eval "${tmpl//%B/$REAL}" 2>"$WORK/re" | norm); rc=${PIPESTATUS[0]}; re=$(norm <"$WORK/re")
-    [ "$oc" = "$rc" ] || { fail "$name" "exit ours=$oc real=$rc (oe=$oe re=$re)"; return; }
-    [ "$oo" = "$ro" ] || { fail "$name" "stdout: ours=[$oo] real=[$ro]"; return; }
-    [ "$oe" = "$re" ] || { fail "$name" "stderr: ours=[$oe] real=[$re]"; return; }
-    [ "$rc" = 0 ] || { fail "$name" "yes-form must succeed but exit=$rc (err=$re)"; return; }
-    ok "$name"
+    eval "${tmpl//%B/$OURS}" >"$WORK/o.ours" 2>"$WORK/e.ours"; OC=$?
+    [ "$HAVE_REAL" = 1 ] && { eval "${tmpl//%B/$REAL}" >"$WORK/o.real" 2>"$WORK/e.real"; RC=$?; }
+    _cmp "$name" zero
 }
 
 # ---- fixtures -------------------------------------------------------------
@@ -307,7 +304,19 @@ ab  dir              -- "${BASE[@]}" --dir /made /bin/sh -c 'test -d /made && ec
 ab  tmpfs            -- "${BASE[@]}" --tmpfs /t /bin/sh -c 'test -d /t && echo yes'
 ab  perms-dir        -- "${BASE[@]}" --perms 0750 --dir /d /bin/sh -c 'stat -c %a /d'
 ab  size-no-tmpfs    -- "${BASE[@]}" --size 4096 /bin/true
+# --size must actually cap the tmpfs (callers rely on it to bound memory); the
+# size-no-tmpfs case above only checks the *error* for --size without --tmpfs.
+ab  tmpfs-size       -- "${BASE[@]}" --size 65536 --tmpfs /t /bin/sh -c "grep ' /t ' /proc/self/mountinfo | grep -o 'size=[0-9a-z]*' || echo no-size"
+# --perms must apply to a --tmpfs too, not just --dir (perms-dir only covers --dir),
+# or e.g. --perms 0700 --tmpfs /private is world-readable.
+ab  perms-tmpfs      -- "${BASE[@]}" --perms 0700 --tmpfs /t /bin/sh -c 'stat -c %a /t'
 ab  chmod            -- "${BASE[@]}" --dir /d --chmod 0700 /d /bin/sh -c 'stat -c %a /d'
+# --chmod must keep the sticky/setuid/setgid bits (chmod above only tests 0700),
+# or --chmod 1777 /tmp silently becomes 0777.
+ab  chmod-sticky     -- "${BASE[@]}" --dir /d --chmod 1777 /d /bin/sh -c 'stat -c %a /d'
+# --dev must create the full node set, not just /dev/null (dev-has-null checks
+# only null); a program opening /dev/random must find it.
+ab  dev-nodes        -- "${BASE[@]}" --dev /dev /bin/sh -c 'ls /dev | tr "\n" " "'
 # A failing --chmod prints the mode with C's %#o formatting (0700, 0), not Rust's
 # {:#o} (0o700, 0o0).
 ab  chmod-ro-msg     -- --ro-bind / / --chmod 700 /etc true
@@ -336,6 +345,14 @@ ab  hostname-no-uts  -- "${BASE[@]}" --hostname nope /bin/true
 HN=$(printf 'a%.0s' $(seq 1 70))
 ab  hostname-order   -- "${BASE[@]}" --unshare-uts --hostname "$HN" --hostname ok /bin/hostname
 ab  net-only-lo      -- "${BASE[@]}" --unshare-net /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
+# loopback must be brought UP, not just given its address: net-only-lo checks the
+# interface name only, and bind(127.0.0.1) succeeds on a down link, so the UP flag
+# can regress unnoticed. Needs iproute2.
+if command -v ip >/dev/null 2>&1; then
+    ab net-lo-up     -- "${BASE[@]}" --unshare-net /bin/sh -c "ip -o link show lo | grep -o '<.*>'"
+else
+    skip net-lo-up "iproute2 (ip) unavailable"
+fi
 ab  share-net-ifs    -- "${BASE[@]}" --unshare-all --share-net --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc /bin/sh -c 'grep -oE "[a-z0-9]+:" /proc/net/dev | sort'
 ab  cgroup-root      -- "${BASE[@]}" --unshare-cgroup /bin/sh -c 'cat /proc/self/cgroup'
 ab  cgroup-try       -- "${BASE[@]}" --unshare-cgroup-try /bin/true
