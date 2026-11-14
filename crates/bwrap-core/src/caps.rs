@@ -107,11 +107,6 @@ pub fn drop_bounding_set(keep: CapSet) -> Result<()> {
     prctl_caps(keep, true, false)
 }
 
-/// Drop the entire bounding set (bwrap's `drop_cap_bounding_set(true)`).
-pub fn drop_all_bounding_set() -> Result<()> {
-    prctl_caps(CapSet::EMPTY, true, false)
-}
-
 /// Raise into the ambient set every capability in `keep`
 /// (bwrap's `set_ambient_capabilities`).
 pub fn set_ambient(keep: CapSet) -> Result<()> {

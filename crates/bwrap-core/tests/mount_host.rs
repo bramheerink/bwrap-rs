@@ -12,7 +12,7 @@ use std::path::Path;
 use std::process::ExitCode;
 
 use bwrap_core::mount::{BindOptions, bind_mount, mount_mqueue, mount_tmpfs, remount_ro};
-use bwrap_core::userns::{IdMap, MapTarget, OverflowIds};
+use bwrap_core::userns::IdMap;
 use bwrap_sys::process::{ForkError, clone_into_namespaces};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
@@ -35,9 +35,6 @@ fn open_opath(p: &Path) -> nix::Result<std::os::fd::OwnedFd> {
 fn child(base: &Path, real_uid: u32, real_gid: u32) -> i32 {
     // Map ourselves to uid/gid 0 so the user namespace is complete (an
     // unmapped userns refuses some mounts, e.g. mqueue). Mirrors bwrap.
-    let Ok(overflow) = OverflowIds::read() else {
-        return 14;
-    };
     let Ok(proc_fd) = open_opath(Path::new("/proc")) else {
         return 15;
     };
@@ -46,11 +43,9 @@ fn child(base: &Path, real_uid: u32, real_gid: u32) -> i32 {
         parent_uid: real_uid,
         sandbox_gid: 0,
         parent_gid: real_gid,
-        overflow,
-        map_root: false,
         deny_groups: true,
     };
-    if idmap.write(proc_fd.as_fd(), MapTarget::SelfProc).is_err() {
+    if idmap.write(proc_fd.as_fd()).is_err() {
         return 16;
     }
 

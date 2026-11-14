@@ -12,7 +12,7 @@ use std::process::ExitCode;
 
 use bwrap_core::setup::{NewrootCtx, pivot_into_newroot};
 use bwrap_core::types::{BindKind, HostPath, Mode, OnMissing, SandboxPath, SetupOp};
-use bwrap_core::userns::{IdMap, MapTarget, OverflowIds};
+use bwrap_core::userns::IdMap;
 use bwrap_sys::process::{ForkError, clone_into_namespaces};
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
@@ -31,9 +31,6 @@ fn host(v: &str) -> HostPath {
 /// Build the sandbox and run the checks. Returns 0 on success, else a step code.
 fn child(real_uid: u32, real_gid: u32) -> i32 {
     // Become root in the new user namespace so we may mount.
-    let Ok(overflow) = OverflowIds::read() else {
-        return 1;
-    };
     let Ok(proc_fd) = open(
         Path::new("/proc"),
         OFlag::O_PATH | OFlag::O_CLOEXEC,
@@ -46,11 +43,9 @@ fn child(real_uid: u32, real_gid: u32) -> i32 {
         parent_uid: real_uid,
         sandbox_gid: 0,
         parent_gid: real_gid,
-        overflow,
-        map_root: false,
         deny_groups: true,
     };
-    if idmap.write(proc_fd.as_fd(), MapTarget::SelfProc).is_err() {
+    if idmap.write(proc_fd.as_fd()).is_err() {
         return 3;
     }
 
