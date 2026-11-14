@@ -99,6 +99,17 @@ security framing and [ROADMAP.md](ROADMAP.md) for the north star.
    until then this is documented rather than worked around. A sandbox started
    with all of stdin/stdout/stderr open — the normal case — is unaffected.
 
+10. **The `--bind-fd` post-mount race error carries no errno suffix.** When a
+    `--bind-fd`/`--ro-bind-fd` destination resolves to a different inode than the
+    caller's fd (the path was swapped under the mount), both abort with exit 1 and
+    the line `Race condition binding dirfd`. bubblewrap's `die_with_error` appends
+    `: <strerror(errno)>` using whatever errno the last failing libc call happened
+    to leave (in the reproducible case `: File exists`), so the suffix is a stale
+    value not set by the check itself; `bwrap-rs` omits it and prints the message
+    alone. This is a near-unreachable TOCTOU guard; the exit code is identical and
+    a well-formed bind is byte-identical. (Distinct from deviation 8, which is the
+    fd-*reuse* path that fails earlier at `readlink`.)
+
 ## Everything else
 
 Outside this list, any divergence from bubblewrap 0.13.1 is a bug. Please report

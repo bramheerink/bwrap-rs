@@ -829,10 +829,11 @@ fn resolve_symlinks_in_ops(ops: &[SetupOp]) -> Result<Vec<SetupOp>> {
                 missing: *missing,
             }),
             SetupOp::Overlay { lower, upper, dest } => {
-                let lower = lower
-                    .iter()
-                    .map(|l| resolve_source(l, false))
-                    .collect::<Result<Vec<_>>>()?;
+                // bubblewrap creates the overlay ops as upper (SETUP_OVERLAY_MOUNT),
+                // then workdir, then the --overlay-src list, and resolves them in
+                // that order — so resolve upper/work BEFORE the lower layers, or
+                // the *first* "Can't find source path" names a different directory
+                // than bubblewrap when more than one source is missing (#34).
                 let upper = match upper {
                     OverlayUpper::Persistent { upper, work } => OverlayUpper::Persistent {
                         upper: resolve_source(upper, false)?,
@@ -841,6 +842,10 @@ fn resolve_symlinks_in_ops(ops: &[SetupOp]) -> Result<Vec<SetupOp>> {
                     OverlayUpper::Tmp => OverlayUpper::Tmp,
                     OverlayUpper::ReadOnly => OverlayUpper::ReadOnly,
                 };
+                let lower = lower
+                    .iter()
+                    .map(|l| resolve_source(l, false))
+                    .collect::<Result<Vec<_>>>()?;
                 Ok(SetupOp::Overlay {
                     lower,
                     upper,

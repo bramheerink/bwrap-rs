@@ -475,6 +475,10 @@ ab0 tmp-overlay      -- "${BASE[@]}" --overlay-src "$WORK/ov/low" --tmp-overlay 
 # (it formats op->dest after advancing op onto an overlay-src entry); match it
 # byte-for-byte, including that quirk.
 ab  overlay-overlap  -- --unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --overlay-src /usr --overlay-src /usr --ro-overlay /mnt /bin/true
+# Source resolution order: with both an --overlay-src and the --overlay upper
+# missing, bubblewrap names the upper first (it resolves upper/workdir before the
+# overlay-src list). Catches the port resolving the lower layers first (#34).
+ab  overlay-src-order -- "${BASE[@]}" --overlay-src /nonexistent1 --overlay /nonexistent2 /nonexistent3 /mnt /bin/true
 
 # === security invariants (ours-only; module-11 review regressions) ========
 inv nnp-set       0 "NoNewPrivs:	1" -- "${BASE[@]}" /bin/sh -c 'grep NoNewPrivs /proc/self/status'
