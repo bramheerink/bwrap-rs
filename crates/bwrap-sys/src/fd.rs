@@ -125,8 +125,22 @@ mod tests {
     use super::*;
     use std::os::fd::AsRawFd;
 
+    /// These tests open and `close(2)` raw, process-global fd *numbers*. Run in
+    /// parallel (cargo's default), one test's `close` can hit a number another
+    /// test just reused, so a concurrent `claim`/`borrow` sees it already shut.
+    /// Serialize them (no extra dependency) so raw-fd manipulation never
+    /// overlaps. Poison is recovered since a failing test would otherwise wedge
+    /// the rest.
+    static FD_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    fn fd_guard() -> std::sync::MutexGuard<'static, ()> {
+        FD_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     #[test]
     fn claim_rejects_bad_numbers() {
+        let _serialize = fd_guard();
         let mut t = FdTable::new();
         assert_eq!(t.claim(-1).unwrap_err().raw_os_error(), Some(libc::EBADF));
         // A number that is almost certainly not an open descriptor in a test proc.
@@ -135,6 +149,7 @@ mod tests {
 
     #[test]
     fn claim_borrow_close_cycle() {
+        let _serialize = fd_guard();
         let (r, w) = nix::unistd::pipe().expect("pipe");
         let fd = r.as_raw_fd();
         // Hand the read end's number to the table as if it were inherited raw, so
@@ -158,6 +173,7 @@ mod tests {
 
     #[test]
     fn claim_is_idempotent() {
+        let _serialize = fd_guard();
         let (r, w) = nix::unistd::pipe().expect("pipe");
         let fd = r.as_raw_fd();
         std::mem::forget(r);
@@ -171,6 +187,7 @@ mod tests {
 
     #[test]
     fn register_is_unchecked_and_reregister_after_close() {
+        let _serialize = fd_guard();
         let (r, w) = nix::unistd::pipe().expect("pipe");
         let fd = r.as_raw_fd();
         std::mem::forget(r);
