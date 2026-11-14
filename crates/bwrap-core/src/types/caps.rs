@@ -15,9 +15,10 @@ use crate::error::Error;
 /// The canonical capability names, indexed by capability number.
 ///
 /// Positions 0..=40 as of Linux 6.x (`CAP_CHOWN` .. `CAP_CHECKPOINT_RESTORE`).
-// TODO: Verify against the running kernel's cap_last_cap at startup; a newer
-// kernel may define further capabilities. Unknown-but-numbered caps are still
-// representable in the u64 mask; only name lookup is limited to this table.
+// The running kernel's `cap_last_cap` is probed separately (see `caps.rs`) for
+// the bounding-set operations; this static table only maps numbers to names. A
+// kernel newer than 6.x may define further capabilities — those stay usable in
+// the u64 mask; only their name lookup is limited to this table.
 const CAP_NAMES: &[&str] = &[
     "CAP_CHOWN",              // 0
     "CAP_DAC_OVERRIDE",       // 1

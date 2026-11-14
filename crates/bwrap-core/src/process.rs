@@ -3,9 +3,9 @@
 //! corresponding pieces of `bubblewrap.c`.
 //!
 //! The monitor (`monitor_child`, signalfd + poll) and the pid-1 reaper
-//! (`do_init`) are the runtime loops; they land with the orchestration in
-//! module 11, where the event/sync/setup fds exist and can be host-tested.
-//! This file holds the parts that are self-contained and unit-testable.
+//! (`do_init`) are the runtime loops; they live here alongside the
+//! self-contained, unit-testable helpers, driven by the orchestration in
+//! `run.rs`, which supplies the event/sync/setup fds they operate on.
 //!
 //! `monitor_child`/`do_init` convert small kernel values (eventfd payloads that
 //! carry exit-code+1, SIGCHLD-derived wait statuses) between integer widths;

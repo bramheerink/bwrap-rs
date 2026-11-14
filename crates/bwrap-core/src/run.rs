@@ -910,9 +910,6 @@ fn create_pid_socketpair() -> Result<(OwnedFd, OwnedFd)> {
     Ok((a, b))
 }
 
-/// Fork to actually enter a pid namespace joined/created via setns/unshare (which
-/// only affect children). The parent half is not needed and exits (bwrap's
-/// `fork_intermediate_child`); only the child returns.
 /// Print an error the way bwrap's `die` does and exit the sandbox child with 1.
 /// Used on the clone-child setup path, where we cannot return a `Result`.
 /// Generic in the (never produced) return type so it fits `unwrap_or_else`.
@@ -921,6 +918,9 @@ fn die_in_child<T>(e: Error) -> T {
     bwrap_sys::process::exit_immediately(1)
 }
 
+/// Fork to actually enter a pid namespace joined/created via setns/unshare (which
+/// only affect children). The parent half is not needed and exits (bwrap's
+/// `fork_intermediate_child`); only the child returns.
 fn fork_intermediate() -> Result<()> {
     match bwrap_sys::process::fork_single_threaded() {
         Ok(nix::unistd::ForkResult::Parent { .. }) => bwrap_sys::process::exit_immediately(0),
