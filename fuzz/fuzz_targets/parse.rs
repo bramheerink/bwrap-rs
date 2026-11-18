@@ -10,12 +10,19 @@ use std::ffi::OsString;
 use std::os::fd::RawFd;
 use std::os::unix::ffi::OsStrExt;
 
-/// A host that never touches real descriptors: `--args`/`--add-seccomp-fd` reads
-/// fail (exercising the parser's error path without needing live fds) and
+/// A host that never touches real descriptors or process state: `--args`/
+/// `--add-seccomp-fd` reads fail (exercising the parser's error path without
+/// needing live fds), SELinux labels are accepted without being installed, and
 /// warnings are dropped. This drives the pure argument grammar.
 struct FuzzHost;
 
 impl ParseHost for FuzzHost {
+    fn validate_label(&mut self, _label: &std::ffi::OsStr) -> Result<(), bwrap_core::Error> {
+        Ok(())
+    }
+    fn set_file_label(&mut self, _label: &std::ffi::OsStr) -> Result<(), bwrap_core::Error> {
+        Ok(())
+    }
     fn read_args(&mut self, _fd: RawFd) -> Result<Vec<u8>, bwrap_core::Error> {
         Err(bwrap_core::Error::invalid("fuzz: no fd available"))
     }

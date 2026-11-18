@@ -22,10 +22,14 @@
 //! call sites discharge by releasing (dropping / `into_raw_fd`) every other owned
 //! fd before the walk. See each call site's `# Caution`/keep-list comment.
 //!
+//! Two more safe functions carry a process-level contract, stated on each:
+//! [`fd::FdTable::adopt`] must only be given numbers inherited from the launcher,
+//! and [`process::seal_single_thread_guard`] must not be followed by a new thread.
+//! Both narrow an obligation that the compiler cannot check to one call site.
+//!
 //! The inherited command-line fds (`--bind-fd`, `--info-fd`, …) no longer use a
-//! free `borrow_raw`: [`fd::FdTable`] owns their numbers and hands out borrows
-//! tied to its own lifetime, so the unsafe `BorrowedFd::borrow_raw` is contained
-//! and the lifetime contract is checked by the borrow checker.
+//! free `borrow_raw`: [`fd::FdTable`] owns their numbers, verifies each one open
+//! before lending it, and ties every borrow to its own lifetime.
 //!
 //! | Module         | Syscall(s)                                             |
 //! |----------------|--------------------------------------------------------|

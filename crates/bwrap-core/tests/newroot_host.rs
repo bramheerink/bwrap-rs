@@ -75,8 +75,8 @@ fn child(real_uid: u32, real_gid: u32) -> i32 {
     let ctx = NewrootCtx::default(); // unshare_pid=false -> /proc host-bound
 
     // No op in this test carries a caller fd, so a fresh empty table suffices.
-    let mut fds = bwrap_sys::fd::FdTable::new();
-    let resolved = match ResolvedOps::resolve(&ops) {
+    let mut fds = bwrap_sys::fd::FdTable::acquire().expect("first table in this process");
+    let resolved = match ResolvedOps::resolve(&ops, &fds) {
         Ok(r) => r,
         Err(e) => {
             eprintln!("  resolve: {e}");

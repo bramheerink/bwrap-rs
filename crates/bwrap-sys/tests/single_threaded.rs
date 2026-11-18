@@ -7,13 +7,17 @@
 //! seccomp. Tests that need user namespaces report SKIP when the
 //! environment forbids them (e.g. nested in another sandbox).
 
-use std::os::fd::AsFd;
+use std::ffi::CString;
+use std::os::fd::{AsFd, AsRawFd, IntoRawFd};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use bwrap_sys::ForkError;
 use bwrap_sys::mount_attr::{MountAttrFlags, Recursion, mount_setattr};
-use bwrap_sys::process::{clone_into_namespaces, fork_single_threaded};
+use bwrap_sys::process::{
+    EnvError, EnvOp, PreparedExec, apply_env, clone_into_namespaces, close_extra_fds,
+    fork_single_threaded, seal_single_thread_guard,
+};
 use bwrap_sys::seccomp::Program;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, open};
@@ -109,6 +113,11 @@ const FILTER_ERRNO: Errno = Errno::EXFULL;
 /// fail and never sets errno for it, so a filtered `getppid` cannot be told
 /// apart reliably.
 fn deny_getcwd_program() -> Program {
+    deny_syscall_program(libc::SYS_getcwd, FILTER_ERRNO)
+}
+
+/// BPF: syscall `nr` fails with `errno`, everything else allowed.
+fn deny_syscall_program(nr: libc::c_long, errno: Errno) -> Program {
     fn insn(code: u32, jt: u8, jf: u8, k: u32) -> [u8; 8] {
         let code = u16::try_from(code).expect("BPF opcode fits u16");
         let mut b = [0u8; 8];
@@ -118,12 +127,12 @@ fn deny_getcwd_program() -> Program {
         b[4..8].copy_from_slice(&k.to_ne_bytes());
         b
     }
-    let nr = u32::try_from(libc::SYS_getcwd).expect("syscall nr fits u32");
-    let errno = u32::try_from(FILTER_ERRNO as i32).expect("errno fits u32");
+    let nr = u32::try_from(nr).expect("syscall nr fits u32");
+    let errno = u32::try_from(errno as i32).expect("errno fits u32");
     let mut bytes = Vec::new();
     // A = seccomp_data.nr (offset 0)
     bytes.extend(insn(libc::BPF_LD | libc::BPF_W | libc::BPF_ABS, 0, 0, 0));
-    // if A == SYS_getcwd goto deny else goto allow
+    // if A == nr goto deny else goto allow
     bytes.extend(insn(libc::BPF_JMP | libc::BPF_JEQ | libc::BPF_K, 0, 1, nr));
     bytes.extend(insn(
         libc::BPF_RET | libc::BPF_K,
@@ -484,6 +493,237 @@ fn test_mount_setattr_non_mountpoint() -> Outcome {
     })
 }
 
+/// A thread started after an earlier successful check must be seen, until the
+/// guard is sealed.
+fn test_guard_sees_later_thread() -> Outcome {
+    const STEPS: &[&str] = &[
+        "first check while single-threaded",
+        "fork must be refused once a thread exists",
+        "apply_env must be refused once a thread exists",
+    ];
+    match fork_single_threaded() {
+        Ok(ForkResult::Child) => {
+            if apply_env(&[]).is_err() {
+                exit_child(1);
+            }
+            let (_keep_alive, parked) = std::sync::mpsc::channel::<()>();
+            let _thread = std::thread::spawn(move || parked.recv());
+            if !matches!(
+                fork_single_threaded(),
+                Err(ForkError::MultiThreaded { threads: 2 })
+            ) {
+                exit_child(2);
+            }
+            if !matches!(
+                apply_env(&[]),
+                Err(EnvError::Guard(ForkError::MultiThreaded { threads: 2 }))
+            ) {
+                exit_child(3);
+            }
+            exit_child(0)
+        }
+        Ok(ForkResult::Parent { child }) => match wait_child(child) {
+            Ok(code) => from_child_code(code, STEPS),
+            Err(e) => Outcome::Fail(e),
+        },
+        Err(e) => Outcome::Fail(format!("fork: {e}")),
+    }
+}
+
+/// After the seal a planted `/proc/self/status` cannot influence the guard. The
+/// planted count of 2 would refuse the fork if the guard still read `/proc`.
+fn test_sealed_guard_ignores_proc() -> Outcome {
+    const STEPS: &[&str] = &[
+        "fork must ignore the planted thread count",
+        "make / MS_SLAVE|MS_REC",
+        "bind the planted tree over /proc",
+    ];
+    let planted: PathBuf =
+        std::env::temp_dir().join(format!("bwrap-sys-planted-proc-{}", std::process::id()));
+    let status = planted.join("self");
+    if let Err(e) = std::fs::create_dir_all(&status)
+        .and_then(|()| std::fs::write(status.join("status"), "Threads:\t2\n"))
+    {
+        return Outcome::Fail(format!("create {}: {e}", planted.display()));
+    }
+    let outcome = in_userns(STEPS, || {
+        seal_single_thread_guard();
+        if mount(
+            None::<&str>,
+            "/",
+            None::<&str>,
+            MsFlags::MS_SLAVE | MsFlags::MS_REC,
+            None::<&str>,
+        )
+        .is_err()
+        {
+            return 2;
+        }
+        if mount(
+            Some(planted.as_path()),
+            "/proc",
+            None::<&str>,
+            MsFlags::MS_BIND,
+            None::<&str>,
+        )
+        .is_err()
+        {
+            return 3;
+        }
+        match fork_single_threaded() {
+            Ok(ForkResult::Child) => bwrap_sys::process::exit_immediately(0),
+            Ok(ForkResult::Parent { child }) => match wait_child(child) {
+                Ok(0) => 0,
+                _ => 1,
+            },
+            Err(_) => 1,
+        }
+    });
+    let _ = std::fs::remove_dir_all(&planted);
+    outcome
+}
+
+/// A failing libc environment call must surface, not be ignored. `setenv` and
+/// `unsetenv` reject a name containing `=` with `EINVAL`.
+fn test_apply_env_reports_failures() -> Outcome {
+    const STEPS: &[&str] = &[
+        "setenv failure must be reported",
+        "unsetenv failure must be reported",
+        "operations after the failure must not run",
+    ];
+    let cs = |s: &str| CString::new(s).expect("no NUL");
+    match fork_single_threaded() {
+        Ok(ForkResult::Child) => {
+            let bad_set = [
+                EnvOp::Set(cs("BAD=NAME"), cs("x")),
+                EnvOp::Set(cs("BWRAP_AFTER_FAILURE"), cs("1")),
+            ];
+            if !matches!(apply_env(&bad_set), Err(EnvError::Set(Errno::EINVAL))) {
+                exit_child(1);
+            }
+            if !matches!(
+                apply_env(&[EnvOp::Unset(cs("BAD=NAME"))]),
+                Err(EnvError::Unset(Errno::EINVAL))
+            ) {
+                exit_child(2);
+            }
+            if std::env::var_os("BWRAP_AFTER_FAILURE").is_some() {
+                exit_child(3);
+            }
+            exit_child(0)
+        }
+        Ok(ForkResult::Parent { child }) => match wait_child(child) {
+            Ok(code) => from_child_code(code, STEPS),
+            Err(e) => Outcome::Fail(e),
+        },
+        Err(e) => Outcome::Fail(format!("fork: {e}")),
+    }
+}
+
+const CLOSE_STEPS: &[&str] = &[
+    "set up descriptors",
+    "install the seccomp filters",
+    "wrong result from close_extra_fds",
+    "wrong state of the descriptor to close",
+    "kept descriptor was closed",
+];
+
+/// Call `close_extra_fds` with `deny` in force. `cleanup_possible` says whether it
+/// must succeed and close the victim, or report an error and leave it open.
+fn close_scenario(deny: &[(libc::c_long, Errno)], cleanup_possible: bool) -> i32 {
+    let is_open = |fd| {
+        // SAFETY: F_GETFD only reads the descriptor's flags.
+        unsafe { libc::fcntl(fd, libc::F_GETFD) != -1 }
+    };
+    let Ok(proc) = open("/proc", OFlag::O_PATH | OFlag::O_CLOEXEC, Mode::empty()) else {
+        return 1;
+    };
+    let Ok((victim, kept)) = nix::unistd::pipe() else {
+        return 1;
+    };
+    let victim = victim.into_raw_fd();
+    if nix::sys::prctl::set_no_new_privs().is_err() {
+        return 2;
+    }
+    for &(nr, errno) in deny {
+        if deny_syscall_program(nr, errno).install().is_err() {
+            return 2;
+        }
+    }
+    let result = close_extra_fds(proc.as_fd(), &[proc.as_raw_fd(), kept.as_raw_fd()]);
+    if result.is_ok() != cleanup_possible {
+        return 3;
+    }
+    if is_open(victim) == cleanup_possible {
+        return 4;
+    }
+    if !is_open(kept.as_raw_fd()) {
+        return 5;
+    }
+    0
+}
+
+fn run_close_scenario(deny: &[(libc::c_long, Errno)], cleanup_possible: bool) -> Outcome {
+    match fork_single_threaded() {
+        Ok(ForkResult::Child) => exit_child(close_scenario(deny, cleanup_possible)),
+        Ok(ForkResult::Parent { child }) => match wait_child(child) {
+            Ok(code) => from_child_code(code, CLOSE_STEPS),
+            Err(e) => Outcome::Fail(e),
+        },
+        Err(e) => Outcome::Fail(format!("fork: {e}")),
+    }
+}
+
+/// When the fd directory cannot be listed, `close_range` does the cleanup.
+fn test_close_extra_fds_with_close_range() -> Outcome {
+    run_close_scenario(&[(libc::SYS_openat, Errno::EACCES)], true)
+}
+
+/// The fd directory walk works without `close_range`.
+fn test_close_extra_fds_by_walking() -> Outcome {
+    run_close_scenario(&[(libc::SYS_close_range, Errno::ENOSYS)], true)
+}
+
+/// When neither strategy can run, the failure is reported, never hidden.
+fn test_close_extra_fds_reports_failure() -> Outcome {
+    run_close_scenario(
+        &[
+            (libc::SYS_close_range, Errno::ENOSYS),
+            (libc::SYS_openat, Errno::EACCES),
+        ],
+        false,
+    )
+}
+
+/// `PreparedExec` runs the prepared argv and reports a failed exec's errno.
+fn test_prepared_exec() -> Outcome {
+    const STEPS: &[&str] = &["exec of a missing path must report ENOENT", "exec failed"];
+    let cs = |s: &str| CString::new(s).expect("no NUL");
+    match fork_single_threaded() {
+        Ok(ForkResult::Child) => {
+            let missing = PreparedExec::new(cs("/no/such/binary"), vec![cs("x")]);
+            if missing.exec() != Errno::ENOENT {
+                exit_child(1);
+            }
+            let sh = PreparedExec::new(
+                cs("sh"),
+                vec![
+                    cs("custom-argv0"),
+                    cs("-c"),
+                    cs(r#"[ "$0" = custom-argv0 ]"#),
+                ],
+            );
+            sh.exec();
+            exit_child(2)
+        }
+        Ok(ForkResult::Parent { child }) => match wait_child(child) {
+            Ok(code) => from_child_code(code, STEPS),
+            Err(e) => Outcome::Fail(e),
+        },
+        Err(e) => Outcome::Fail(format!("fork: {e}")),
+    }
+}
+
 type Test = (&'static str, fn() -> Outcome);
 
 fn main() -> ExitCode {
@@ -505,6 +745,25 @@ fn main() -> ExitCode {
         (
             "mount_setattr on non-mountpoint",
             test_mount_setattr_non_mountpoint,
+        ),
+        ("guard sees a later thread", test_guard_sees_later_thread),
+        ("sealed guard ignores /proc", test_sealed_guard_ignores_proc),
+        (
+            "apply_env reports libc failures",
+            test_apply_env_reports_failures,
+        ),
+        ("PreparedExec argv and errors", test_prepared_exec),
+        (
+            "close_extra_fds uses close_range when listing fails",
+            test_close_extra_fds_with_close_range,
+        ),
+        (
+            "close_extra_fds walks without close_range",
+            test_close_extra_fds_by_walking,
+        ),
+        (
+            "close_extra_fds reports a failed cleanup",
+            test_close_extra_fds_reports_failure,
         ),
     ];
     let mut failed = 0;

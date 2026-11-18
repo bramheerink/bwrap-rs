@@ -3,22 +3,23 @@
 //!
 //! The parser turns an argument list into a [`bwrap_core::Config`] plus an
 //! [`Outcome`]. Its only side effects go through an injected [`ParseHost`]:
-//! reading an `--args` file, and emitting warnings. Warnings are emitted
-//! immediately (not collected), so — like bwrap — a warning is printed even
-//! when parsing then fails with an error. The real host lives with the binary;
-//! tests supply a fake. This keeps the crate `forbid(unsafe)` and
-//! fully testable.
+//! reading an `--args` file, validating and installing SELinux labels, and
+//! emitting warnings. Warnings are emitted immediately (not collected), so —
+//! like bwrap — a warning is printed even when parsing then fails with an error.
+//! The real host lives with the binary; tests supply a fake. This keeps the crate
+//! `forbid(unsafe)` and fully testable.
 //!
 //! What this crate does *not* do: the `main()` validation/resolution (that is
-//! [`bwrap_core::Config::resolve`]) and the "no command given" usage error,
-//! which is interleaved with the resolution checks and therefore belongs to
-//! the orchestration layer.
+//! [`bwrap_core::run::ExecutionPlan::new`]) and the "no command given" usage
+//! error, which is interleaved with the resolution checks and therefore belongs
+//! to the orchestration layer.
 
 #![forbid(unsafe_code)]
 
 mod parse;
 pub mod usage;
 
+use std::ffi::OsStr;
 use std::os::fd::RawFd;
 
 use bwrap_core::Error;
@@ -26,9 +27,19 @@ use bwrap_core::types::Config;
 
 pub use parse::parse;
 
-/// The parser's window onto the outside world: reading `--args` files and
-/// emitting warnings. Abstracted so the parser stays pure and testable.
+/// The parser's window onto the outside world: reading `--args` files, SELinux
+/// labels, and emitting warnings. Abstracted so the parser stays pure and
+/// testable.
 pub trait ParseHost {
+    /// Check an `--exec-label`/`--file-label` value (bwrap's
+    /// `die_unless_label_valid`). Called the moment the option is parsed, before
+    /// later arguments are looked at, so error ordering matches bwrap.
+    fn validate_label(&mut self, label: &OsStr) -> Result<(), Error>;
+
+    /// Install the `--file-label` file-creation context for this process (bwrap's
+    /// `label_create_file`), which the sandbox child inherits across the clone.
+    fn set_file_label(&mut self, label: &OsStr) -> Result<(), Error>;
+
     /// Read all bytes from an `--args` fd (bwrap's `load_file_data` + `close`).
     /// The parser then splits them on NUL.
     fn read_args(&mut self, fd: RawFd) -> Result<Vec<u8>, Error>;

@@ -390,7 +390,7 @@ impl Parser<'_> {
                 }
                 // bwrap validates the label as it is parsed (before the no-command
                 // check and before scanning later arguments).
-                bwrap_core::selinux::die_unless_label_valid(&rest[1])?;
+                self.host.validate_label(&rest[1])?;
                 self.cfg.exec_label = Some(rest[1].clone());
                 Ok(1)
             }
@@ -402,12 +402,10 @@ impl Parser<'_> {
                 // bwrap validates and installs the fscreate context at parse time;
                 // the context is then inherited across the clone. A setfscreatecon
                 // failure is reported as C's `--file-label setup failed`.
-                bwrap_core::selinux::die_unless_label_valid(&rest[1])?;
-                bwrap_core::selinux::label_create_file(Some(rest[1].as_os_str())).map_err(|e| {
-                    Error::Sys {
-                        message: "--file-label setup failed".into(),
-                        errno: e.errno().unwrap_or(nix::errno::Errno::EINVAL),
-                    }
+                self.host.validate_label(&rest[1])?;
+                self.host.set_file_label(&rest[1]).map_err(|e| Error::Sys {
+                    message: "--file-label setup failed".into(),
+                    errno: e.errno().unwrap_or(nix::errno::Errno::EINVAL),
                 })?;
                 self.cfg.file_label = Some(rest[1].clone());
                 Ok(1)
@@ -714,43 +712,29 @@ fn is_valid_env_name(name: &OsStr) -> bool {
     !name.is_empty() && !name.as_bytes().contains(&b'=')
 }
 
-/// Parse an fd argument like bwrap: `int fd = strtol(.., 10)`, reject empty,
-/// trailing junk, or a negative value, with the message `Invalid fd: <value>`.
-///
-/// The `strtol` result is a `long` that bwrap stores into an `int`, so the
-/// value is narrowed with a wrapping cast to `i32` before the `< 0` check
-/// (e.g. `4294967297` wraps to `1`, matching bwrap).
+/// A parsed `strtol` value that is a valid non-negative C `int`. bubblewrap
+/// narrows the `long` to an `int` before checking it, which turns out-of-range
+/// input into a different valid number; this port refuses it (DIFFERENCES.md #15).
+fn non_negative_int(value: &str) -> Option<i32> {
+    i32::try_from(strtol10(value)?).ok().filter(|n| *n >= 0)
+}
+
+/// Parse an fd argument: reject empty input, trailing junk, and anything outside
+/// `0..=INT_MAX`, with the message `Invalid fd: <value>`.
 fn parse_fd(value: &OsStr) -> Result<RawFd> {
     // fd arguments are ASCII decimals; a non-UTF-8 value has no digits (or
     // trailing junk) and is rejected exactly as C's strtol rejects it, only the
     // echoed value in the error text renders lossily (DIFFERENCES.md #6).
     let value = value.to_string_lossy();
-    // The `as i32` truncation is the whole point: it reproduces C storing a
-    // `long` into an `int`.
-    #[expect(
-        clippy::cast_possible_truncation,
-        reason = "reproduces C storing a long fd into an int"
-    )]
-    match strtol10(&value) {
-        Some(n) if (n as i32) >= 0 => Ok(n as i32),
-        _ => Err(Error::invalid(format!("Invalid fd: {value}"))),
-    }
+    non_negative_int(&value).ok_or_else(|| Error::invalid(format!("Invalid fd: {value}")))
 }
 
-/// Parse `--uid`/`--gid`: `int id = strtol(..)`, reject negative (bwrap's
-/// `the_uid < 0`), same `int` narrowing as [`parse_fd`].
+/// Parse `--uid`/`--gid`, with the same range rule as [`parse_fd`].
 fn parse_id(value: &OsStr, which: &str) -> Result<u32> {
     let value = value.to_string_lossy();
-    // Intentional C int-narrowing, as in parse_fd; the i32 is then known >= 0.
-    #[expect(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        reason = "intentional C int-narrowing; the i32 is then range-checked >= 0 before the u32 cast"
-    )]
-    match strtol10(&value) {
-        Some(n) if (n as i32) >= 0 => Ok((n as i32) as u32),
-        _ => Err(Error::invalid(format!("Invalid {which}: {value}"))),
-    }
+    non_negative_int(&value)
+        .map(i32::cast_unsigned)
+        .ok_or_else(|| Error::invalid(format!("Invalid {which}: {value}")))
 }
 
 /// `strtol(value, &end, 10)` with the full-consumption and non-empty checks
@@ -765,8 +749,6 @@ fn strtol10(value: &str) -> Option<i64> {
     }
     // strtol returns LONG_MAX / LONG_MIN on ERANGE: that is a u64 overflow, or a
     // magnitude outside the signed `long` range even when it still fits a u64.
-    // bwrap stores the result into an int without checking errno, so a huge
-    // positive later narrows to -1 and a huge negative to 0.
     const LONG_MAX_MAG: u64 = i64::MAX as u64; // |LONG_MAX|
     const LONG_MIN_MAG: u64 = LONG_MAX_MAG + 1; // |LONG_MIN|
     if c.overflow || (!c.neg && c.val > LONG_MAX_MAG) || (c.neg && c.val > LONG_MIN_MAG) {

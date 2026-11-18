@@ -13,8 +13,25 @@ use bwrap_core::types::{BindKind, Config, OverlayUpper, SeccompSource, SetupOp};
 struct TestHost {
     files: HashMap<RawFd, Vec<u8>>,
     warnings: Vec<String>,
+    /// Every label side effect the parser asked for, in order.
+    label_calls: Vec<String>,
+    /// Make `validate_label` refuse every label.
+    reject_labels: bool,
 }
 impl ParseHost for TestHost {
+    fn validate_label(&mut self, label: &std::ffi::OsStr) -> Result<(), bwrap_core::Error> {
+        self.label_calls
+            .push(format!("validate {}", label.to_string_lossy()));
+        if self.reject_labels {
+            return Err(bwrap_core::Error::invalid("rejected by test host"));
+        }
+        Ok(())
+    }
+    fn set_file_label(&mut self, label: &std::ffi::OsStr) -> Result<(), bwrap_core::Error> {
+        self.label_calls
+            .push(format!("install {}", label.to_string_lossy()));
+        Ok(())
+    }
     fn read_args(&mut self, fd: RawFd) -> Result<Vec<u8>, bwrap_core::Error> {
         self.files
             .get(&fd)
@@ -34,6 +51,29 @@ impl ParseHost for TestHost {
 
 fn argv(s: &[&str]) -> Vec<std::ffi::OsString> {
     s.iter().map(std::ffi::OsString::from).collect()
+}
+
+#[test]
+fn label_effects_go_through_the_host_in_order() {
+    let mut host = TestHost::default();
+    let args = argv(&["--exec-label", "e", "--file-label", "f", "true"]);
+    parse(&args, &mut host).expect("parse");
+    assert_eq!(
+        host.label_calls,
+        ["validate e", "validate f", "install f"],
+        "an exec label is only validated; a file label is validated, then installed"
+    );
+}
+
+#[test]
+fn rejected_file_label_is_never_installed() {
+    let mut host = TestHost {
+        reject_labels: true,
+        ..TestHost::default()
+    };
+    let args = argv(&["--file-label", "f", "true"]);
+    assert!(parse(&args, &mut host).is_err());
+    assert_eq!(host.label_calls, ["validate f"]);
 }
 
 /// Parse, returning the config and the warnings emitted.
@@ -144,10 +184,9 @@ fn empty_path_operands_are_rejected() {
 }
 
 #[test]
-fn uid_gid_follow_strtol_int_narrowing() {
-    // 2^32 + 1 wraps to 1 when stored in an int, like bwrap.
-    let (c, _) = ok(&["--uid", "4294967297", "true"]);
-    assert_eq!(c.sandbox_uid, Some(1));
+fn uid_gid_accept_the_strtol_grammar_within_int_range() {
+    let (c, _) = ok(&["--uid", "2147483647", "true"]);
+    assert_eq!(c.sandbox_uid, Some(2_147_483_647), "INT_MAX is in range");
     let (c, _) = ok(&["--gid", " 7", "true"]);
     assert_eq!(c.sandbox_gid, Some(7), "leading whitespace is accepted");
     let (c, _) = ok(&["--uid", "+9", "true"]);
@@ -161,20 +200,31 @@ fn uid_gid_follow_strtol_int_narrowing() {
 }
 
 #[test]
-fn strtol_overflow_saturates_then_narrows() {
-    // LONG_MAX narrows to -1 as an int: rejected. LONG_MIN narrows to 0.
-    assert_eq!(
-        err(&["--uid", "99999999999999999999", "true"]),
-        "Invalid uid: 99999999999999999999"
-    );
-    let (c, _) = ok(&["--uid", "-99999999999999999999", "true"]);
-    assert_eq!(c.sandbox_uid, Some(0));
-    assert_eq!(
-        err(&["--userns", "99999999999999999999", "true"]),
-        "Invalid fd: 99999999999999999999"
-    );
-    let (c, _) = ok(&["--userns", "-99999999999999999999", "true"]);
-    assert_eq!(c.userns_fd, Some(0));
+fn out_of_range_numbers_are_refused_not_narrowed() {
+    // bubblewrap narrows each of these to a different valid number
+    // (DIFFERENCES.md #15): 2^32+1 to 1, 2^32+1000 to 1000, LONG_MIN to 0.
+    for bad in [
+        "2147483648",
+        "4294967295",
+        "4294967297",
+        "4294968296",
+        "-4294966296",
+        "99999999999999999999",
+        "-99999999999999999999",
+    ] {
+        assert_eq!(err(&["--uid", bad, "true"]), format!("Invalid uid: {bad}"));
+        assert_eq!(err(&["--gid", bad, "true"]), format!("Invalid gid: {bad}"));
+        assert_eq!(
+            err(&["--userns", bad, "true"]),
+            format!("Invalid fd: {bad}")
+        );
+        assert_eq!(
+            err(&["--bind-fd", bad, "/mnt", "true"]),
+            format!("Invalid fd: {bad}")
+        );
+    }
+    let (c, _) = ok(&["--userns", "2147483647", "true"]);
+    assert_eq!(c.userns_fd, Some(2_147_483_647), "INT_MAX is in range");
 }
 
 #[test]

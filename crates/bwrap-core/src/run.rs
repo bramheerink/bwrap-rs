@@ -18,13 +18,14 @@ use nix::sched::CloneFlags;
 use nix::sys::stat::{Mode as NixMode, fstat};
 use std::os::fd::AsRawFd;
 
-use nix::unistd::{Pid, chdir, execvp, read, setsid};
+use nix::unistd::{Pid, chdir, getgid, getuid, read, setsid};
 
 use bwrap_sys::fd::FdTable;
+use bwrap_sys::process::PreparedExec;
 
 use crate::caps::{drop_bounding_set, set_ambient};
 use crate::error::{Context, Error, Result};
-use crate::privs::{acquire_privs, drop_privs, switch_to_user_with_privs};
+use crate::privs::{StartupPrivs, drop_privs, switch_to_user_with_privs};
 use crate::process::{
     NamespaceIds, block_sigchild, do_init, handle_die_with_parent, handle_die_with_parent_fd,
     monitor_child, unblock_sigchild, write_all,
@@ -33,21 +34,90 @@ use crate::seccomp::SeccompPrograms;
 use crate::setup::{NewrootCtx, pivot_into_newroot};
 use crate::types::caps::CapOp;
 use crate::types::config::NsPolicy;
-use crate::types::{CapSet, Config, ResolvedConfig, SetupOp};
+use crate::types::{CapSet, Config, ResolvedConfig, SetupOp, UsernsProbe};
 use crate::userns::{IdMap, OverflowIds};
 
-/// Run the sandbox described by `config` (already resolved into `resolved`).
-/// Returns the exit code to propagate. `real_uid`/`real_gid` are the launcher's.
-/// `fds` is the process fd-ownership table, already holding the `--args`/
-/// `--seccomp` descriptors read at parse time; the inherited runtime fds are
-/// registered here and every borrow/close of them goes through it.
-pub fn run(
-    config: &Config,
-    resolved: &ResolvedConfig,
+/// A launch that has passed every startup check: the privilege gate, and bwrap's
+/// `main()` validation of this exact configuration. The fields are private and
+/// [`ExecutionPlan::new`] is the only constructor, so [`run`] cannot be handed an
+/// unvalidated configuration or one resolved from a different configuration.
+#[derive(Debug)]
+pub struct ExecutionPlan {
+    config: Config,
+    resolved: ResolvedConfig,
+    privs: StartupPrivs,
     real_uid: u32,
     real_gid: u32,
-    fds: &mut FdTable,
-) -> Result<i32> {
+}
+
+impl ExecutionPlan {
+    /// Validate `config` for the current user (bwrap's `main()` checks, in order).
+    pub fn new(config: Config, privs: StartupPrivs, probe: &dyn UsernsProbe) -> Result<Self> {
+        let real_uid = getuid().as_raw();
+        let real_gid = getgid().as_raw();
+        let resolved = config.resolve(real_uid, real_gid, probe)?;
+        // Record the host's SELinux state now, while the host's mounts are still
+        // visible: the sandbox's root says nothing about it.
+        if config.exec_label.is_some() || config.file_label.is_some() {
+            let _ = crate::selinux::is_selinux_enabled();
+        }
+        Ok(Self {
+            config,
+            resolved,
+            privs,
+            real_uid,
+            real_gid,
+        })
+    }
+}
+
+/// Take ownership of every caller fd named in `config`, then close the adoption
+/// window. Runs before this process opens any descriptor of its own, so a number
+/// the caller left closed cannot be mistaken for an internal descriptor later.
+fn adopt_inherited_fds(config: &Config, fds: &mut FdTable) {
+    for &fd in config
+        .userns_fd
+        .iter()
+        .chain(config.userns2_fd.iter())
+        .chain(config.pidns_fd.iter())
+        .chain(config.userns_block_fd.iter())
+        .chain(config.info_fd.iter())
+        .chain(config.json_status_fd.iter())
+        .chain(config.block_fd.iter())
+        .chain(config.sync_fds.iter())
+    {
+        fds.adopt(fd);
+    }
+    if let crate::types::SeccompSource::Single(fd) = &config.seccomp {
+        fds.adopt(*fd);
+    }
+    for op in &config.ops {
+        match op {
+            SetupOp::File { fd, .. }
+            | SetupOp::BindData { fd, .. }
+            | SetupOp::BindFd { fd, .. } => fds.adopt(*fd),
+            _ => {}
+        }
+    }
+    fds.seal();
+}
+
+/// Run the sandbox described by `plan`. Returns the exit code to propagate.
+/// `fds` is the process fd-ownership table, already holding the `--args`/
+/// `--add-seccomp-fd` descriptors consumed at parse time; every other inherited
+/// fd is adopted here and every borrow/close of them goes through it.
+pub fn run(plan: &ExecutionPlan, fds: &mut FdTable) -> Result<i32> {
+    let ExecutionPlan {
+        config,
+        resolved,
+        privs,
+        real_uid,
+        real_gid,
+    } = plan;
+    let (real_uid, real_gid) = (*real_uid, *real_gid);
+
+    adopt_inherited_fds(config, fds);
+
     // Wire the `--debug-opt=force-*-fallback` toggles from the parsed config into
     // the resolver and the mount engine (bwrap's global `opt_force_*`). Set before
     // the clone so the sandbox child inherits the choice. SELinux label validation
@@ -67,68 +137,31 @@ pub fn run(
     // sandbox child inherits the fd. A no-op when the variable is unset.
     crate::profile::init();
 
-    // Record every inherited runtime caller fd in the ownership table before the
-    // clone, so both the launcher and the sandbox child — which closes some of
-    // them with no preceding borrow — operate on owned numbers rather than bare
-    // integers. Each use site re-registers idempotently to mirror bubblewrap's
-    // per-fd-variable reuse (a second `--file N` reads the now-closed number and
-    // fails with EBADF), and every close goes through the table so a number is
-    // closed exactly once.
-    for &fd in config
-        .userns_fd
-        .iter()
-        .chain(config.userns2_fd.iter())
-        .chain(config.pidns_fd.iter())
-        .chain(config.userns_block_fd.iter())
-        .chain(config.info_fd.iter())
-        .chain(config.json_status_fd.iter())
-        .chain(config.block_fd.iter())
-        .chain(config.sync_fds.iter())
-    {
-        fds.register(fd);
-    }
-    if let crate::types::SeccompSource::Single(fd) = &config.seccomp {
-        fds.register(*fd);
-    }
-    for op in &config.ops {
-        match op {
-            SetupOp::File { fd, .. }
-            | SetupOp::BindData { fd, .. }
-            | SetupOp::BindFd { fd, .. } => fds.register(*fd),
-            _ => {}
-        }
-    }
-
     // The process that invoked bwrap, captured before the clone, for the
     // launcher's die-with-parent reparent check (#700).
     let invoker = nix::unistd::getppid();
 
-    // acquire_privs: seed the requested caps (effective as root, else empty),
-    // then fold in --cap-add/--cap-drop.
+    // The requested caps from the startup gate (effective as root, else empty),
+    // with --cap-add/--cap-drop folded in.
     let is_root = real_uid == 0;
-    let requested = CapOp::fold(acquire_privs()?, &config.cap_ops);
+    let requested = CapOp::fold(privs.requested(), &config.cap_ops);
     let cap_used = config.cap_add_or_drop_used;
-
-    // Never gain privileges through a later exec. Set before the clone so the
-    // sandbox inherits it; the whole capability model AND `--seccomp` (which
-    // installs a filter with no caps) depend on it.
-    nix::sys::prctl::set_no_new_privs().context("prctl(PR_SET_NO_NEW_PRIVS) failed")?;
 
     // Join a custom user namespace before the clone, which gives us privileges
     // in it (it must be a descendant of ours). `--unshare-user` is mutually
     // exclusive with this, so the clone below won't also make a new userns.
     if let Some(fd) = config.userns_fd {
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("userns_fd just registered");
-        nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER).map_err(|e| {
-            if e == Errno::EINVAL {
-                Error::invalid(
-                    "Joining the specified user namespace failed, it might not be a descendant of the current user namespace.",
-                )
-            } else {
-                Error::Sys { message: "Joining specified user namespace failed".into(), errno: e }
-            }
-        })?;
+        fds.live(fd)
+            .and_then(|bf| nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER))
+            .map_err(|e| {
+                if e == Errno::EINVAL {
+                    Error::invalid(
+                        "Joining the specified user namespace failed, it might not be a descendant of the current user namespace.",
+                    )
+                } else {
+                    Error::Sys { message: "Joining specified user namespace failed".into(), errno: e }
+                }
+            })?;
     }
 
     let ns = &resolved.namespaces;
@@ -193,9 +226,8 @@ pub fn run(
             // intermediate forks, only the final sandbox process continues here.
             if let Some((s0, s1)) = pid_sockets {
                 if let Some(fd) = config.pidns_fd {
-                    fds.register(fd);
-                    let bf = fds.borrow(fd).expect("pidns_fd just registered");
-                    nix::sched::setns(bf, CloneFlags::CLONE_NEWPID)
+                    fds.live(fd)
+                        .and_then(|bf| nix::sched::setns(bf, CloneFlags::CLONE_NEWPID))
                         .map_err(|e| Error::Sys {
                             message: "Setting pidns failed".into(),
                             errno: e,
@@ -283,9 +315,9 @@ fn parent(
     let ns_ids = namespace_ids_read(child, &resolved.namespaces);
     // Optionally join a second user namespace (bwrap's `--userns2`).
     if let Some(fd) = config.userns2_fd {
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("userns2_fd just registered");
-        nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER).context("Setting userns2 failed")?;
+        fds.live(fd)
+            .and_then(|bf| nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER))
+            .context("Setting userns2 failed")?;
     }
     // The launcher needs no privileges.
     drop_privs(None, cap_used, is_root)?;
@@ -298,9 +330,7 @@ fn parent(
             child.as_raw(),
             &ns_ids,
         );
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("info_fd just registered");
-        crate::process::dump_info(bf, doc.as_bytes())?;
+        dump_info_to(fds, fd, doc.as_bytes())?;
         // bwrap closes --info-fd here, right after writing and before the
         // --userns-block-fd wait, so a helper that reads the info pipe to EOF
         // before releasing the block fd does not deadlock.
@@ -312,22 +342,15 @@ fn parent(
             child.as_raw(),
             &ns_ids,
         );
-        // Re-register: if `--json-status-fd` aliased `--info-fd`, the close above
-        // removed the number, and C writes json to that same (now closed) number
-        // and fails at the write — so borrow the stale number to reproduce it.
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("json_status_fd just registered");
-        crate::process::dump_info(bf, doc.as_bytes())?;
+        // If `--json-status-fd` aliased `--info-fd`, the close above consumed the
+        // number, and this fails with EBADF exactly as C's write to it does.
+        dump_info_to(fds, fd, doc.as_bytes())?;
     }
 
     // With `--userns-block-fd`, an external process writes the child's maps and
     // signals us here (it learned the child pid from `--info-fd`). Wait for it.
     if let Some(fd) = config.userns_block_fd {
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("userns_block_fd just registered");
-        let mut b = [0u8; 1];
-        let _ = read(bf, &mut b);
-        fds.close(fd);
+        wait_on_block_fd(fds, fd);
     }
 
     // Let the child proceed now that its maps are set up. Ignore the result,
@@ -353,12 +376,7 @@ fn parent(
         None
     };
 
-    let json = if let Some(fd) = config.json_status_fd {
-        fds.register(fd);
-        fds.borrow(fd)
-    } else {
-        None
-    };
+    let json = config.json_status_fd.and_then(|fd| fds.live(fd).ok());
     monitor_child(
         ev_r.as_ref().map(AsFd::as_fd),
         child,
@@ -395,8 +413,8 @@ fn child(
     // The caller's status fds must not leak into the sandbox (bwrap closes them
     // in the child right after the clone). Our copies are a separate fd table
     // after the clone, so closing them here does not affect the launcher. The
-    // numbers were registered before the clone, so the table closes them once
-    // (an alias of the same number is already gone and closing is a no-op).
+    // numbers were adopted before the clone, so the table closes them once (an
+    // alias of the same number is already gone and closing is a no-op).
     if let Some(fd) = config.info_fd {
         fds.close(fd);
     }
@@ -508,6 +526,7 @@ fn child(
         have_pidns_fd: config.pidns_fd.is_some(),
         not_a_security_boundary: config.not_a_security_boundary,
         host_tty_dev: host_tty.clone(),
+        pwd: crate::types::config::effective_pwd(std::env::var_os("PWD"), &config.env_ops),
         // A non-UTF-8 --file-label is unreachable here: die_unless_label_valid
         // rejects it at parse time (SELinux on → context write fails; off →
         // "labeling not supported"), so the lossy branch is dead and the
@@ -520,7 +539,10 @@ fn child(
     // Resolve symlinks in the op sources against the real root before pivoting
     // (and fail early on a missing source with the right message). The resulting
     // ResolvedOps is the only thing the executor accepts.
-    let resolved_ops = crate::setup::ResolvedOps::resolve(&config.ops)?;
+    let resolved_ops = crate::setup::ResolvedOps::resolve(&config.ops, fds)?;
+    // The host /proc is about to disappear from view; a /proc inside the sandbox
+    // must not be able to influence the single-thread guard.
+    bwrap_sys::process::seal_single_thread_guard();
     let sp = crate::profile::span("child.setup_newroot");
     let old_cwd = pivot_into_newroot(&resolved_ops, &ctx, fds)?;
     drop(sp);
@@ -547,9 +569,9 @@ fn child(
     // Optionally join a second user namespace (bwrap's `--userns2`), after the
     // pivot, as the sandbox side does.
     if let Some(fd) = config.userns2_fd {
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("userns2_fd just registered");
-        nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER).context("Setting userns2 failed")?;
+        fds.live(fd)
+            .and_then(|bf| nix::sched::setns(bf, CloneFlags::CLONE_NEWUSER))
+            .context("Setting userns2 failed")?;
     }
 
     // Second-level user namespace: map back to the sandbox uid/gid after the
@@ -592,11 +614,7 @@ fn child(
 
     // `--block-fd`: wait for an external process to let us continue.
     if let Some(fd) = config.block_fd {
-        fds.register(fd);
-        let bf = fds.borrow(fd).expect("block_fd just registered");
-        let mut b = [0u8; 1];
-        let _ = read(bf, &mut b);
-        fds.close(fd);
+        wait_on_block_fd(fds, fd);
     }
 
     // Load seccomp now (reads the fds), apply just before exec. The single
@@ -616,14 +634,9 @@ fn child(
     apply_env_ops(&config.env_ops)?;
     let new_cwd = compute_cwd(config, old_cwd.as_deref())?;
     // PWD is set after the cwd is known (bwrap sets it last), so it is a separate
-    // single op routed through the same gated apply_env. The NUL case cannot
-    // occur for a path, so skip defensively rather than panicking.
-    if let Ok(pwd) = CString::new(new_cwd.clone()) {
-        env_apply(&[bwrap_sys::process::EnvOp::Set(
-            CString::new("PWD").expect("PWD has no NUL"),
-            pwd,
-        )])?;
-    }
+    // single op routed through the same gated apply_env.
+    let pwd = CString::new(new_cwd).map_err(|_| Error::invalid("setenv failed"))?;
+    env_apply(&[bwrap_sys::process::EnvOp::Set(c"PWD".to_owned(), pwd)])?;
 
     if config.new_session {
         setsid().context("setsid")?;
@@ -634,8 +647,20 @@ fn child(
     if !config.as_pid_1
         && (unshare_pid || !config.lock_files.is_empty() || !config.sync_fds.is_empty())
     {
+        // With --lock-file the command must not start until pid 1 holds the locks.
+        // POSIX record locks are not inherited across fork, so pid 1 has to take
+        // them itself and then release pid 2 over this channel.
+        let lock_channel = if config.lock_files.is_empty() {
+            None
+        } else {
+            Some(child_wait_pair()?)
+        };
         match bwrap_sys::process::fork_single_threaded() {
             Ok(nix::unistd::ForkResult::Parent { child: app }) => {
+                let locks_taken = lock_channel.map(|(pid2_end, pid1_end)| {
+                    drop(pid2_end);
+                    pid1_end
+                });
                 drop_privs(None, cap_used, is_root)?;
                 // Release the setup-finished write end (owned) before the fd
                 // walk closes its number, or its later drop would double-close
@@ -658,6 +683,9 @@ fn child(
                 if let Some(fd) = cw_r.as_ref() {
                     keep.push(fd.as_raw_fd());
                 }
+                if let Some(fd) = locks_taken.as_ref() {
+                    keep.push(fd.as_raw_fd());
+                }
                 bwrap_sys::process::close_extra_fds(proc_fd.as_fd(), &keep).context("fdwalk")?;
                 drop(proc_fd);
                 return do_init(
@@ -667,11 +695,16 @@ fn child(
                     &seccomp,
                     config.die_with_parent,
                     cw_r.as_ref().map(AsFd::as_fd),
+                    locks_taken,
                 );
             }
             Ok(nix::unistd::ForkResult::Child) => {
                 // pid 2: fall through to exec. die-with-parent is keyed on the
                 // launcher handshake socket (cw_r), not getppid().
+                if let Some((pid2_end, pid1_end)) = lock_channel {
+                    drop(pid1_end);
+                    wait_for_locks(pid2_end);
+                }
             }
             Err(e) => return Err(Error::invalid(format!("Can't fork for pid 1: {e}"))),
         }
@@ -700,6 +733,9 @@ fn child(
         });
     }
     set_ambient(requested)?;
+    // Allocate everything exec needs before the filters go in: a restrictive
+    // filter must not be able to trip over the allocator on the way to exec.
+    let exec = prepare_exec(config)?;
     seccomp.apply()?;
 
     // Setup-finished protocol (bwrap): one byte signals "about to exec". On a
@@ -711,16 +747,49 @@ fn child(
         let _ = write_all(sf.as_fd(), &[0u8]);
     }
 
-    match exec_command(config) {
-        // exec_command only returns on failure; on success execvpe replaced us.
-        Ok(code) => Ok(code),
-        Err(e) => {
-            if let Some(sf) = &setup_w {
-                let _ = write_all(sf.as_fd(), &[0u8]);
-            }
-            Err(e)
+    // Only returns on failure; on success execvp replaced this process.
+    let errno = exec.exec();
+    if let Some(sf) = &setup_w {
+        let _ = write_all(sf.as_fd(), &[0u8]);
+    }
+    Err(Error::Sys {
+        message: format!("execvp {}", config.command[0].to_string_lossy()).into(),
+        errno,
+    })
+}
+
+/// Block until pid 1 reports that every `--lock-file` lock is held. If pid 1 goes
+/// away first, it could not take them and has already reported why, so this
+/// process exits without running the command.
+fn wait_for_locks(channel: OwnedFd) {
+    let mut byte = [0u8; 1];
+    loop {
+        match read(channel.as_fd(), &mut byte) {
+            Ok(1) => return,
+            Err(Errno::EINTR) => {}
+            Ok(_) | Err(_) => bwrap_sys::process::exit_immediately(1),
         }
     }
+}
+
+/// Write `doc` to the caller's `--info-fd`/`--json-status-fd`. A consumed or closed
+/// number reports the same error as the failing write it stands in for.
+fn dump_info_to(fds: &FdTable, fd: std::os::fd::RawFd, doc: &[u8]) -> Result<()> {
+    let bf = fds.live(fd).map_err(|errno| Error::Sys {
+        message: "Write to info_fd".into(),
+        errno,
+    })?;
+    crate::process::dump_info(bf, doc)
+}
+
+/// Wait for one byte on a caller's blocking fd, then close it. As in bwrap, a
+/// failed read (including a closed fd) simply stops the wait.
+fn wait_on_block_fd(fds: &mut FdTable, fd: std::os::fd::RawFd) {
+    if let Ok(bf) = fds.live(fd) {
+        let mut b = [0u8; 1];
+        let _ = read(bf, &mut b);
+    }
+    fds.close(fd);
 }
 
 /// Build the `CLONE_*` flag set from the resolved namespace decisions. The mount
@@ -935,15 +1004,15 @@ fn read_pid(sock: BorrowedFd<'_>) -> Result<Pid> {
 }
 
 /// Read all bytes from a caller fd (for `--seccomp`), then close it through the
-/// table. Re-registers first so a stale (reused) number still borrows and fails
-/// at the `read` with the same errno as C, rather than at an earlier gate.
+/// table. A consumed or closed number fails with `EBADF`, as C's `read` does.
 fn read_all_fd(fd: std::os::fd::RawFd, fds: &mut FdTable) -> Result<Vec<u8>> {
-    fds.register(fd);
-    let bf = fds.borrow(fd).expect("seccomp fd just registered");
-    let result = crate::fs::io::read_to_end(bf).map_err(|errno| Error::Sys {
-        message: "Can't read seccomp data".into(),
-        errno,
-    });
+    let result = fds
+        .live(fd)
+        .and_then(crate::fs::io::read_to_end)
+        .map_err(|errno| Error::Sys {
+            message: "Can't read seccomp data".into(),
+            errno,
+        });
     // bwrap's `seccomp_program_new` reads the fd and closes it (before the pid-1
     // fork), so `--seccomp FD` cannot leak into the sandboxed process.
     fds.close(fd);
@@ -969,35 +1038,39 @@ fn apply_env_ops(ops: &[crate::types::config::EnvOp]) -> Result<()> {
     use bwrap_sys::process::EnvOp as SysOp;
     use std::os::unix::ffi::OsStrExt;
     let mut sys_ops: Vec<SysOp> = Vec::with_capacity(ops.len());
+    // argv-derived strings are NUL-free, so these conversions cannot fail on a
+    // parsed command line; if one ever does, the requested environment cannot be
+    // produced and the launch must stop.
+    let set_failed = |_| Error::invalid("setenv failed");
+    let unset_failed = |_| Error::invalid("unsetenv failed");
     for op in ops {
-        match op {
-            EnvOp::Clear => sys_ops.push(SysOp::Clear),
-            // argv-derived strings are NUL-free, so CString::new succeeds; skip
-            // defensively if that ever fails rather than panicking.
-            EnvOp::Set { name, value } => {
-                if let (Ok(n), Ok(v)) = (
-                    CString::new(name.as_bytes()),
-                    CString::new(value.as_bytes()),
-                ) {
-                    sys_ops.push(SysOp::Set(n, v));
-                }
-            }
+        sys_ops.push(match op {
+            EnvOp::Clear => SysOp::Clear,
+            EnvOp::Set { name, value } => SysOp::Set(
+                CString::new(name.as_bytes()).map_err(set_failed)?,
+                CString::new(value.as_bytes()).map_err(set_failed)?,
+            ),
             EnvOp::Unset { name } => {
-                if let Ok(n) = CString::new(name.as_bytes()) {
-                    sys_ops.push(SysOp::Unset(n));
-                }
+                SysOp::Unset(CString::new(name.as_bytes()).map_err(unset_failed)?)
             }
-        }
+        });
     }
     env_apply(&sys_ops)
 }
 
-/// Apply environment ops through the single-threaded-gated syscall wrapper,
-/// mapping its refusal to an `Error`. (It can only fail if the process is
-/// multi-threaded, which never happens in bwrap's cloned/forked child.)
+/// Apply environment ops through the single-threaded-gated wrapper. Any failure
+/// stops the launch, with bwrap's `xclearenv`/`xsetenv`/`xunsetenv` messages.
 fn env_apply(ops: &[bwrap_sys::process::EnvOp]) -> Result<()> {
-    bwrap_sys::process::apply_env(ops)
-        .map_err(|e| Error::invalid(format!("refusing to change the environment: {e}")))
+    use bwrap_sys::process::EnvError;
+    bwrap_sys::process::apply_env(ops).map_err(|e| match e {
+        EnvError::Guard(e) => Error::invalid(format!("refusing to change the environment: {e}")),
+        EnvError::Clear(errno) => Error::Sys {
+            message: "clearenv failed".into(),
+            errno,
+        },
+        EnvError::Set(_) => Error::invalid("setenv failed"),
+        EnvError::Unset(_) => Error::invalid("unsetenv failed"),
+    })
 }
 
 /// bwrap's cwd logic: `--chdir`, else the old cwd if reachable, else `$HOME`,
@@ -1028,8 +1101,8 @@ fn compute_cwd(config: &Config, old_cwd: Option<&std::path::Path>) -> Result<Vec
     Ok(b"/".to_vec())
 }
 
-/// `execvp` the command with `argv0` applied and the computed environment,
-/// exactly as bwrap does.
+/// Prepare the `execvp` of the command with `argv0` applied, exactly as bwrap
+/// runs it.
 ///
 /// The environment is applied to the real `environ` first (in place, by
 /// [`apply_env_ops`]), then `execvp` resolves the command and runs it. This
@@ -1039,7 +1112,7 @@ fn compute_cwd(config: &Config, old_cwd: Option<&std::path::Path>) -> Result<Vec
 /// bwrap's *own* `PATH`, which is the bug that broke every flatpak launch
 /// (`execvp smile: No such file`). Deferring to real `execvp` also gives the
 /// `_CS_PATH` default and the ENOEXEC shell fallback for free.
-fn exec_command(config: &Config) -> Result<i32> {
+fn prepare_exec(config: &Config) -> Result<PreparedExec> {
     let exec_path = CString::new(config.command[0].as_bytes())
         .map_err(|_| Error::invalid("command contains a NUL byte"))?;
     use std::os::unix::ffi::OsStrExt;
@@ -1052,14 +1125,5 @@ fn exec_command(config: &Config) -> Result<i32> {
     for a in &config.command[1..] {
         argv.push(CString::new(a.as_bytes()).map_err(|_| Error::invalid("arg NUL"))?);
     }
-    // The environment was already applied to the real `environ` in place
-    // (apply_env_ops); execvp reads that global environ for the PATH search and
-    // passes it to the command.
-    match execvp(&exec_path, &argv) {
-        Ok(_) => unreachable!("execvp returns only on error"),
-        Err(e) => Err(Error::Sys {
-            message: format!("execvp {}", config.command[0].to_string_lossy()).into(),
-            errno: e,
-        }),
-    }
+    Ok(PreparedExec::new(exec_path, argv))
 }

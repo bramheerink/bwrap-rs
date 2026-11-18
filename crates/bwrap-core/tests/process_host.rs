@@ -105,7 +105,7 @@ fn launcher(rd: OwnedFd, wr: OwnedFd, seccomp: &SeccompPrograms) -> i32 {
                 Err(_) => std::process::exit(31),
             };
             // die_with_parent is false here, so there is no launcher handshake fd.
-            match do_init(Some(wr.as_fd()), app_pid, &[], seccomp, false, None) {
+            match do_init(Some(wr.as_fd()), app_pid, &[], seccomp, false, None, None) {
                 // do_init returns the app's status; exiting with it is a second,
                 // independent signal, but the launcher reads the event fd.
                 Ok(_) => std::process::exit(0),

@@ -2,12 +2,15 @@
 
 use std::fs;
 use std::io;
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
-/// The first thread count seen while `/proc` was readable (normally in the
-/// parent, before `pivot_root`). Used only to answer the guard when `/proc`
-/// has since disappeared.
-static PRIMED_COUNT: OnceLock<usize> = OnceLock::new();
+/// The most recent thread count read from the trusted host `/proc`; 0 until the
+/// first successful read.
+static LAST_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+/// Set by [`seal_thread_count`]: `/proc` can no longer be trusted, so the guard
+/// answers from [`LAST_COUNT`].
+static SEALED: AtomicBool = AtomicBool::new(false);
 
 /// Number of threads in the calling process, from `/proc/self/status`.
 pub(crate) fn thread_count() -> io::Result<usize> {
@@ -15,28 +18,37 @@ pub(crate) fn thread_count() -> io::Result<usize> {
     parse_thread_count(&status)
 }
 
-/// Thread count for the single-thread guard, independent of the sandbox's
-/// `/proc` once primed.
+/// Thread count for the single-thread guard.
 ///
-/// The first call runs in the parent, before any `pivot_root`, while
-/// `/proc/self/status` is still the real host procfs; it reads the count and
-/// remembers it in [`PRIMED_COUNT`]. Every later call — in particular the pid-1
-/// fork, which happens *after* the pivot (`--unshare-pid`, `--lock-file`,
-/// `--sync-fd`) — returns that primed value without touching the path again.
+/// Until [`seal_thread_count`] runs, every call measures the live count, so a
+/// thread started after an earlier check is seen. A failed read is an error: an
+/// older measurement says nothing about the threads running now.
 ///
-/// This is sound because bwrap-rs spawns no threads after startup, so the count
-/// cannot have changed; and it removes any dependency on the new root's
-/// `/proc/self/status`. A planted or stale `proc/self/status` inside the sandbox
-/// (rootfs tarballs, `--file … /proc/self/status`, test fixtures), or an
-/// unrelated read error such as `EMFILE` at the fd limit, must not be able to
-/// decide whether the fork is allowed. bubblewrap has no such dependency.
+/// After the seal the last measurement is returned without touching any path. A
+/// planted `proc/self/status` inside the sandbox (rootfs tarballs, `--file …
+/// /proc/self/status`, test fixtures) must not be able to decide whether the
+/// pid-1 fork is allowed. This relies on the sealing process starting no thread
+/// afterwards, which is the documented contract of [`seal_thread_count`].
 pub(crate) fn guard_thread_count() -> io::Result<usize> {
-    if let Some(&n) = PRIMED_COUNT.get() {
-        return Ok(n);
+    let last = LAST_COUNT.load(Ordering::Relaxed);
+    if SEALED.load(Ordering::Relaxed) && last != 0 {
+        return Ok(last);
     }
     let n = thread_count()?;
-    let _ = PRIMED_COUNT.set(n);
+    LAST_COUNT.store(n, Ordering::Relaxed);
     Ok(n)
+}
+
+/// Take a final thread count from the host `/proc` and stop consulting `/proc`.
+///
+/// Call this in the sandbox child immediately before the mount namespace is
+/// rearranged. The caller promises not to start a thread afterwards: from here
+/// on the single-thread guard can no longer observe one.
+pub(crate) fn seal_thread_count() {
+    // Without a fresh measurement nothing is recorded, so the guard keeps measuring
+    // live rather than trusting an older count.
+    LAST_COUNT.store(thread_count().unwrap_or(0), Ordering::Relaxed);
+    SEALED.store(true, Ordering::Relaxed);
 }
 
 fn parse_thread_count(status: &str) -> io::Result<usize> {
@@ -81,10 +93,10 @@ mod tests {
     }
 
     #[test]
-    fn guard_reports_live_count_and_primes() {
+    fn guard_reports_live_count_and_records_it() {
         let n = guard_thread_count().expect("/proc readable");
         assert!(n >= 1);
-        assert!(PRIMED_COUNT.get().is_some());
+        assert_ne!(LAST_COUNT.load(Ordering::Relaxed), 0);
     }
 
     #[test]

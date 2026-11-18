@@ -22,12 +22,12 @@ use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use nix::dir::Dir;
 use nix::errno::Errno;
 use nix::fcntl::{OFlag, openat};
-use nix::libc::{self, c_int, c_ulong, pid_t};
+use nix::libc::{self, c_int, c_uint, c_ulong, pid_t};
 use nix::sched::CloneFlags;
 use nix::sys::stat::Mode;
 use nix::unistd::{ForkResult, Pid};
 
-use crate::thread::guard_thread_count;
+use crate::thread::{guard_thread_count, seal_thread_count};
 
 /// The namespace flags [`clone_into_namespaces`] accepts.
 ///
@@ -96,6 +96,21 @@ fn ensure_single_threaded() -> Result<(), ForkError> {
         1 => Ok(()),
         threads => Err(ForkError::MultiThreaded { threads }),
     }
+}
+
+/// Fix the single-thread guard's answer before `/proc` stops being trustworthy.
+///
+/// Until this runs, [`clone_into_namespaces`], [`fork_single_threaded`] and
+/// [`apply_env`] measure the live thread count on every call. Afterwards they use
+/// the count taken here, because the sandbox's `/proc` may be absent or planted.
+///
+/// # Caller contract
+///
+/// The process must not start a thread after calling this. The sandbox child
+/// calls it once, right before it rearranges its mount namespace, and never
+/// creates threads.
+pub fn seal_single_thread_guard() {
+    seal_thread_count();
 }
 
 /// Fork into new namespaces: `clone(SIGCHLD | flags)` with no child stack.
@@ -183,6 +198,60 @@ pub fn wait_raw(pid: pid_t, nohang: bool) -> nix::Result<Option<(Pid, c_int)>> {
     }
 }
 
+/// A fully prepared `execvp`: the path, the argument strings and the
+/// NULL-terminated pointer array, all allocated up front.
+///
+/// Building this before installing seccomp filters keeps the path from the
+/// filter to `exec` free of allocations, so a restrictive filter cannot be
+/// tripped by the allocator (`nix::unistd::execvp` allocates the pointer array).
+#[derive(Debug)]
+pub struct PreparedExec {
+    path: std::ffi::CString,
+    /// Owns the strings `argv` points into. Their heap buffers do not move when
+    /// this `Vec` or the struct moves, and nothing mutates them.
+    _args: Vec<std::ffi::CString>,
+    argv: Vec<*const libc::c_char>,
+}
+
+impl PreparedExec {
+    /// Prepare `execvp(path, args)`.
+    pub fn new(path: std::ffi::CString, args: Vec<std::ffi::CString>) -> Self {
+        let argv = args
+            .iter()
+            .map(|a| a.as_ptr())
+            .chain(std::iter::once(std::ptr::null()))
+            .collect();
+        Self {
+            path,
+            _args: args,
+            argv,
+        }
+    }
+
+    /// Replace this process with the prepared command, resolving it through the
+    /// current `PATH` exactly like `execvp(3)`. Returns only on failure.
+    pub fn exec(&self) -> Errno {
+        // SAFETY: `path` is a valid C string. `argv` is NULL-terminated and each
+        // entry points into a `CString` owned by `self._args`, alive for this call.
+        unsafe { libc::execvp(self.path.as_ptr(), self.argv.as_ptr()) };
+        Errno::last()
+    }
+}
+
+/// Why [`apply_env`] could not complete. Nothing after the failed operation has
+/// been applied, so the caller must not go on to run the command.
+#[derive(Debug)]
+pub enum EnvError {
+    /// The process is not provably single-threaded.
+    Guard(ForkError),
+    /// `clearenv(3)` failed.
+    Clear(Errno),
+    /// `setenv(3)` failed.
+    Set(Errno),
+    /// `unsetenv(3)` failed.
+    Unset(Errno),
+}
+
 /// How to change the environment (bwrap's `--clearenv`/`--setenv`/`--unsetenv`),
 /// applied in order by [`apply_env`].
 #[derive(Debug)]
@@ -205,42 +274,40 @@ pub enum EnvOp {
 /// another thread accesses it is a data race — the reason `std::env::set_var`
 /// became `unsafe` in edition 2024. bwrap's child is single-threaded by
 /// construction (it just cloned/forked from a single-threaded parent and spawns
-/// no threads), so this always succeeds there; the check is what makes the
-/// function a sound *safe* `pub fn`. Reading the environment stays safe via
-/// `std::env::var_os`, so no getenv wrapper is exposed.
-pub fn apply_env(ops: &[EnvOp]) -> Result<(), ForkError> {
-    ensure_single_threaded()?;
+/// no threads), so this always succeeds there. After
+/// [`seal_single_thread_guard`] the check rests on that function's contract.
+/// Reading the environment stays safe via `std::env::var_os`, so no getenv
+/// wrapper is exposed.
+///
+/// Stops at the first failing operation: running the command with an environment
+/// other than the one requested is never acceptable.
+pub fn apply_env(ops: &[EnvOp]) -> Result<(), EnvError> {
+    ensure_single_threaded().map_err(EnvError::Guard)?;
     for op in ops {
         match op {
-            EnvOp::Clear => env_clear(),
-            EnvOp::Set(name, value) => env_set(name, value),
-            EnvOp::Unset(name) => env_unset(name),
+            EnvOp::Clear => env_clear().map_err(EnvError::Clear)?,
+            EnvOp::Set(name, value) => env_set(name, value).map_err(EnvError::Set)?,
+            EnvOp::Unset(name) => env_unset(name).map_err(EnvError::Unset)?,
         }
     }
     Ok(())
 }
 
-pub(crate) fn env_clear() {
+fn env_clear() -> Result<(), Errno> {
     // SAFETY: clears `environ`; apply_env verified single-threadedness first, so
     // nothing races.
-    unsafe {
-        libc::clearenv();
-    }
+    Errno::result(unsafe { libc::clearenv() }).map(drop)
 }
 
-pub(crate) fn env_set(name: &std::ffi::CStr, value: &std::ffi::CStr) {
+fn env_set(name: &std::ffi::CStr, value: &std::ffi::CStr) -> Result<(), Errno> {
     // SAFETY: both are valid NUL-terminated C strings borrowed for this call;
     // setenv copies them. Single-threaded (apply_env checked).
-    unsafe {
-        libc::setenv(name.as_ptr(), value.as_ptr(), 1);
-    }
+    Errno::result(unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) }).map(drop)
 }
 
-pub(crate) fn env_unset(name: &std::ffi::CStr) {
+fn env_unset(name: &std::ffi::CStr) -> Result<(), Errno> {
     // SAFETY: a valid NUL-terminated C string; single-threaded (apply_env checked).
-    unsafe {
-        libc::unsetenv(name.as_ptr());
-    }
+    Errno::result(unsafe { libc::unsetenv(name.as_ptr()) }).map(drop)
 }
 
 /// Whether the process inherited SIG_IGN for each signal the Rust runtime
@@ -349,41 +416,74 @@ pub fn reset_runtime_signal_state() {
     install(libc::SIGCHLD, false);
 }
 
-/// Close every open file descriptor greater than 2 (stdio) that is not in
-/// `keep`, by walking the fd directory of `proc` (bwrap's `fdwalk` +
-/// `close_extra_fds`).
+/// The inclusive `close_range(2)` intervals covering every number above 2 that is
+/// not in `keep`.
+fn ranges_to_close(keep: &[RawFd]) -> Vec<(c_uint, c_uint)> {
+    let mut kept: Vec<c_uint> = keep
+        .iter()
+        .filter_map(|&fd| c_uint::try_from(fd).ok())
+        .filter(|&fd| fd > 2)
+        .collect();
+    kept.sort_unstable();
+    kept.dedup();
+    let mut ranges = Vec::with_capacity(kept.len() + 1);
+    let mut next: c_uint = 3;
+    for fd in kept {
+        if fd > next {
+            ranges.push((next, fd - 1));
+        }
+        // `fd` came from a non-negative `RawFd`, so this cannot overflow.
+        next = fd + 1;
+    }
+    ranges.push((next, c_uint::MAX));
+    ranges
+}
+
+/// Close the [`ranges_to_close`] intervals with `close_range(2)` (Linux 5.9+).
+fn close_with_ranges(keep: &[RawFd]) -> Result<(), Errno> {
+    for (first, last) in ranges_to_close(keep) {
+        let no_flags: c_uint = 0;
+        // SAFETY: `close_range` takes plain integers and touches no memory of
+        // ours. Which descriptors may be closed is this function's caller
+        // contract, documented on `close_extra_fds`.
+        Errno::result(unsafe { libc::syscall(libc::SYS_close_range, first, last, no_flags) })?;
+    }
+    Ok(())
+}
+
+/// Close every open file descriptor greater than 2 (stdio) that is not in `keep`
+/// (bwrap's `fdwalk` + `close_extra_fds`).
+///
+/// Walks the fd directory of `proc`, using the same syscalls as bwrap. If the
+/// directory cannot be listed, it falls back to `close_range(2)`. An `Err` means
+/// descriptors may still be open: success is reported only when the cleanup really
+/// ran, unlike bwrap's `fdwalk`, which reports success when it cannot list the
+/// directory.
 ///
 /// `proc` is an `O_PATH` handle to the host `/proc`, opened before any pivot;
 /// the directory is listed with `openat(proc, "self/fd")`, never via the
-/// `/proc/self/fd` path. This matches bwrap, which threads a single `proc_fd`
-/// through, and is required because the sandbox root need not mount `/proc` at
-/// all (`--dev` without `--proc`, as glycin does) — a path lookup would then
-/// fail right before `exec`.
-///
-/// Called in the sandboxed child just before `exec` so that no stray host fd
-/// leaks in. The fd numbers are collected while the directory is open, then
-/// closed after the directory handle is closed; closing an already-closed or
-/// invalid number yields `EBADF`, which is ignored, exactly as bwrap does.
+/// `/proc/self/fd` path, because the sandbox root need not mount `/proc` at all
+/// (`--dev` without `--proc`, as glycin does).
 pub fn close_extra_fds(proc: BorrowedFd<'_>, keep: &[RawFd]) -> io::Result<()> {
-    // Stage 1: opening self/fd is non-fatal — bwrap's fdwalk silently ignores a
-    // /proc/self/fd it cannot open (e.g. a root without /proc), rather than
-    // treating it as an error.
-    let dir_fd = match openat(
+    close_by_walking(proc, keep)
+        .or_else(|walk_error| close_with_ranges(keep).map_err(|_| walk_error))
+}
+
+/// List `self/fd` under `proc` and close every number above 2 not in `keep`. Nothing
+/// is closed unless the whole directory could be read.
+fn close_by_walking(proc: BorrowedFd<'_>, keep: &[RawFd]) -> io::Result<()> {
+    let dir_fd = openat(
         proc.as_fd(),
         "self/fd",
         OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_CLOEXEC,
         Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(_) => return Ok(()),
-    };
-    // Stage 2: fdopendir failure IS surfaced, as the original did. `Dir` owns the
-    // fd and its `Drop` does closedir (+ closes the fd).
+    )?;
+    // `Dir` owns the fd and its `Drop` does closedir (+ closes the fd).
     let mut dir = Dir::from_fd(dir_fd).map_err(io::Error::from)?;
     let self_fd = dir.as_raw_fd();
     let mut candidates: Vec<RawFd> = Vec::new();
     for entry in dir.iter() {
-        let Ok(entry) = entry else { continue };
+        let entry = entry?;
         if let Ok(n) = entry.file_name().to_str().unwrap_or("").parse::<RawFd>()
             && n > 2
             && n != self_fd
@@ -409,6 +509,41 @@ fn to_fork_result(ret: libc::c_long) -> Result<ForkResult, ForkError> {
     Ok(ForkResult::Parent {
         child: Pid::from_raw(pid),
     })
+}
+
+#[cfg(test)]
+mod close_range_tests {
+    use super::{c_uint, ranges_to_close};
+
+    const MAX: c_uint = c_uint::MAX;
+
+    #[test]
+    fn nothing_kept_closes_everything_above_stdio() {
+        assert_eq!(ranges_to_close(&[]), [(3, MAX)]);
+    }
+
+    #[test]
+    fn kept_numbers_split_the_range() {
+        assert_eq!(ranges_to_close(&[5]), [(3, 4), (6, MAX)]);
+        assert_eq!(ranges_to_close(&[9, 5]), [(3, 4), (6, 8), (10, MAX)]);
+    }
+
+    #[test]
+    fn adjacent_and_duplicate_numbers_leave_no_empty_range() {
+        assert_eq!(ranges_to_close(&[3]), [(4, MAX)]);
+        assert_eq!(ranges_to_close(&[3, 4, 4, 5]), [(6, MAX)]);
+    }
+
+    #[test]
+    fn stdio_and_negative_numbers_are_ignored() {
+        assert_eq!(ranges_to_close(&[-1, 0, 1, 2]), [(3, MAX)]);
+    }
+
+    #[test]
+    fn the_largest_fd_can_be_kept() {
+        let top = c_uint::try_from(i32::MAX).unwrap();
+        assert_eq!(ranges_to_close(&[i32::MAX]), [(3, top - 1), (top + 1, MAX)]);
+    }
 }
 
 #[cfg(test)]

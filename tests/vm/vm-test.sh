@@ -72,6 +72,11 @@ echo "--- A) setuid role: must be REFUSED, identically ---"
 chmod u+s $OURS $REAL
 abx setuid-refused     user $BASE /bin/true
 abx setuid-refused-msg user $BASE /bin/sh -c 'echo should-not-run'
+# The refusal comes before any argument is looked at: neither a parse error nor
+# --help may be reported instead. A lone --version is the one exception.
+abx setuid-refused-before-parse user --this-option-does-not-exist
+abx setuid-refused-help         user --help
+abx setuid-version-still-works  user --version
 chmod u-s $OURS $REAL
 
 if [ "$USERNS_DISABLED" = 1 ]; then

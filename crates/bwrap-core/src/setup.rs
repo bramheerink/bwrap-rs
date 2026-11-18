@@ -116,6 +116,9 @@ pub struct NewrootCtx {
     pub not_a_security_boundary: bool,
     /// Host tty device path when stdout is a tty, for `/dev/console`.
     pub host_tty_dev: Option<Vec<u8>>,
+    /// `PWD` as `--clearenv`/`--setenv`/`--unsetenv` leave it, for the lookup of
+    /// the logical working directory.
+    pub pwd: Option<std::ffi::OsString>,
     /// `--file-label`: SELinux context folded into tmpfs mount options.
     pub file_label: Option<String>,
 }
@@ -377,8 +380,12 @@ pub fn setup_newroot(ops: &ResolvedOps, ctx: &NewrootCtx, fds: &mut FdTable) -> 
             }
 
             SetupOp::BindFd { fd, dest, kind } => {
-                fds.register(*fd);
-                let src_fd = fds.borrow(*fd).expect("bind-fd src just registered");
+                // A number consumed by an earlier op reports what reading its
+                // `/proc/self/fd` link reports (DIFFERENCES.md #8).
+                let src_fd = fds.live(*fd).map_err(|_| Error::Sys {
+                    message: format!("Can't read link /proc/self/fd/{fd}").into(),
+                    errno: Errno::ENOENT,
+                })?;
                 // Resolve the caller's fd to its real path (bwrap resolves the
                 // `/proc/self/fd/N` source to the realpath), then bind that path
                 // from the old root like a normal source — binding the magic link
@@ -583,9 +590,8 @@ pub fn setup_newroot(ops: &ResolvedOps, ctx: &NewrootCtx, fds: &mut FdTable) -> 
                     false,
                 )?;
                 let dest_fd = dest_fd.expect("file dest is created");
-                fds.register(*fd);
-                let src = fds.borrow(*fd).expect("file src just registered");
-                copy_file_data(src, dest_fd.as_fd())
+                fds.live(*fd)
+                    .and_then(|src| copy_file_data(src, dest_fd.as_fd()))
                     .with_context(|| format!("Can't write data to file {}", disp(dest_b)))?;
                 // bwrap closes the data fd after copying (bubblewrap.c:1306), so a
                 // reused `--file N … --file N` re-reads a closed fd and fails with
@@ -678,30 +684,24 @@ pub fn setup_newroot(ops: &ResolvedOps, ctx: &NewrootCtx, fds: &mut FdTable) -> 
 }
 
 /// bwrap captures `old_cwd` with glibc's `get_current_dir_name()`, which returns
-/// `$PWD` when it is an absolute path that names the current directory (same
-/// dev/ino, no `.`/`..` components) and falls back to `getcwd()` otherwise. That
-/// keeps a *logical* cwd reached through a symlink (bash's `$PWD`) for the
+/// `$PWD` verbatim whenever it names the current directory (same dev/ino), even if
+/// it is relative or has `.`/`..` components, and falls back to `getcwd()`
+/// otherwise. That keeps a *logical* cwd reached through a symlink (bash's `$PWD`) for the
 /// sandbox cwd and `PWD`, where a plain `getcwd()` would substitute the physical
 /// path — an observable difference for `pwd`/`$PWD` inside the sandbox.
-fn get_current_dir_name() -> nix::Result<std::path::PathBuf> {
-    use std::os::unix::ffi::OsStrExt;
-    if let Some(pwd) = std::env::var_os("PWD") {
-        let b = pwd.as_bytes();
-        let has_dot_component = b.windows(3).any(|w| w == b"/./")
-            || b.windows(4).any(|w| w == b"/../")
-            || b.ends_with(b"/.")
-            || b.ends_with(b"/..");
-        if b.first() == Some(&b'/') && !has_dot_component {
-            let pwd_path = std::path::Path::new(&pwd);
-            if let (Ok(at_pwd), Ok(at_dot)) = (
-                nix::sys::stat::stat(pwd_path),
-                nix::sys::stat::stat(std::path::Path::new(".")),
-            ) && at_pwd.st_dev == at_dot.st_dev
-                && at_pwd.st_ino == at_dot.st_ino
-            {
-                return Ok(std::path::PathBuf::from(&pwd));
-            }
-        }
+///
+/// `pwd` is the value glibc would read at this point in bwrap: the environment
+/// options have already been applied there, but not yet in this port.
+fn get_current_dir_name(pwd: Option<&std::ffi::OsStr>) -> nix::Result<std::path::PathBuf> {
+    if let Some(pwd) = pwd
+        && let (Ok(at_pwd), Ok(at_dot)) = (
+            nix::sys::stat::stat(std::path::Path::new(pwd)),
+            nix::sys::stat::stat(std::path::Path::new(".")),
+        )
+        && at_pwd.st_dev == at_dot.st_dev
+        && at_pwd.st_ino == at_dot.st_ino
+    {
+        return Ok(std::path::PathBuf::from(pwd));
     }
     nix::unistd::getcwd()
 }
@@ -721,8 +721,9 @@ impl ResolvedOps {
     /// before the pivot (bwrap's `resolve_symlinks_in_ops`): symlinks in the
     /// source are resolved, and a missing source fails early with `Can't find
     /// source path X` unless the op is a `-try` variant. Non-source ops pass
-    /// through unchanged.
-    pub fn resolve(ops: &[SetupOp]) -> Result<Self> {
+    /// through unchanged. `fds` answers whether a `--bind-fd` number is really the
+    /// caller's descriptor.
+    pub fn resolve(ops: &[SetupOp], fds: &FdTable) -> Result<Self> {
         let resolved = ops
             .iter()
             .map(|op| match op {
@@ -768,8 +769,16 @@ impl ResolvedOps {
                     // (bubblewrap.c op->source = "/proc/self/fd/%d"), so a bad fd
                     // must fail *here* with the same "Can't find source path"
                     // message — not later with a readlink-specific one. Validate
-                    // the magic link now.
+                    // the magic link now. A number the caller left closed fails
+                    // here too, even if an internal descriptor has since landed on
+                    // it: the link would otherwise name that internal descriptor.
                     let proc = format!("/proc/self/fd/{fd}");
+                    if !fds.is_live(*fd) {
+                        return Err(Error::Sys {
+                            message: format!("Can't find source path {proc}").into(),
+                            errno: Errno::ENOENT,
+                        });
+                    }
                     std::fs::canonicalize(&proc).map_err(|e| Error::Sys {
                         message: format!("Can't find source path {proc}").into(),
                         errno: Errno::from_raw(e.raw_os_error().unwrap_or(0)),
@@ -851,7 +860,7 @@ pub fn pivot_into_newroot(
     // glibc's get_current_dir_name() returns NULL when the cwd has been removed;
     // bwrap ignores that and lets the later chdir fall back to $HOME then /. A
     // failed lookup is therefore None here, not a fatal error.
-    let old_cwd = get_current_dir_name().ok();
+    let old_cwd = get_current_dir_name(ctx.pwd.as_deref()).ok();
     chdir(BASE).context("chdir base_path")?;
 
     mkdir("newroot", dir_mode).context("Creating newroot failed")?;
@@ -1074,9 +1083,8 @@ fn bind_data_tmpfile(
             disp(dest_display)
         )
     })?;
-    fds.register(fd);
-    let src = fds.borrow(fd).expect("bind-data src just registered");
-    copy_file_data(src, tmp.as_fd())
+    fds.live(fd)
+        .and_then(|src| copy_file_data(src, tmp.as_fd()))
         .with_context(|| format!("Can't write data to file {}", disp(dest_display)))?;
     // Close the data fd after copying (bubblewrap.c:1547) so a reused
     // --bind-data/--ro-bind-data fd fails with EBADF like bubblewrap.

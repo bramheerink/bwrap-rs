@@ -19,7 +19,9 @@ use crate::error::{Error, Result};
 
 /// An environment mutation from `--clearenv` / `--setenv` / `--unsetenv`,
 /// in command-line order. bwrap applies these to its own environment during
-/// parsing; we record them and apply to a copy later.
+/// parsing; we record them and apply them to the real environment after the
+/// pivot. Anything that reads the environment earlier must account for them, as
+/// [`effective_pwd`] does.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum EnvOp {
     /// `--clearenv`: drop the entire environment.
@@ -183,15 +185,29 @@ pub struct Config {
     pub force_mount_setattr_fallback: bool,
 }
 
-/// The configuration after bwrap's `main()` resolution and checks.
+/// The configuration after bwrap's `main()` resolution and checks. Created only
+/// by [`Config::resolve`] and carried by [`crate::run::ExecutionPlan`], so a launch
+/// cannot combine it with a different [`Config`].
 #[derive(Debug)]
 pub struct ResolvedConfig {
     /// Resolved namespace decisions.
-    pub namespaces: NamespaceConfig,
+    pub(crate) namespaces: NamespaceConfig,
     /// Sandbox uid (defaulted to the real uid when `--uid` was absent).
-    pub sandbox_uid: u32,
+    pub(crate) sandbox_uid: u32,
     /// Sandbox gid (defaulted to the real gid when `--gid` was absent).
-    pub sandbox_gid: u32,
+    pub(crate) sandbox_gid: u32,
+}
+
+/// The value `PWD` has once `ops` are applied to an environment where it is
+/// `inherited`. bwrap applies these ops while parsing, so its cwd lookup sees this
+/// value, whereas this port applies them to the real environment after the pivot.
+pub(crate) fn effective_pwd(inherited: Option<OsString>, ops: &[EnvOp]) -> Option<OsString> {
+    ops.iter().fold(inherited, |pwd, op| match op {
+        EnvOp::Clear => None,
+        EnvOp::Set { name, value } if name == "PWD" => Some(value.clone()),
+        EnvOp::Unset { name } if name == "PWD" => None,
+        EnvOp::Set { .. } | EnvOp::Unset { .. } => pwd,
+    })
 }
 
 impl Config {
@@ -199,7 +215,7 @@ impl Config {
     ///
     /// Returns the first failing check as an [`Error`] whose message matches
     /// bwrap's `die()` text, or the [`ResolvedConfig`] on success.
-    pub fn resolve(
+    pub(crate) fn resolve(
         &self,
         real_uid: u32,
         real_gid: u32,
@@ -318,6 +334,42 @@ impl Config {
             sandbox_uid,
             sandbox_gid,
         })
+    }
+}
+
+#[cfg(test)]
+mod effective_pwd_tests {
+    use super::{EnvOp, effective_pwd};
+    use std::ffi::OsString;
+
+    fn set(name: &str, value: &str) -> EnvOp {
+        EnvOp::Set {
+            name: name.into(),
+            value: value.into(),
+        }
+    }
+
+    #[test]
+    fn follows_the_ops_in_command_line_order() {
+        let inherited = || Some(OsString::from("/logical"));
+        assert_eq!(effective_pwd(inherited(), &[]), inherited());
+        assert_eq!(
+            effective_pwd(inherited(), &[set("HOME", "/h")]),
+            inherited()
+        );
+        assert_eq!(effective_pwd(inherited(), &[EnvOp::Clear]), None);
+        assert_eq!(
+            effective_pwd(inherited(), &[EnvOp::Unset { name: "PWD".into() }]),
+            None
+        );
+        assert_eq!(
+            effective_pwd(inherited(), &[EnvOp::Clear, set("PWD", "/new")]),
+            Some("/new".into())
+        );
+        assert_eq!(
+            effective_pwd(inherited(), &[set("PWD", "/new"), EnvOp::Clear]),
+            None
+        );
     }
 }
 

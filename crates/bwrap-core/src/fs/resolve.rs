@@ -19,7 +19,7 @@ use std::ffi::OsStr;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
 
-/// bwrap's `MAX_READLINKS`: symlink-depth limit before `ELOOP`.
+/// How many symlinks one resolution may follow before `ELOOP`.
 const MAX_READLINKS: u32 = 32;
 
 /// `PATH_MAX` as the C uses it for its length guards.
@@ -100,10 +100,14 @@ pub fn chroot_realpath(chroot: &[u8], path: &[u8]) -> io::Result<Vec<u8>> {
         if readlinks > MAX_READLINKS {
             return Err(io::Error::from_raw_os_error(libc_eloop()));
         }
-        readlinks += 1;
 
         match std::fs::read_link(OsStr::from_bytes(&got)) {
             Ok(target) => {
+                // Only a symlink actually followed counts. bubblewrap's C counts
+                // every component, which wrongly limits the depth of plain paths
+                // (DIFFERENCES.md #16). Plain components need no limit of their
+                // own: each one consumes part of the bounded path.
+                readlinks += 1;
                 let link = target.as_os_str().as_bytes();
                 if link.first() == Some(&b'/') {
                     // Absolute symlink: restart from the root.
@@ -183,6 +187,81 @@ mod tests {
 
     fn rp(chroot: &str, path: &str) -> String {
         String::from_utf8(chroot_realpath(chroot.as_bytes(), path.as_bytes()).unwrap()).unwrap()
+    }
+
+    /// A fresh directory under the system temp dir, unique to this test.
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("bwrap-rp-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn plain_directories_do_not_count_as_symlinks() {
+        let root = scratch("deep");
+        let rel = vec!["d"; 100].join("/");
+        std::fs::create_dir_all(root.join(&rel)).unwrap();
+        let chroot = root.as_os_str().as_bytes();
+        let got = chroot_realpath(chroot, rel.as_bytes()).expect("deep plain path resolves");
+        assert_eq!(got, root.join(&rel).as_os_str().as_bytes());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// `l0 -> l1 -> … -> l<n-1> -> target`, returning the root.
+    fn symlink_chain(name: &str, n: usize) -> std::path::PathBuf {
+        let root = scratch(name);
+        std::fs::create_dir(root.join("target")).unwrap();
+        for i in 0..n {
+            let next = if i + 1 == n {
+                "target".to_string()
+            } else {
+                format!("l{}", i + 1)
+            };
+            std::os::unix::fs::symlink(next, root.join(format!("l{i}"))).unwrap();
+        }
+        root
+    }
+
+    #[test]
+    fn symlink_limit_still_applies() {
+        let within = symlink_chain("chain32", MAX_READLINKS as usize);
+        let got = chroot_realpath(within.as_os_str().as_bytes(), b"l0").expect("within the limit");
+        assert_eq!(got, within.join("target").as_os_str().as_bytes());
+        std::fs::remove_dir_all(&within).unwrap();
+
+        let beyond = symlink_chain("chain33", MAX_READLINKS as usize + 1);
+        let e = chroot_realpath(beyond.as_os_str().as_bytes(), b"l0").unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc_eloop()));
+        std::fs::remove_dir_all(&beyond).unwrap();
+    }
+
+    #[test]
+    fn chain_ending_without_another_component_matches_c() {
+        // After the 33rd link there is no further component to look up, so the C
+        // resolver accepts this chain too.
+        let root = scratch("chain-dot");
+        for i in 0..33 {
+            let next = if i == 32 {
+                ".".to_string()
+            } else {
+                format!("l{}", i + 1)
+            };
+            std::os::unix::fs::symlink(next, root.join(format!("l{i}"))).unwrap();
+        }
+        let got = chroot_realpath(root.as_os_str().as_bytes(), b"l0").expect("resolves");
+        assert_eq!(got, root.as_os_str().as_bytes());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn symlink_loop_is_refused() {
+        let root = scratch("loop");
+        std::os::unix::fs::symlink("b", root.join("a")).unwrap();
+        std::os::unix::fs::symlink("a", root.join("b")).unwrap();
+        let e = chroot_realpath(root.as_os_str().as_bytes(), b"a").unwrap_err();
+        assert_eq!(e.raw_os_error(), Some(libc_eloop()));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]

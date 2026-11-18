@@ -30,6 +30,12 @@ impl ParseHost for TestHost {
             .cloned()
             .ok_or_else(|| bwrap_core::Error::invalid(format!("no such test fd {fd}")))
     }
+    fn validate_label(&mut self, _label: &std::ffi::OsStr) -> Result<(), bwrap_core::Error> {
+        Ok(())
+    }
+    fn set_file_label(&mut self, _label: &std::ffi::OsStr) -> Result<(), bwrap_core::Error> {
+        Ok(())
+    }
     fn warn(&mut self, msg: &str) {
         self.warnings.push(msg.to_string());
     }

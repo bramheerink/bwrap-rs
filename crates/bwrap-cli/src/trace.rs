@@ -10,8 +10,9 @@
 //! binary stays a byte-exact drop-in for bwrap. Nothing is ever written to
 //! stdout/stderr, so logging can never change the sandbox's observable output.
 //!
-//! Note: those callers' argv can contain secrets such as proxy credentials.
-//! Point the log at a private, mode-0600 file and do not share it.
+//! Note: those callers' argv can contain secrets such as proxy credentials. The
+//! log is therefore written only to a regular file owned by the current user with
+//! no group or other permissions; any other target silently disables logging.
 
 use std::ffi::{OsStr, OsString};
 
@@ -75,18 +76,30 @@ fn log_path() -> Option<OsString> {
     (!line.is_empty()).then(|| OsString::from(line))
 }
 
+/// Whether an opened log target may receive the (secret-bearing) log: the checks
+/// apply to the object actually opened, since `mode(0o600)` only governs creation.
+fn target_is_private(is_file: bool, owner: u32, euid: u32, mode: u32) -> bool {
+    is_file && owner == euid && (mode & 0o077) == 0
+}
+
 /// Append one line to `path`. Best-effort: any error (unwritable path, full
-/// disk) is ignored. Opened mode-0600 and `O_NOFOLLOW` so the (secret-bearing)
-/// log is private and a symlink at the target cannot redirect the write.
+/// disk) is ignored. `O_NOFOLLOW` keeps a final symlink from redirecting the
+/// write, and `O_NONBLOCK` keeps a FIFO without a reader from hanging the launch.
 fn append(path: &OsStr, record: &str) {
     use std::io::Write as _;
-    use std::os::unix::fs::OpenOptionsExt as _;
-    if let Ok(mut f) = std::fs::OpenOptions::new()
+    use std::os::unix::fs::{MetadataExt as _, OpenOptionsExt as _};
+    let Ok(mut f) = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .custom_flags(nix::libc::O_NOFOLLOW)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK | nix::libc::O_NOCTTY)
         .open(path)
+    else {
+        return;
+    };
+    let euid = nix::unistd::geteuid().as_raw();
+    if f.metadata()
+        .is_ok_and(|m| target_is_private(m.is_file(), m.uid(), euid, m.mode()))
     {
         let _ = f.write_all(record.as_bytes());
     }
@@ -110,5 +123,23 @@ fn sh_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\\''"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::target_is_private;
+
+    #[test]
+    fn only_a_private_regular_file_owned_by_us_is_accepted() {
+        assert!(target_is_private(true, 1000, 1000, 0o100600));
+        assert!(target_is_private(true, 1000, 1000, 0o100400));
+        assert!(!target_is_private(false, 1000, 1000, 0o010600), "FIFO");
+        assert!(
+            !target_is_private(true, 1001, 1000, 0o100600),
+            "other owner"
+        );
+        assert!(!target_is_private(true, 1000, 1000, 0o100640), "group read");
+        assert!(!target_is_private(true, 1000, 1000, 0o100604), "other read");
     }
 }

@@ -435,6 +435,10 @@ pub fn monitor_child(
 /// die with the parent, apply seccomp, then reap every descendant. When the
 /// initial sandbox process dies, its exit status + 1 is written to `event_fd`
 /// for [`monitor_child`]. Returns the initial process's exit status.
+///
+/// `locks_taken` releases the initial process once every lock is held. If taking
+/// a lock fails, this returns an error and the channel closes unsignalled, so the
+/// initial process ends without running the command.
 pub fn do_init(
     event_fd: Option<BorrowedFd<'_>>,
     initial_pid: Pid,
@@ -442,10 +446,20 @@ pub fn do_init(
     seccomp: &SeccompPrograms,
     die_with_parent: bool,
     launcher: Option<BorrowedFd<'_>>,
+    locks_taken: Option<OwnedFd>,
 ) -> Result<i32> {
     // Hold the locks for our whole lifetime; dropping at return closes the fds,
     // as C does at the end of do_init.
     let _locks = take_locks(lock_files)?;
+    if let Some(channel) = locks_taken {
+        // MSG_NOSIGNAL: an initial process that already died must not take pid 1
+        // down with SIGPIPE, which would lose its exit status.
+        let _ = nix::sys::socket::send(
+            channel.as_raw_fd(),
+            &[1u8],
+            nix::sys::socket::MsgFlags::MSG_NOSIGNAL,
+        );
+    }
 
     // Bind our lifetime to the launcher via the handshake socket, not getppid()
     // (which is 0 here — we are pid 1 of the new pid namespace).

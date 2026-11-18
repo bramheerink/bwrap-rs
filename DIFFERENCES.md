@@ -70,13 +70,16 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
    mounted. On the unusual configuration where `selinuxfs` is mounted but SELinux
    is disabled, this can report "enabled" where libselinux reports "disabled". On
    enforcing and permissive systems — the normal case — the two agree. Matching
-   libselinux's enabled-state check on that edge case is not yet done.
+   libselinux's enabled-state check on that edge case is not yet done. The state
+   is detected once, before the sandbox's root is built, and a requested label is
+   then either applied or the launch fails.
 
-5. **[safer divergence] The `/proc/self/mountinfo` parser rejects
-   hostile/malformed input.** A line with too few fields, a truncated octal
-   escape, or a cyclic mount tree is rejected rather than read past. This never
-   arises for the mountinfo a kernel actually produces; it is defensive
-   hardening.
+5. **[safer divergence] The `/proc/self/mountinfo` parser tolerates
+   hostile/malformed input without crashing.** A line with too few fields or a
+   non-numeric mount id is rejected with an error. A truncated octal escape is
+   kept literally, and a cycle in the mount tree is cut by skipping nodes already
+   visited, where bubblewrap's recursion would crash. This never arises for the
+   mountinfo a kernel actually produces; it is defensive hardening.
 
 6. **[known limitation] Non-UTF-8 values appear in *error text* with U+FFFD, not
    their raw bytes.** Arbitrary byte strings are now accepted and processed
@@ -154,22 +157,53 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
     the moment after the clone, so this is near-unreachable in practice; matching
     bubblewrap's abort on it is an open fidelity gap.
 
-12. **[known limitation] A *closed* low-numbered fd passed to an fd-taking option
-    can be shadowed by one of the port's internal descriptors.** Both binaries
-    open their own descriptors during setup (an `O_PATH` handle to `/proc`, the
-    pid-translation socketpair, …), which fill a low fd number the caller left
-    *closed*. So an fd option naming that number — `--pidns`/`--userns`/`--userns2`
-    (→ `setns` on a socket: `Invalid argument` vs bubblewrap's `Bad file
-    descriptor`), or `--bind-fd N` (→ resolving `/proc/self/fd/N` reaches the
-    port's internal `/proc` handle and binds `/proc` instead of failing) — behaves
-    differently between the port and bubblewrap, because their internal fd layouts
-    differ. All still exit 1. A **valid** fd is unaffected: the caller's fd
-    occupies the number, so the port's internal fds land above it (verified with
-    `--bind-fd 3`), and passing a closed fd is a caller bug either way. Matching
-    bubblewrap on this closed-fd edge needs either reproducing its fd layout or
-    keeping the port's internal descriptors out of the low caller-fd range (an
-    fd-hygiene improvement worth doing); tracked as an open fidelity gap. Found by
-    the generative differential fuzzer (`crates/bwrap-cli/examples/diff_fuzz.rs`).
+12. **[safer divergence] A *closed* or already consumed fd number is never
+    confused with one of bwrap's internal descriptors.** Both binaries open their
+    own descriptors during setup (an `O_PATH` handle to `/proc`, for example),
+    which can land on a low number the caller left closed. `bwrap-rs` records which
+    numbers are open before it opens any descriptor of its own, so `--bind-fd 3`
+    with fd 3 closed fails with `Can't find source path /proc/self/fd/3: No such
+    file or directory`, where bubblewrap's result depends on its internal fd
+    layout. A number consumed by an earlier option likewise stays unusable
+    even if the kernel reuses it. Every other fd option given a closed number
+    matches bubblewrap's exit code and message (compared for `--userns`,
+    `--userns2`, `--pidns`, `--file`, `--bind-data`, `--info-fd`,
+    `--json-status-fd`, `--block-fd`, `--sync-fd`, `--seccomp` and `--args`). A
+    valid fd is unaffected.
+
+13. **[equivalent by design] The optional invocation log is an addition of the
+    port.** With `BWRAP_RS_LOG` unset and no `/etc/bwrap-rs-log`, nothing changes.
+    When enabled, each launch's full argv is appended to the named file, so argv
+    (which can contain secrets) reaches a place it does not reach with bubblewrap.
+    Output, exit codes and the sandbox are unaffected. The log is written only to a
+    regular file owned by the current user with no group or other permissions, and
+    is skipped entirely for a refused setuid or file-capability launch and for a
+    lone `--version`.
+
+14. **[safer divergence] With `--lock-file`, the command starts only after the
+    locks are held.** bubblewrap forks the command first and takes the locks
+    afterwards in pid 1, so the command can run without the lock, and still runs
+    when the lock cannot be taken even though bubblewrap exits 1. `bwrap-rs` makes
+    the command wait for pid 1, and ends it unrun if pid 1 fails. The exit code and
+    error message are unchanged.
+
+15. **[safer divergence] Numbers outside `0..=INT_MAX` are refused.** bubblewrap
+    narrows the parsed `long` to an `int` before validating it, so `--uid 4294968296`
+    means uid 1000, `--uid -4294966296` also means uid 1000, and `--bind-fd 4294967299`
+    means fd 3. `bwrap-rs` rejects such values for every fd option, `--uid` and
+    `--gid`, with the usual `Invalid fd` / `Invalid uid` / `Invalid gid` message.
+
+16. **[safer divergence] The fallback path resolver limits symlinks, not depth.**
+    bubblewrap's `chroot_realpath` counts every path component against its limit of
+    32 symlinks, so its fallback (used without `openat2`, or with
+    `--debug-opt=force-openat-fallback`) refuses deep paths that contain no symlinks
+    at all. `bwrap-rs` counts only symlinks it follows. Symlink chains and loops are
+    limited as before.
+
+17. **[safer divergence] A failed descriptor cleanup is reported.** bubblewrap's
+    `fdwalk` reports success when it cannot list `/proc/self/fd`, leaving descriptors
+    open. `bwrap-rs` then closes them with `close_range(2)`, and fails if that does
+    not work either.
 
 ## Everything else
 

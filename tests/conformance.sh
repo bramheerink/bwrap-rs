@@ -89,7 +89,12 @@ B="${BASE[*]}"   # space-joined base for template cases
 # or it dies on the incompatibility check before the fd is ever looked at.
 UJOIN="--ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --symlink usr/sbin /sbin --proc /proc"
 
-WORK=$(mktemp -d); trap 'rm -rf "$WORK"' EXIT
+WORK=$(mktemp -d)
+# Outside /tmp on purpose: bwrap mounts its setup tmpfs over /tmp before it looks
+# up the working directory, which would hide a logical path below /tmp.
+LOGICAL=$(mktemp -d -p "$HOME" .bwrap-conformance.XXXXXX)
+trap 'rm -rf "$WORK" "$LOGICAL"' EXIT
+mkdir "$LOGICAL/phys"; ln -s phys "$LOGICAL/link"
 PASS=0 FAIL=0 SKIP=0; FAILED=()
 ok()   { PASS=$((PASS+1)); }
 fail() { FAIL=$((FAIL+1)); FAILED+=("  [$1] $2"); }
@@ -265,8 +270,27 @@ abx file-fd-reuse     "%B --ro-bind / / --tmpfs /tmp --file 3 /tmp/a --file 3 /t
 # _cmp helpers run abx templates in the current shell (not a $(...) subshell), a
 # bare `cd` here would change the working directory for every later case.
 abx cwd-logical       '( cd "'"$WORK"'/link" && %B --bind / / --dev /dev /bin/sh -c pwd )'
+# The environment options apply before the cwd lookup, as in C: once PWD is gone
+# or names the physical directory, the logical path must not survive.
+abx cwd-logical-clearenv  '( cd "'"$LOGICAL"'/link" && %B --bind / / --clearenv /bin/sh -c pwd )'
+abx cwd-logical-unsetenv  '( cd "'"$LOGICAL"'/link" && %B --bind / / --unsetenv PWD /bin/sh -c pwd )'
+abx cwd-logical-setenv    '( cd "'"$LOGICAL"'/link" && %B --bind / / --setenv PWD "'"$LOGICAL"'/phys" /bin/sh -c pwd )'
+# glibc keeps any PWD that names the cwd, relative or with dot components.
+abx cwd-pwd-relative      '( cd /usr && %B --ro-bind / / --setenv PWD . /bin/sh -c "echo \$PWD; /bin/pwd -P" )'
+abx cwd-pwd-dot           '( cd /usr && %B --ro-bind / / --setenv PWD /usr/. /bin/sh -c "echo \$PWD; /bin/pwd -P" )'
+abx cwd-pwd-dotdot        '( cd /usr && %B --ro-bind / / --setenv PWD /usr/../usr /bin/sh -c "echo \$PWD; /bin/pwd -P" )'
 # An empty SELinux label is rejected exactly as C (libselinux writes the NUL).
 ab  empty-exec-label -- "${BASE[@]}" --exec-label '' /bin/true
+# A requested exec label is applied or the launch fails, whatever the sandbox's
+# root shows. On an SELinux host this label is valid but not permitted, so the
+# command must not run; the sandbox has no /sys, and in the second case no /proc.
+ab  exec-label-denied         -- "${BASE[@]}" --exec-label system_u:system_r:init_t:s0 /bin/sh -c 'echo ran'
+ab  exec-label-denied-no-proc -- --unshare-user --ro-bind /usr /usr --symlink usr/bin /bin --symlink usr/lib /lib --symlink usr/lib64 /lib64 --exec-label system_u:system_r:init_t:s0 /bin/sh -c 'echo ran'
+# A number the caller left closed stays closed, even when an internal descriptor
+# lands on it (DIFFERENCES.md #12).
+invx bind-fd-closed-number 1 "Can't find source path /proc/self/fd/3" '%B $B --bind-fd 3 /mnt /bin/true 3<&-'
+invx userns-closed-number  1 "Bad file descriptor" '%B $UJOIN --userns 3 /bin/true 3<&-'
+invx pidns-closed-number   1 "Bad file descriptor" '%B $B --pidns 3 /bin/true 3<&-'
 ab  chdir            -- "${BASE[@]}" --chdir /usr /bin/sh -c 'pwd'
 ab  chdir-missing    -- "${BASE[@]}" --chdir /no/such /bin/true
 ab  level-prefix     -- --level-prefix "${BASE[@]}" --bind /no/such /x /bin/true
@@ -360,6 +384,22 @@ ab0 lock-file        -- "${BASE[@]}" --ro-bind "$WORK/lock" /lock --lock-file /l
 # the holder pid differs from the oracle's). Catches a regression that drops the
 # lock while still exiting 0.
 inv lock-held 0 'held'  -- "${BASE[@]}" --ro-bind "$WORK/lock" /lock --lock-file /lock /bin/sh -c 'grep -q READ /proc/locks && echo held || echo none'
+# The command starts only once the lock is held, and never when it cannot be taken
+# (DIFFERENCES.md #14). Ours-only: bubblewrap starts the command first.
+# A FIFO makes the order deterministic: pid 1 blocks opening it until a writer
+# appears, so the command must not have run before that, and must run after it.
+invx lock-held-at-start 0 '' '( f="'"$WORK"'/lockfifo"; m="'"$WORK"'/lockstart"; rm -f "$f" "$m"; mkfifo "$f"; %B --unshare-user --bind / / --proc /proc --lock-file "$f" /bin/sh -c "echo x > \"$m\"" 2>/dev/null & p=$!; sleep 0.5; early=0; [ ! -e "$m" ] || early=1; timeout 5 sh -c ": > \"$f\"" || exit 8; wait $p; rc=$?; sleep 0.2; [ "$early" = 0 ] || exit 7; [ -e "$m" ] || exit 9; exit $rc )'
+invx lock-failure-no-run 1 'Unable to open lock file' '( m="'"$WORK"'/lockran"; rm -f "$m"; %B --unshare-user --bind / / --proc /proc --lock-file /nonexistent/lock /bin/sh -c "echo x > \"$m\""; rc=$?; sleep 0.3; [ ! -e "$m" ] || exit 7; exit $rc )'
+# Out-of-range numbers are refused instead of narrowed to another valid number
+# (DIFFERENCES.md #15). Ours-only: bubblewrap accepts them.
+inv uid-out-of-range    1 'Invalid uid: 4294968296'  -- "${BASE[@]}" --uid 4294968296 /bin/true
+inv gid-out-of-range    1 'Invalid gid: 4294968296'  -- "${BASE[@]}" --gid 4294968296 /bin/true
+inv uid-negative-wrap   1 'Invalid uid: -4294966296' -- "${BASE[@]}" --uid -4294966296 /bin/true
+inv fd-out-of-range     1 'Invalid fd: 4294967297'   -- "${BASE[@]}" --info-fd 4294967297 /bin/true
+# Plain directories do not count against the fallback resolver's symlink limit
+# (DIFFERENCES.md #16). Ours-only: bubblewrap refuses this path.
+DEEP="$LOGICAL/deep$(printf '/d%.0s' $(seq 64))"; mkdir -p "$DEEP"
+inv fallback-deep-plain 0 'deep-ok' -- --debug-opt=force-openat-fallback --unshare-user --ro-bind / / --proc /proc --tmpfs "$DEEP" /bin/echo deep-ok
 abx bind-fd          '%B '"$B"' --bind-fd 8 /u /bin/sh -c "test -d /u && echo yes" 8</usr'
 abx ro-bind-fd       '%B '"$B"' --ro-bind-fd 8 /u /bin/sh -c "touch /u/x 2>&1; echo e=\$?" 8</usr'
 ab  bind-fd-bad      -- "${BASE[@]}" --bind-fd 99 /u /bin/true
@@ -632,4 +672,4 @@ if [ "$SKIP" -gt 0 ]; then
     echo "OURS-ONLY SMOKE — $PASS invariant(s) held; $SKIP case(s) NOT compared (ALLOW_NO_ORACLE=1)."
     exit 0
 fi
-echo "ALL PASS — every case byte-identical to bubblewrap 0.13.1 at REAL=$REAL"
+echo "ALL PASS — every A/B case byte-identical to bubblewrap 0.13.1 at REAL=$REAL, every ours-only invariant held"

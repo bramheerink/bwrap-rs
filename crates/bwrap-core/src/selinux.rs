@@ -6,12 +6,15 @@
 //! kernel interfaces libselinux uses: the `selinuxfs` mount (`/sys/fs/selinux`)
 //! and the process attribute files (`/proc/self/attr/*`).
 //!
-//! Note: inside a sandbox `/sys` and parts of `/proc` can be masked, so these
-//! run on the host before the pivot; the state they read is the real system's.
+//! Whether SELinux is enabled is a property of the host kernel, not of the
+//! filesystem the sandbox happens to see. It is detected once, before the mount
+//! namespace is rearranged, and that answer holds for the rest of the process
+//! (libselinux likewise initialises this state at load time).
 
 use std::ffi::OsStr;
 use std::io::Write;
 use std::os::unix::ffi::OsStrExt;
+use std::sync::OnceLock;
 
 use nix::errno::Errno;
 
@@ -31,11 +34,19 @@ pub fn label_mount(opt: Option<&str>, mount_label: Option<&str>) -> Option<Strin
     }
 }
 
-/// Whether SELinux is enabled (libselinux's `is_selinux_enabled`): true iff the
-/// `selinuxfs` filesystem is mounted. We detect it by scanning
-/// `/proc/self/mountinfo` for a `selinuxfs` mount, which is how libselinux finds
-/// the mountpoint.
+/// Whether SELinux is enabled on the host (libselinux's `is_selinux_enabled`).
+///
+/// The first call detects it and every later call returns that answer, so it must
+/// first run before the sandbox's root is built. [`crate::run::ExecutionPlan`]
+/// guarantees that for any configuration carrying a label.
 pub fn is_selinux_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(detect_selinux)
+}
+
+/// True iff a `selinuxfs` filesystem is mounted, found by scanning
+/// `/proc/self/mountinfo`, which is how libselinux finds the mountpoint.
+fn detect_selinux() -> bool {
     match std::fs::read("/proc/self/mountinfo") {
         // The fstype is the field just after the " - " separator on each line.
         Ok(data) => data
@@ -90,36 +101,39 @@ fn check_context(label: &OsStr) -> std::result::Result<(), Errno> {
     write_attr(&format!("{SELINUX_FS}/context"), label.as_bytes())
 }
 
+/// A requested label is applied or the launch fails: it is never skipped. The
+/// parser already refuses labels on a system without SELinux, so this only fires
+/// for a configuration that bypassed that validation.
+fn require_labeling(enabled: bool) -> Result<()> {
+    if enabled {
+        Ok(())
+    } else {
+        Err(Error::invalid("labeling not supported on this system"))
+    }
+}
+
 /// Set the exec context for the next `execve` (bwrap's `label_exec` /
 /// libselinux `setexeccon`): write the label to `/proc/self/attr/exec`. A no-op
-/// when `label` is `None` or SELinux is disabled.
+/// only when no label was requested.
 pub fn label_exec(label: Option<&OsStr>) -> Result<()> {
-    if let Some(label) = label
-        && is_selinux_enabled()
-    {
-        return write_attr("/proc/self/attr/exec", label.as_bytes()).map_err(|errno| Error::Sys {
-            message: format!("label_exec {}", label.to_string_lossy()).into(),
-            errno,
-        });
-    }
-    Ok(())
+    let Some(label) = label else { return Ok(()) };
+    require_labeling(is_selinux_enabled())?;
+    write_attr("/proc/self/attr/exec", label.as_bytes()).map_err(|errno| Error::Sys {
+        message: format!("label_exec {}", label.to_string_lossy()).into(),
+        errno,
+    })
 }
 
 /// Set the file-creation context (bwrap's `label_create_file` / libselinux
 /// `setfscreatecon`): write the label to `/proc/self/attr/fscreate`. A no-op
-/// when `label` is `None` or SELinux is disabled.
+/// only when no label was requested.
 pub fn label_create_file(label: Option<&OsStr>) -> Result<()> {
-    if let Some(label) = label
-        && is_selinux_enabled()
-    {
-        return write_attr("/proc/self/attr/fscreate", label.as_bytes()).map_err(|errno| {
-            Error::Sys {
-                message: format!("label_create_file {}", label.to_string_lossy()).into(),
-                errno,
-            }
-        });
-    }
-    Ok(())
+    let Some(label) = label else { return Ok(()) };
+    require_labeling(is_selinux_enabled())?;
+    write_attr("/proc/self/attr/fscreate", label.as_bytes()).map_err(|errno| Error::Sys {
+        message: format!("label_create_file {}", label.to_string_lossy()).into(),
+        errno,
+    })
 }
 
 /// Write a context string to a SELinux attribute/selinuxfs file, returning the
@@ -179,6 +193,26 @@ mod tests {
                 .to_string(),
             "invalid label sys_u:obj_r:t:s0: Invalid argument"
         );
+    }
+
+    #[test]
+    fn requested_label_is_never_skipped() {
+        assert!(require_labeling(true).is_ok());
+        assert_eq!(
+            require_labeling(false).unwrap_err().to_string(),
+            "labeling not supported on this system"
+        );
+    }
+
+    #[test]
+    fn no_label_requested_is_a_no_op() {
+        assert!(label_exec(None).is_ok());
+        assert!(label_create_file(None).is_ok());
+    }
+
+    #[test]
+    fn enabled_state_is_stable_across_calls() {
+        assert_eq!(is_selinux_enabled(), is_selinux_enabled());
     }
 
     #[test]

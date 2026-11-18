@@ -33,11 +33,36 @@ fn acquire_privs_decision(real_uid: u32, euid: u32, has_caps: bool) -> Result<bo
 ///
 /// As root, inherit the effective set (so `--cap-drop` can trim it); otherwise
 /// start from nothing. Refuses the unsupported setuid / file-caps setups.
-pub fn acquire_privs() -> Result<CapSet> {
+fn acquire_privs() -> Result<CapSet> {
     let real_uid = getuid().as_raw();
     let euid = geteuid().as_raw();
     let is_root = acquire_privs_decision(real_uid, euid, has_caps()?)?;
     initial_requested(is_root)
+}
+
+/// Proof that the process passed bwrap's startup privilege gate: the unsupported
+/// setuid / file-caps configurations were refused and `PR_SET_NO_NEW_PRIVS` is
+/// set. Only [`StartupPrivs::acquire`] creates one, and a launch needs one.
+#[derive(Debug)]
+pub struct StartupPrivs {
+    requested: CapSet,
+}
+
+impl StartupPrivs {
+    /// bwrap's `acquire_privs` followed by `PR_SET_NO_NEW_PRIVS`. Must run before
+    /// logging, argument parsing, or any other work on the caller's input.
+    pub fn acquire() -> Result<Self> {
+        let requested = acquire_privs()?;
+        // Never gain privileges through a later exec. The whole capability model
+        // and `--seccomp` (which installs a filter with no caps) depend on it.
+        nix::sys::prctl::set_no_new_privs().context("prctl(PR_SET_NO_NEW_PRIVS) failed")?;
+        Ok(Self { requested })
+    }
+
+    /// The capabilities requested before `--cap-add`/`--cap-drop` are folded in.
+    pub(crate) fn requested(&self) -> CapSet {
+        self.requested
+    }
 }
 
 /// Once inside the namespace: clear the bounding set the new user namespace

@@ -77,8 +77,9 @@ escapes (TOCTOU, symlink races, fd confusion, seccomp gaps).
   (formerly `replace_environ`) was already honest — it checks single-threadedness
   itself. The one remaining `bwrap-sys` exception, `close_extra_fds`, is an
   irreducible case: its precondition is a process-global invariant no signature
-  can express, so it is slated to be expressed as `unsafe` + a documented caller
-  invariant rather than refactored (closes most of issue #33).
+  can express. It stays a safe `fn` with a documented caller contract, because an
+  `unsafe fn` would cost `bwrap-core` its `forbid(unsafe_code)` without letting the
+  compiler check anything more.
 - **Fuzz-target upstreaming to OSS-Fuzz** — after the fuzz harnesses exist and
   there is adoption traction (being the sandbox behind Flatpak is the "critical
   infrastructure" argument).

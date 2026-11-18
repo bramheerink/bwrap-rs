@@ -30,13 +30,15 @@ static BWRAP_RS_GIT_SHA: &str = match option_env!("BWRAP_RS_GIT_SHA") {
     None => "bwrap-rs-git: unknown",
 };
 
+use std::ffi::OsStr;
 use std::os::fd::RawFd;
 use std::process::ExitCode;
 
 use bwrap_cli::usage::{VERSION, usage};
 use bwrap_cli::{Outcome, ParseHost, parse};
 use bwrap_core::Error;
-use bwrap_core::run::run;
+use bwrap_core::privs::StartupPrivs;
+use bwrap_core::run::{ExecutionPlan, run};
 use bwrap_core::types::Config;
 use bwrap_core::userns::SystemUsernsProbe;
 use nix::errno::Errno;
@@ -48,14 +50,13 @@ struct Host<'a> {
 }
 
 impl Host<'_> {
-    /// Claim, borrow and read a caller fd to EOF (bwrap's `load_file_data`),
+    /// Adopt, borrow and read a caller fd to EOF (bwrap's `load_file_data`),
     /// returning the raw errno on failure. A bad or already-closed number is
     /// `EBADF`, so a reused `--args N … --args N` fails on the second read
     /// exactly as bubblewrap does.
     fn read_caller_fd(&mut self, fd: RawFd) -> Result<Vec<u8>, Errno> {
-        self.fds.claim(fd).map_err(|_| Errno::EBADF)?;
-        let bf = self.fds.borrow(fd).ok_or(Errno::EBADF)?;
-        bwrap_core::fs::io::read_to_end(bf)
+        self.fds.adopt(fd);
+        bwrap_core::fs::io::read_to_end(self.fds.live(fd)?)
     }
 }
 
@@ -84,6 +85,14 @@ impl ParseHost for Host<'_> {
         })
     }
 
+    fn validate_label(&mut self, label: &OsStr) -> Result<(), Error> {
+        bwrap_core::selinux::die_unless_label_valid(label)
+    }
+
+    fn set_file_label(&mut self, label: &OsStr) -> Result<(), Error> {
+        bwrap_core::selinux::label_create_file(Some(label))
+    }
+
     fn warn(&mut self, msg: &str) {
         bwrap_core::log::emit_err(&bwrap_core::log::warning_line(msg));
     }
@@ -105,9 +114,24 @@ fn main() -> ExitCode {
     // bubblewrap passes its `char *` argv. The parser matches option names as
     // ASCII and carries path/command/env/argv0/hostname values as bytes.
     let argv_os: Vec<std::ffi::OsString> = std::env::args_os().collect();
+    // A lone `--version` works before any privilege handling, as in bwrap, so it
+    // also works in a build environment.
+    if argv_os.len() == 2 && argv_os[1] == "--version" {
+        bwrap_core::log::emit_out(VERSION);
+        return ExitCode::SUCCESS;
+    }
+    // bwrap's startup gate: refuse setuid / file-caps use and set no_new_privs
+    // before touching the caller's input in any way, logging included.
+    let privs = match StartupPrivs::acquire() {
+        Ok(privs) => privs,
+        Err(e) => {
+            bwrap_core::log::emit_err(&bwrap_core::log::error_line(&e.to_string()));
+            return ExitCode::FAILURE;
+        }
+    };
     // Optional, env-gated invocation log (`BWRAP_RS_LOG`). A no-op when the
     // variable is unset or empty, so the drop-in behaviour and output stay
-    // byte-identical to bwrap. Logged first, from the raw argv.
+    // byte-identical to bwrap. Logged from the raw argv.
     trace::invocation(&argv_os);
     // argv[0] is still rendered lossily for the usage line (a non-UTF-8 argv0
     // shows U+FFFD there — the one remaining fidelity gap, DIFFERENCES.md #6).
@@ -117,9 +141,9 @@ fn main() -> ExitCode {
         .unwrap_or_else(|| "bwrap".to_string());
     let args: Vec<std::ffi::OsString> = argv_os.into_iter().skip(1).collect();
 
-    // The process's fd table; the Host claims the --args/--add-seccomp-fd
+    // The process's fd table; the Host adopts the --args/--add-seccomp-fd
     // descriptors through it (owns them for their read, closes them after).
-    let mut fds = bwrap_sys::fd::FdTable::new();
+    let mut fds = bwrap_sys::fd::FdTable::acquire().expect("main creates the only fd table");
     let mut host = Host { fds: &mut fds };
     let config = match parse(&args, &mut host) {
         Ok(Outcome::Run(cfg)) => *cfg,
@@ -142,7 +166,7 @@ fn main() -> ExitCode {
         }
     };
 
-    match launch(config, &mut fds) {
+    match launch(config, privs, &mut fds) {
         Ok(code) => {
             trace::outcome(&format!("exit={code}"));
             ExitCode::from(u8::try_from(code).unwrap_or(255))
@@ -161,9 +185,11 @@ fn main() -> ExitCode {
     }
 }
 
-fn launch(config: Config, fds: &mut bwrap_sys::fd::FdTable) -> Result<i32, Error> {
-    let real_uid = nix::unistd::getuid().as_raw();
-    let real_gid = nix::unistd::getgid().as_raw();
-    let resolved = config.resolve(real_uid, real_gid, &SystemUsernsProbe)?;
-    run(&config, &resolved, real_uid, real_gid, fds)
+fn launch(
+    config: Config,
+    privs: StartupPrivs,
+    fds: &mut bwrap_sys::fd::FdTable,
+) -> Result<i32, Error> {
+    let plan = ExecutionPlan::new(config, privs, &SystemUsernsProbe)?;
+    run(&plan, fds)
 }

@@ -138,7 +138,7 @@ jobs:
   release:
     name: Release artifact (tag push)
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [check, msrv]
+    needs: [check, msrv, supply-chain, fuzz-smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write # only this job may upload the release asset

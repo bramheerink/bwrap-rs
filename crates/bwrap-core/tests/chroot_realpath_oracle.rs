@@ -126,6 +126,17 @@ fn rust_matches_c_oracle() {
         symlink(format!("chain{}", i + 1), root.join(format!("chain{i}"))).unwrap();
     }
     std::fs::write(root.join("chain40"), b"x").unwrap();
+    // Chains of 32 to 34 links ending in ".", where no component follows the last.
+    for len in 32..=34 {
+        for i in 0..len {
+            let next = if i + 1 == len {
+                ".".to_string()
+            } else {
+                format!("dot{len}-{}", i + 1)
+            };
+            symlink(next, root.join(format!("dot{len}-{i}"))).unwrap();
+        }
+    }
 
     let root_b = root.as_os_str().as_bytes();
     let mut mismatches = Vec::new();
@@ -157,6 +168,9 @@ fn rust_matches_c_oracle() {
     // MAX_READLINKS boundary and a very long path (ENAMETOOLONG).
     cmp(root_b, "chain0", &mut mismatches);
     cmp(root_b, "chain9", &mut mismatches);
+    for len in 32..=34 {
+        cmp(root_b, &format!("dot{len}-0"), &mut mismatches);
+    }
     cmp(root_b, &"a/".repeat(4000), &mut mismatches);
 
     // Fuzz: random paths built from a component alphabet that stresses the
