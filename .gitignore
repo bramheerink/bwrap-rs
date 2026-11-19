@@ -10,3 +10,10 @@ C-TO-RUST-MAP.md
 /fuzz/target
 /fuzz/corpus
 /fuzz/artifacts
+
+# untracked working material, never part of the port
+SECURITY-REVIEW-*.md
+BWRAP-C-REVIEW-*.md
+/bwrap-c/
+/mutants.out/
+/mutants.out.old/
