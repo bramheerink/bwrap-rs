@@ -8,7 +8,9 @@ code, stdout and stderr). Deliberate, fail-closed divergences are recorded in
 
 ## [Unreleased]
 
-Follow-up to the security review of 2026-11-18.
+## [0.1.5-alpha] — 2026-11-19
+
+Follow-up to the security review of 2026-11-18 and the independent C audit.
 
 ### Security
 - **A requested `--exec-label` can no longer be skipped.** SELinux was re-detected
@@ -28,6 +30,10 @@ Follow-up to the security review of 2026-11-18.
   a different valid number (DIFFERENCES.md #15).
 - **A failed descriptor cleanup is reported** instead of passing as success
   (DIFFERENCES.md #17).
+- **The `--disable-userns` / `--assert-userns-disabled` probe fails closed on a
+  transient error.** A durable denial (`ENOSPC`/`EPERM`/`EUSERS`) still counts as
+  proof; a transient `ENOMEM`/`EAGAIN` no longer passes the assertion
+  (DIFFERENCES.md #18).
 
 ### Fixed
 - `--clearenv`, `--unsetenv PWD` and `--setenv PWD` now take effect on the logical
@@ -43,6 +49,11 @@ Follow-up to the security review of 2026-11-18.
   or combined freely by other crates.
 - SELinux label effects in the parser go through `ParseHost`.
 - The release job now also waits for `supply-chain` and `fuzz-smoke`.
+
+### Tooling
+- The shadow-oracle parity tool is kept under `tools/shadow-oracle/` as a
+  standalone tool: the Python replay harness is current; the Rust plan generator
+  is preserved as reference and needs an API refresh before it compiles.
 
 ## [0.1.4-alpha] — 2026-11-14
 
