@@ -601,11 +601,25 @@ fn child(
     }
 
     if config.disable_userns || config.assert_userns_disabled {
-        // Verify we really can no longer create a user namespace.
-        if nix::sched::unshare(CloneFlags::CLONE_NEWUSER).is_ok() {
-            return Err(Error::invalid(
-                "creation of new user namespaces was not disabled as requested",
-            ));
+        // Verify we really can no longer create a user namespace. bwrap (C)
+        // treats *any* failure of this probe as proof; we narrow that. A
+        // genuinely disabled userns returns a durable denial (ENOSPC from the
+        // `max_user_namespaces=0` limit, EPERM/EUSERS from policy or the nesting
+        // limit). A transient failure (ENOMEM/EAGAIN under resource pressure)
+        // proves nothing about the policy, so we fail closed rather than let the
+        // assertion pass on it. DIFFERENCES.md #18.
+        match nix::sched::unshare(CloneFlags::CLONE_NEWUSER) {
+            Ok(()) => {
+                return Err(Error::invalid(
+                    "creation of new user namespaces was not disabled as requested",
+                ));
+            }
+            Err(Errno::ENOMEM | Errno::EAGAIN) => {
+                return Err(Error::invalid(
+                    "could not verify that user namespaces are disabled (transient error)",
+                ));
+            }
+            Err(_) => {}
         }
     }
 

@@ -205,6 +205,19 @@ framing and [ROADMAP.md](ROADMAP.md) for the north star.
     open. `bwrap-rs` then closes them with `close_range(2)`, and fails if that does
     not work either.
 
+18. **[safer divergence] The `--disable-userns` / `--assert-userns-disabled` probe
+    fails closed on a transient error.** Both implementations verify the restriction
+    by attempting `unshare(CLONE_NEWUSER)` and treating a failure as proof it is
+    disabled. bubblewrap accepts *any* errno, so a transient `ENOMEM`/`EAGAIN` under
+    resource pressure is read as "disabled" and the sandbox proceeds, even though a
+    later attempt could still succeed. `bwrap-rs` accepts only a durable denial as
+    proof — `ENOSPC` (the errno the `max_user_namespaces=0` mechanism produces),
+    `EPERM`, `EUSERS` and the like — and aborts with `could not verify that user
+    namespaces are disabled (transient error)` on `ENOMEM`/`EAGAIN`. The normal
+    disabled case (`ENOSPC`) and a genuinely-not-disabled case (success → the usual
+    `… was not disabled as requested` error) are unchanged. See UPSTREAM-FINDINGS.md
+    F12.
+
 ## Everything else
 
 Outside this list, any divergence from bubblewrap 0.13.1 is a bug. Please report
